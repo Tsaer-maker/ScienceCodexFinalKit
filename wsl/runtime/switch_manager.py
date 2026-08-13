@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Transactional runtime owner for ScienceCodexFinalKit.
 
-The manager keeps one Claude Science data directory and exactly one loopback
-backend.  A switch stops Science, replaces the verified backend process,
-restarts Science with the matching endpoint, and restores the prior runtime if
-any step fails.
+The default runtime is native Claude Code plus exactly one loopback backend.
+Claude Science remains an optional compatibility client and is never required
+by the no-Claude-account workflow.
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,18 +81,27 @@ RUNTIME_CAPABILITIES = (
     "codex-tier-test",
     "effective-route-output",
     "model-route-update",
+    "native-browser-mcp",
     "persistent-model-routes",
     "provider-model-discovery",
     "runtime-update-v1",
-    "science-linux-only-runtime",
     "native-provider-client",
-    "science-official-auth-boundary",
     "shared-official-codex-auth",
 )
 
 
 class FinalKitError(RuntimeError):
     pass
+
+
+def default_gateway_port(uid: int | None = None) -> int:
+    """Return a deterministic per-UID loopback port for ordinary Linux users."""
+
+    resolved_uid = os.getuid() if uid is None else uid
+    if resolved_uid < 1000:
+        return DEFAULT_GATEWAY_PORT
+    available = 65535 - DEFAULT_GATEWAY_PORT + 1
+    return DEFAULT_GATEWAY_PORT + ((resolved_uid - 1000) % available)
 
 
 class Paths:
@@ -104,13 +113,15 @@ class Paths:
         self.bridge_python = self.bridge / ".venv" / "bin" / "python"
         self.bridge_config = self.bridge / "config.json"
         self.model_routes = self.config / "model-routes.json"
-        # Claude Science creates nested AF_UNIX sockets.  Keep this path short
-        # enough for Linux's 108-byte sun_path limit while retaining isolation.
+        self.browser_mcp_config = self.config / "claude-browser-mcp.json"
+        self.client_home = Path.home() / ".finalkit-client"
+        # Legacy Science state is retained only to identify and stop a process
+        # left by an older package; no current start or login path writes it.
         self.science_home = Path.home() / ".science-finalkit"
         # The official Linux Codex CLI owns the only ChatGPT credential cache.
         # The connector reads and refreshes this same file instead of keeping a
         # second refresh-token chain that can drift or invalidate the first.
-        self.codex_auth = self.science_home / ".codex" / "auth.json"
+        self.codex_auth = self.client_home / ".codex" / "auth.json"
         self.data_dir = self.science_home / ".claude-science"
         self.run = self.root / "run"
         self.logs = self.root / "logs"
@@ -128,7 +139,6 @@ class Paths:
         self.bridge_commit = self.root / "bridge.commit"
         self.versions = self.root / "versions.txt"
         self.direct_gateway = self.runtime / "direct_gateway.py"
-        self.science_identity = self.runtime / "science_identity.py"
         self.science = Path.home() / ".local" / "bin" / "claude-science"
         self.claude = Path.home() / ".local" / "bin" / "claude"
         self.codex = Path.home() / ".local" / "bin" / "codex"
@@ -138,7 +148,7 @@ class Paths:
             self.root,
             self.runtime,
             self.config,
-            self.science_home,
+            self.client_home,
             self.run,
             self.logs,
             self.secrets,
@@ -443,16 +453,20 @@ class RuntimeManager:
     def __init__(self, paths: Paths):
         self.p = paths
         self.p.ensure_private_tree()
-        self.gateway_port = int(os.environ.get("FINALKIT_GATEWAY_PORT", DEFAULT_GATEWAY_PORT))
+        requested_port = os.environ.get("FINALKIT_GATEWAY_PORT", "").strip()
+        try:
+            self.gateway_port = int(requested_port) if requested_port else default_gateway_port()
+        except ValueError as exc:
+            raise FinalKitError("FINALKIT_GATEWAY_PORT must be an integer") from exc
+        if not 1024 <= self.gateway_port <= 65535:
+            raise FinalKitError("FINALKIT_GATEWAY_PORT must be between 1024 and 65535")
         self.science_port = int(os.environ.get("FINALKIT_SCIENCE_PORT", DEFAULT_SCIENCE_PORT))
 
     def require_runtime(self) -> None:
         required = (
-            (self.p.science, "Claude Science"),
             (self.p.claude, "Claude Code"),
             (self.p.codex, "Linux Codex CLI"),
             (self.p.direct_gateway, "direct gateway"),
-            (self.p.science_identity, "Science local identity helper"),
             (self.p.bridge_python, "connector Python"),
             (self.p.bridge / "proxy.py", "connector proxy"),
         )
@@ -801,7 +815,7 @@ class RuntimeManager:
                     "an active FinalKit runtime is using the old route; rerun with --restart or stop it first; no config was written"
                 )
             previous_science_running = False
-            if affected_active:
+            if affected_active and self.science_lock_process() is not None:
                 science = self.science_status()
                 if science.get("control_error"):
                     raise FinalKitError(self.science_recovery_message(science))
@@ -814,7 +828,8 @@ class RuntimeManager:
             )
             try:
                 if affected_active:
-                    self.science_stop()
+                    if previous_science_running:
+                        self.science_stop()
                     self.stop_gateway()
                 atomic_write(
                     self.p.model_routes,
@@ -823,21 +838,18 @@ class RuntimeManager:
                 self.ensure_bridge_config()
                 if affected_active:
                     endpoint = self.spawn_gateway(previous_backend)
-                    if previous_science_running:
-                        self.science_start(endpoint)
                     if not self.gateway_health():
                         raise FinalKitError("updated gateway failed its health check")
-                    if previous_science_running and not self.science_endpoint_matches(endpoint):
-                        raise FinalKitError("updated Claude Science endpoint identity check failed")
                     self.write_mode(previous_backend)
                     restarted = True
             except Exception as primary_error:
                 rollback_errors: list[str] = []
                 if affected_active:
-                    try:
-                        self.science_stop()
-                    except Exception as exc:
-                        rollback_errors.append(f"stop updated Science: {exc}")
+                    if previous_science_running:
+                        try:
+                            self.science_stop()
+                        except Exception as exc:
+                            rollback_errors.append(f"stop updated Science: {exc}")
                     try:
                         self.stop_gateway()
                     except Exception as exc:
@@ -853,8 +865,6 @@ class RuntimeManager:
                 if affected_active:
                     try:
                         endpoint = self.spawn_gateway(previous_backend)
-                        if previous_science_running:
-                            self.science_start(endpoint)
                     except Exception as exc:
                         rollback_errors.append(f"restore {previous_backend}: {exc}")
                 message = f"model route update failed: {primary_error}; previous route files were restored"
@@ -997,7 +1007,7 @@ class RuntimeManager:
                     "--key-fd",
                     str(key_fd),
                 ]
-                environment = private_child_environment(self.p.science_home)
+                environment = private_child_environment(self.p.client_home)
                 endpoint = f"http://127.0.0.1:{self.gateway_port}/{path_secret}"
                 cwd = self.p.runtime
             else:
@@ -1010,7 +1020,7 @@ class RuntimeManager:
                 inherited_fds.extend((control_fd, instance_fd))
                 command = [str(self.p.bridge_python), str(self.p.bridge / "proxy.py")]
                 environment = codex_network_environment(
-                    self.p.science_home, "https://chatgpt.com/backend-api/codex"
+                    self.p.client_home, "https://chatgpt.com/backend-api/codex"
                 )
                 environment.update(
                     {
@@ -1104,46 +1114,6 @@ class RuntimeManager:
                 raise FinalKitError(f"verified gateway PID {pid} did not stop")
         reap_child(pid)
         self.p.gateway_record.unlink(missing_ok=True)
-
-    def science_environment(self, endpoint: str) -> dict[str, str]:
-        environment = science_child_environment(self.p.science_home)
-        for name in ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
-            environment.pop(name, None)
-        environment["ANTHROPIC_BASE_URL"] = endpoint
-        append_no_proxy(environment)
-        return environment
-
-    def ensure_science_identity(self, *, check_only: bool = False) -> dict[str, Any]:
-        """Remove only obsolete FinalKit identities and preserve Science-owned auth."""
-
-        result = subprocess.run(
-            [
-                str(self.p.bridge_python),
-                str(self.p.science_identity),
-                "check" if check_only else "ensure",
-                "--data-dir",
-                str(self.p.data_dir),
-            ],
-            env=science_child_environment(self.p.science_home),
-            cwd=self.p.science_home,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=30,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise FinalKitError(
-                (result.stderr or result.stdout).strip()
-                or "FinalKit could not establish the isolated Claude Science local identity"
-            )
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise FinalKitError("Science local identity helper returned invalid JSON") from exc
-        if not isinstance(payload, dict) or payload.get("ok") is not True:
-            raise FinalKitError("Science local identity helper did not verify its result")
-        return payload
 
     def science_process_identity(self, pid: int) -> bool:
         if not process_is_live(pid):
@@ -1354,92 +1324,6 @@ class RuntimeManager:
                 file=sys.stderr,
             )
 
-    def science_start(self, endpoint: str, *, ensure_identity: bool = True) -> dict[str, Any]:
-        current = self.science_status()
-        if current.get("control_error"):
-            raise FinalKitError(self.science_recovery_message(current))
-        if current.get("running"):
-            pid = int(current.get("pid", 0) or 0)
-            if process_environment(pid).get("ANTHROPIC_BASE_URL") == endpoint:
-                return current
-            raise FinalKitError("Claude Science is running with a different backend endpoint")
-
-        if ensure_identity:
-            identity = self.ensure_science_identity()
-            if str(identity.get("action", "")).startswith("removed-"):
-                print("Removed an obsolete FinalKit virtual OAuth identity; sign in to Claude Science with a supported Claude account.")
-            if identity.get("schema") == "science-login-required":
-                print(
-                    "Claude Science account sign-in is required in the web UI. "
-                    "Provider API keys and ChatGPT/Codex login authenticate the local gateway only."
-                )
-        environment = self.science_environment(endpoint)
-        with open(self.p.science_boot_log, "a", encoding="utf-8") as log_handle:
-            os.chmod(self.p.science_boot_log, 0o600)
-            result = subprocess.run(
-                [
-                    str(self.p.science),
-                    "serve",
-                    "--data-dir",
-                    str(self.p.data_dir),
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(self.science_port),
-                    "--no-browser",
-                    "--detached",
-                    "--no-auto-update",
-                ],
-                env=environment,
-                cwd=self.p.science_home,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                timeout=60,
-                check=False,
-            )
-        if result.returncode != 0:
-            raise FinalKitError(
-                f"Claude Science start returned {result.returncode}; see {self.p.science_boot_log}"
-            )
-
-        for _ in range(160):
-            current = self.science_status()
-            if current.get("control_error"):
-                raise FinalKitError(self.science_recovery_message(current))
-            if current.get("running") and int(current.get("port", 0) or 0) == self.science_port:
-                pid = int(current.get("pid", 0) or 0)
-                if process_environment(pid).get("ANTHROPIC_BASE_URL") == endpoint:
-                    return current
-            time.sleep(0.25)
-        raise FinalKitError(f"Claude Science did not become ready; see {self.p.science_boot_log}")
-
-    def science_url(self) -> str:
-        environment = science_child_environment(self.p.science_home)
-        result = subprocess.run(
-            [str(self.p.science), "url", "--data-dir", str(self.p.data_dir)],
-            env=environment,
-            cwd=self.p.science_home,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=20,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise FinalKitError(result.stderr.strip() or "could not create a Claude Science login URL")
-        for line in reversed(result.stdout.splitlines()):
-            value = line.strip()
-            if value.startswith("http://") or value.startswith("https://"):
-                return value
-        raise FinalKitError("Claude Science did not return a login URL")
-
-    def science_endpoint_matches(self, endpoint: str) -> bool:
-        status_value = self.science_status()
-        if status_value.get("control_error") or not status_value.get("running"):
-            return False
-        pid = int(status_value.get("pid", 0) or 0)
-        return process_environment(pid).get("ANTHROPIC_BASE_URL") == endpoint
-
     def ensure_bridge_config(self) -> None:
         route = self.model_routes()["codex"]
         codex_opus_model = route["opus"]
@@ -1461,7 +1345,7 @@ class RuntimeManager:
             "codex_model": codex_opus_model,
             "codex_reasoning_effort": codex_reasoning_effort,
             "codex_model_map": {
-                # Claude Science owns these UI compatibility IDs.  The
+                # Claude-compatible clients use these request aliases.  The
                 # connector maps every current/future version suffix within a
                 # family to FinalKit's real three-tier ChatGPT Codex route.
                 "claude-opus": codex_opus_model,
@@ -1517,9 +1401,9 @@ class RuntimeManager:
         return "unconfigured"
 
     @staticmethod
-    def print_science_model_note() -> None:
+    def print_model_alias_note() -> None:
         print(
-            "Science model IDs: Claude-compatible aliases; FinalKit's model catalog "
+            "Claude-compatible request aliases are local routing labels; FinalKit's model catalog "
             "and EFFECTIVE_ROUTE expose the configured upstream route."
         )
 
@@ -1529,7 +1413,7 @@ class RuntimeManager:
         self.require_runtime()
         self.ensure_bridge_config()
 
-    def _switch_locked(self, mode: str, *, start_science: bool = True) -> str:
+    def _switch_locked(self, mode: str) -> str:
         if mode not in VALID_MODES:
             raise FinalKitError("mode must be deepseek, kimi, glm, or codex")
         previous_mode = self.current_mode()
@@ -1538,77 +1422,40 @@ class RuntimeManager:
             previous_record and self.gateway_identity(previous_record) and self.gateway_health(previous_record)
         )
 
-        # Native Claude Code can reuse an already healthy matching gateway
-        # without consulting or touching Claude Science.  This keeps provider
-        # use available even when the optional Science control socket or
-        # account session needs repair.
-        if (
-            not start_science
-            and previous_gateway_running
-            and previous_record
-            and previous_record.get("backend") == mode
-        ):
+        # No start path owns Claude Science.  If a previous FinalKit package
+        # left a fully verified Science process behind, stop it before reusing
+        # or switching the provider gateway.
+        if self.science_lock_process() is not None:
+            science = self.science_status()
+            if science.get("control_error"):
+                raise FinalKitError(self.science_recovery_message(science))
+            if science.get("running"):
+                self.science_stop()
+
+        if previous_gateway_running and previous_record and previous_record.get("backend") == mode:
             self.write_mode(mode)
             return str(previous_record["endpoint"])
-
-        previous_science_status = self.science_status()
-        if previous_science_status.get("control_error"):
-            raise FinalKitError(self.science_recovery_message(previous_science_status))
-        previous_science_running = bool(previous_science_status.get("running"))
-
-        if previous_science_running:
-            if not previous_gateway_running or not previous_record:
-                raise FinalKitError(
-                    "Claude Science is running without a healthy owned gateway; run fkctl stop before switching"
-                )
-            if not self.science_endpoint_matches(str(previous_record["endpoint"])):
-                raise FinalKitError(
-                    "Claude Science and the owned gateway have different endpoints; run fkctl stop before switching"
-                )
         previous_backend = (
             str(previous_record.get("backend"))
             if previous_gateway_running and previous_record
             else previous_mode
         )
-
-        if (
-            previous_mode == mode
-            and previous_gateway_running
-            and previous_record
-            and previous_record.get("backend") == mode
-        ):
-            if start_science and self.science_endpoint_matches(str(previous_record["endpoint"])):
-                return self.science_url()
-            if not start_science:
-                return str(previous_record["endpoint"])
-
-        self.science_stop()
         self.stop_gateway()
         try:
             endpoint = self.spawn_gateway(mode)
-            if start_science:
-                self.science_start(endpoint)
-            if not self.gateway_health() or (
-                start_science and not self.science_endpoint_matches(endpoint)
-            ):
+            if not self.gateway_health():
                 raise FinalKitError("post-switch runtime identity verification failed")
             self.write_mode(mode)
-            return self.science_url() if start_science else endpoint
+            return endpoint
         except Exception as primary_error:
             rollback_errors: list[str] = []
-            try:
-                self.science_stop()
-            except Exception as exc:  # rollback must attempt every owned layer
-                rollback_errors.append(f"stop Science: {exc}")
             try:
                 self.stop_gateway()
             except Exception as exc:
                 rollback_errors.append(f"stop gateway: {exc}")
             if previous_backend and previous_gateway_running:
                 try:
-                    old_endpoint = self.spawn_gateway(previous_backend)
-                    if previous_science_running:
-                        self.science_start(old_endpoint)
+                    self.spawn_gateway(previous_backend)
                 except Exception as exc:
                     rollback_errors.append(f"restore {previous_backend}: {exc}")
             message = f"switch to {mode} failed: {primary_error}"
@@ -1619,6 +1466,8 @@ class RuntimeManager:
             raise FinalKitError(message) from primary_error
 
     def switch(self, mode: str) -> str:
+        """Backward-compatible gateway-only switch; never start Claude Science."""
+
         with FileLock(self.p.lock):
             return self._switch_locked(mode)
 
@@ -1626,44 +1475,13 @@ class RuntimeManager:
         """Select a backend without requiring or starting Claude Science."""
 
         with FileLock(self.p.lock):
-            return self._switch_locked(mode, start_science=False)
+            return self._switch_locked(mode)
 
     def stop(self) -> None:
         with FileLock(self.p.lock):
-            self.science_stop()
+            if self.science_lock_process() is not None:
+                self.science_stop()
             self.stop_gateway()
-
-    def init_profile(self) -> None:
-        self.require_runtime()
-        with FileLock(self.p.lock):
-            key_file = self.p.data_dir / "encryption.key"
-            if not key_file.is_file() or key_file.stat().st_size == 0:
-                science_status = self.science_status()
-                if science_status.get("control_error"):
-                    raise FinalKitError(self.science_recovery_message(science_status))
-                if science_status.get("running") or self.read_gateway_record():
-                    raise FinalKitError("stop the active FinalKit runtime before initializing its profile")
-                endpoint = self.spawn_gateway("deepseek", key_override="finalkit-local-smoke-key")
-                try:
-                    # A first Science boot creates encryption.key.  Once that
-                    # bootstrap completes, the helper can remove only exact
-                    # obsolete FinalKit identities and otherwise leaves Claude
-                    # Science account state untouched.
-                    self.science_start(endpoint, ensure_identity=False)
-                    for _ in range(160):
-                        if key_file.is_file() and key_file.stat().st_size > 0:
-                            break
-                        time.sleep(0.25)
-                finally:
-                    self.science_stop()
-                    self.stop_gateway()
-            if not key_file.is_file() or key_file.stat().st_size == 0:
-                raise FinalKitError(f"Claude Science did not create {key_file}")
-            identity = self.ensure_science_identity()
-            print(
-                "Science credential boundary is ready "
-                f"({identity.get('schema', 'unknown')}; {identity.get('action', 'verified')})."
-            )
 
     def configure_provider(self, provider_name: str) -> None:
         if provider_name not in API_PROVIDERS:
@@ -1682,10 +1500,10 @@ class RuntimeManager:
         with FileLock(self.p.lock):
             self.ensure_bridge_config()
             environment = codex_network_environment(
-                self.p.science_home,
+                self.p.client_home,
                 "https://auth.openai.com",
             )
-            print("Starting the official Codex browser login in Claude Science's isolated home.")
+            print("Starting the official Codex browser login in FinalKit's isolated client home.")
             print("No token value will be printed; complete the browser flow opened by Codex.")
             self._replace_codex_auth(
                 [str(self.p.codex), *CODEX_FILE_AUTH_ARGS, "login"],
@@ -1701,7 +1519,7 @@ class RuntimeManager:
         with FileLock(self.p.lock):
             self.ensure_bridge_config()
             environment = codex_network_environment(
-                self.p.science_home,
+                self.p.client_home,
                 "https://auth.openai.com/api/accounts/deviceauth/usercode",
             )
             print("Starting the official Codex device-code login (beta).")
@@ -1723,7 +1541,7 @@ class RuntimeManager:
         auth = self.p.codex_auth
         auth.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         auth.parent.chmod(0o700)
-        with tempfile.TemporaryDirectory(prefix=".codex-login.", dir=self.p.science_home) as scratch:
+        with tempfile.TemporaryDirectory(prefix=".codex-login.", dir=self.p.client_home) as scratch:
             staging_home = Path(scratch)
             staging_environment = environment.copy()
             staging_environment["HOME"] = str(staging_home)
@@ -1793,7 +1611,7 @@ class RuntimeManager:
         if not self.codex_auth_configured():
             return False
         try:
-            environment = private_child_environment(self.p.science_home)
+            environment = private_child_environment(self.p.client_home)
             return self._codex_login_status(environment)
         except (OSError, subprocess.SubprocessError):
             return False
@@ -1830,24 +1648,86 @@ class RuntimeManager:
             environment.pop(name, None)
         environment["ANTHROPIC_BASE_URL"] = str(record["endpoint"])
         environment["ANTHROPIC_AUTH_TOKEN"] = "finalkit-local-token"
+        routes = self.model_routes()
+        if mode in API_PROVIDERS:
+            provider = API_PROVIDERS[mode]
+            main = str(routes["providers"][mode]["main"])
+            fast = str(routes["providers"][mode]["fast"])
+            label = str(provider["label"])
+            effort_suffix = ""
+        else:
+            codex_route = routes["codex"]
+            main = str(codex_route["opus"])
+            fast = str(codex_route["haiku"])
+            label = "ChatGPT Codex"
+            effort_suffix = f" {codex_route['reasoning_effort']}"
+        sonnet = (
+            str(routes["codex"]["sonnet"])
+            if mode == "codex"
+            else main
+        )
+        display = lambda model: f"{label} {model}{effort_suffix}"  # noqa: E731
+        environment.update(
+            {
+                "ANTHROPIC_MODEL": main,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": main,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": display(main),
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": display(sonnet),
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": fast,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": display(fast),
+                "ANTHROPIC_CUSTOM_MODEL_OPTION": main,
+                "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": display(main),
+                "CLAUDE_CODE_SUBAGENT_MODEL": sonnet,
+                "DISABLE_AUTOUPDATER": "1",
+            }
+        )
         append_no_proxy(environment)
         result = subprocess.run([str(self.p.claude), *arguments], env=environment, check=False)
         return result.returncode
 
+    def write_browser_mcp_config(self, browser_url: str) -> Path:
+        """Write a session-scoped config for a fixed Windows-side MCP launcher."""
+
+        parsed = urllib.parse.urlsplit(browser_url)
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "localhost"}
+            or parsed.username
+            or parsed.password
+            or not parsed.port
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise FinalKitError("browser URL must be an HTTP loopback origin with an explicit port")
+        config = {
+            "mcpServers": {
+                "chrome-devtools": {
+                    "type": "stdio",
+                    "command": "cmd.exe",
+                    "args": [
+                        "/d",
+                        "/c",
+                        "%LOCALAPPDATA%/ScienceCodexFinalKit/browser-mcp.cmd",
+                    ],
+                }
+            }
+        }
+        atomic_write(
+            self.p.browser_mcp_config,
+            json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+        return self.p.browser_mcp_config
+
     def smoke_local(self) -> str:
         self.require_runtime()
         with FileLock(self.p.lock):
-            science_status = self.science_status()
-            if science_status.get("control_error"):
-                raise FinalKitError(self.science_recovery_message(science_status))
-            if science_status.get("running") or self.read_gateway_record():
+            if self.read_gateway_record():
                 record = self.read_gateway_record()
                 if not record or not self.gateway_identity(record) or not self.gateway_health(record):
                     raise FinalKitError("an unhealthy runtime is active; stop or repair it before smoke")
-                if science_status.get("running") and not self.science_endpoint_matches(str(record["endpoint"])):
-                    raise FinalKitError("Science/backend endpoint mismatch")
-                client_state = "Science running" if science_status.get("running") else "gateway-only"
-                return f"active runtime passed the no-cost identity smoke ({client_state})"
+                return "active native-client gateway passed the no-cost identity smoke"
 
             passed: list[str] = []
             for provider_name in API_PROVIDERS:
@@ -1859,15 +1739,7 @@ class RuntimeManager:
                     passed.append(provider_name)
                 finally:
                     self.stop_gateway()
-            endpoint = self.spawn_gateway("deepseek", key_override="finalkit-local-smoke-key")
-            try:
-                self.science_start(endpoint)
-                if not self.gateway_health() or not self.science_endpoint_matches(endpoint):
-                    raise FinalKitError("Claude Science/local gateway identity verification failed")
-            finally:
-                self.science_stop()
-                self.stop_gateway()
-            return "local provider gateways + Claude Science smoke passed: " + ", ".join(passed)
+            return "local provider gateways + native Claude Code smoke passed: " + ", ".join(passed)
 
     def test_backend(self, mode: str) -> dict[str, Any]:
         self.select_gateway(mode)
@@ -1978,7 +1850,6 @@ class RuntimeManager:
             )
         else:
             print(f"[INFO] distribution metadata: {installed_metadata} (not a runtime gate)")
-        add("Claude Science", os.access(self.p.science, os.X_OK), str(self.p.science))
         add("Claude Code", os.access(self.p.claude, os.X_OK), str(self.p.claude))
         add("Linux Codex CLI", os.access(self.p.codex, os.X_OK), str(self.p.codex))
         add("direct provider gateway", self.p.direct_gateway.is_file(), str(self.p.direct_gateway))
@@ -1989,25 +1860,10 @@ class RuntimeManager:
             ("instance id", self.p.instance_id),
             ("gateway path secret", self.p.path_secret),
             ("connector control token", self.p.control_token),
-            ("Science encryption key", self.p.data_dir / "encryption.key"),
         ):
             add(label, path.is_file() and path.stat().st_size > 0, str(path))
             if path.exists():
                 add(f"{label} permission 600", stat.S_IMODE(path.stat().st_mode) == 0o600)
-        try:
-            science_identity = self.ensure_science_identity(check_only=True)
-            science_identity_ok = science_identity.get("schema") in {
-                "science-login-required",
-                "science-credentials-preserved",
-            }
-        except FinalKitError as exc:
-            science_identity_ok = False
-            science_identity = {"error": str(exc)}
-        add(
-            "isolated Science credential boundary",
-            science_identity_ok,
-            str(science_identity.get("schema") or science_identity.get("error") or self.p.data_dir),
-        )
         if self.codex_auth_configured():
             add("official isolated Codex login", self.codex_login_status(), str(self.p.codex_auth))
             add("Codex auth permission 600", stat.S_IMODE(self.p.codex_auth.stat().st_mode) == 0o600)
@@ -2076,15 +1932,6 @@ class RuntimeManager:
         else:
             add("connector pinned commit", False)
 
-        science = self.science_status()
-        add(
-            "Claude Science control",
-            not bool(science.get("control_error")),
-            self.science_recovery_message(science)
-            if science.get("control_error")
-            else ("running" if science.get("running") else "stopped"),
-        )
-
         failures = 0
         for label, ok, detail in checks:
             print(f"[{'OK' if ok else 'FAIL'}] {label}" + (f" -- {detail}" if detail else ""))
@@ -2095,27 +1942,24 @@ class RuntimeManager:
                 f"{'configured' if self.p.provider_keys[name].is_file() else 'not configured'}"
             )
         print(f"[INFO] ChatGPT Codex auth: {'configured' if self.codex_auth_configured() else 'not configured'}")
-        if science_identity.get("schema") == "science-login-required":
-            print("[INFO] Claude Science account: sign-in required in the Science web UI")
-        elif science_identity.get("schema") == "science-credentials-preserved":
-            print("[INFO] Claude Science account: credential state preserved; confirm sign-in in the web UI")
+        print("[INFO] Claude account: not used by the default native Claude Code workflow")
         record = self.read_gateway_record()
         if record and self.gateway_identity(record) and self.gateway_health(record):
             print(f"[OK] active gateway: {record.get('backend')} (identity verified)")
             print(f"[INFO] effective route: {self.route_description(str(record.get('backend')))}")
-            self.print_science_model_note()
+            self.print_model_alias_note()
         else:
             print("[INFO] active gateway: stopped")
-        if science.get("control_error"):
-            print("[INFO] Claude Science: control unavailable; see the failed control check above")
-        else:
-            print(f"[INFO] Claude Science: {'running' if science.get('running') else 'stopped'}")
+        print(
+            "[INFO] Optional Claude Science client: "
+            + ("installed but excluded from default starts" if self.p.science.is_file() else "not installed")
+        )
         return 0 if failures == 0 else 1
 
     def status(self) -> None:
         print(f"FinalKit root:       {self.p.root}")
         print(f"Deployed version:    {self.installed_package_version()}")
-        print(f"Science data:       {self.p.data_dir}")
+        print(f"Native client:       {self.p.claude}")
         print(f"Committed mode:     {self.current_mode() or 'unconfigured'}")
         for name, provider in API_PROVIDERS.items():
             print(
@@ -2134,35 +1978,16 @@ class RuntimeManager:
             print(f"Gateway:            healthy ({record.get('backend')}, PID {record.get('pid')})")
             print(f"Gateway endpoint:   {endpoint}")
             print(f"Effective route:    {self.route_description(str(record.get('backend')))}")
-            self.print_science_model_note()
+            self.print_model_alias_note()
         elif record:
             print("Gateway:            stale or identity check failed")
         else:
             print("Gateway:            stopped")
-        science = self.science_status()
-        if science.get("control_error"):
-            print(
-                "Claude Science:     control unavailable "
-                f"(PID {science.get('pid', 'unknown')}, state {science.get('process_state', 'unknown')})"
-            )
-            print(f"Recovery:           {self.science_recovery_message(science)}")
-        elif science.get("running"):
-            print(f"Claude Science:     running (PID {science.get('pid')}, port {science.get('port')})")
-            if record and health:
-                print(
-                    "Runtime identity:    "
-                    + ("matched" if self.science_endpoint_matches(str(record["endpoint"])) else "MISMATCH")
-                )
-        else:
-            print("Claude Science:     stopped")
-        try:
-            identity = self.ensure_science_identity(check_only=True)
-            if identity.get("schema") == "science-login-required":
-                print("Science account:    sign-in required in the Science web UI")
-            else:
-                print("Science account:    credential state preserved; confirm in the web UI")
-        except FinalKitError as exc:
-            print(f"Science account:    credential audit failed ({exc})")
+        print("Claude account:     not used")
+        print(
+            "Optional Science:    "
+            + ("installed; not used by default" if self.p.science.is_file() else "not installed")
+        )
 
     def capabilities(self) -> None:
         """Machine-readable command support; package versions never gate use."""
@@ -2182,11 +2007,13 @@ class RuntimeManager:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="fkctl", description="ScienceCodexFinalKit controller")
+    parser = argparse.ArgumentParser(
+        prog="fkctl",
+        description="FinalKit no-Claude-account WSL client and provider controller",
+    )
     parser.add_argument("--root", type=Path, default=Path(os.environ.get("FINALKIT_ROOT", DEFAULT_ROOT)))
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("prepare")
-    sub.add_parser("init-profile")
     for provider_name in API_PROVIDERS:
         sub.add_parser(f"configure-{provider_name}")
     sub.add_parser("configure-codex")
@@ -2195,10 +2022,18 @@ def build_parser() -> argparse.ArgumentParser:
     claude = sub.add_parser("claude", help="run native Claude Code through a selected FinalKit backend")
     claude.add_argument("mode", choices=sorted(VALID_MODES))
     claude.add_argument("arguments", nargs=argparse.REMAINDER)
+    browser_mcp = sub.add_parser(
+        "browser-mcp-config",
+        help="write an isolated Claude Code MCP config for a loopback Chrome endpoint",
+    )
+    browser_mcp.add_argument("--browser-url", required=True)
     gateway = sub.add_parser("gateway", help="select a backend without starting Claude Science")
     gateway.add_argument("mode", choices=sorted(VALID_MODES))
     for command in ("start", "switch", "restart", "test"):
-        item = sub.add_parser(command)
+        item = sub.add_parser(
+            command,
+            help=("select a provider gateway without starting Claude Science" if command != "test" else None),
+        )
         item.add_argument("mode", choices=sorted(VALID_MODES), nargs="?" if command == "restart" else None)
     sub.add_parser("smoke")
     sub.add_parser("test-codex-tiers")
@@ -2244,9 +2079,6 @@ def main() -> int:
         if args.command == "prepare":
             manager.prepare()
             print("PREPARE_OK")
-        elif args.command == "init-profile":
-            manager.init_profile()
-            print("PROFILE_OK")
         elif args.command.startswith("configure-") and args.command.removeprefix("configure-") in API_PROVIDERS:
             manager.configure_provider(args.command.removeprefix("configure-"))
         elif args.command == "configure-codex":
@@ -2257,6 +2089,8 @@ def main() -> int:
             manager.login_linux_codex()
         elif args.command == "claude":
             return manager.run_claude_code(args.mode, args.arguments)
+        elif args.command == "browser-mcp-config":
+            print(manager.write_browser_mcp_config(args.browser_url))
         elif args.command == "gateway":
             manager.select_gateway(args.mode)
             print(f"ACTIVE_MODE={args.mode}")
@@ -2265,11 +2099,11 @@ def main() -> int:
             mode = args.mode or manager.current_mode()
             if not mode:
                 raise FinalKitError("no mode is selected; use deepseek, kimi, glm, or codex")
-            url = manager.switch(mode)
+            endpoint = manager.switch(mode)
             print(f"ACTIVE_MODE={mode}")
             print(f"EFFECTIVE_ROUTE={manager.route_description(mode)}")
-            manager.print_science_model_note()
-            print(url)
+            manager.print_model_alias_note()
+            print(f"GATEWAY_ENDPOINT={endpoint}")
         elif args.command == "smoke":
             print(manager.smoke_local())
             print("SMOKE_OK")
@@ -2339,7 +2173,10 @@ def main() -> int:
                 if result["changed"] and not args.dry_run and not result["runtime_restarted"]:
                     print("The new route will be used on the next start.")
         elif args.command == "url":
-            print(manager.science_url())
+            record = manager.read_gateway_record()
+            if not record or not manager.gateway_identity(record) or not manager.gateway_health(record):
+                raise FinalKitError("the FinalKit gateway is not running")
+            print(record["endpoint"])
         elif args.command == "status":
             manager.status()
         elif args.command == "capabilities":

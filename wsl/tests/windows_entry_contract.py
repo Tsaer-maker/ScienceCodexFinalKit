@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline contract for stable Windows menu/action semantics."""
+"""Offline contract for no-Claude-account Windows menu/action semantics."""
 
 from __future__ import annotations
 
@@ -20,21 +20,50 @@ def function_body(source: str, name: str, next_name: str) -> str:
 
 def verify(script_path: Path) -> None:
     source = script_path.read_text(encoding="utf-8-sig")
-    science = function_body(source, "Open-Science", "Open-CurrentScience")
-    native = function_body(source, "Open-NativeClaude", "Open-Science")
-    assert '@("start", $Mode)' in science
-    assert '@("claude", $Mode)' not in science
+    kit_root = script_path.parent.parent
+    native = function_body(source, "Open-NativeClaude", "Open-ProviderWorkspace")
     assert '@("claude", $Mode)' in native
+    workspace = function_body(source, "Open-ProviderWorkspace", "Show-NativeClaudeMenu")
+    assert "Open-NativeClaude -Mode $Mode -WithBrowser" in workspace
 
-    menu_science = {"7": "deepseek", "8": "kimi", "9": "glm", "10": "codex"}
+    menu_workspace = {"7": "deepseek", "8": "kimi", "9": "glm", "10": "codex"}
     menu_claude = {"19": "deepseek", "20": "kimi", "21": "glm", "22": "codex"}
-    for number, provider in menu_science.items():
-        assert f'"{number}" {{ Open-Science {provider} }}' in source
+    for number, provider in menu_workspace.items():
+        assert f'"{number}" {{ Open-ProviderWorkspace {provider} }}' in source
     for number, provider in menu_claude.items():
         assert f'"{number}" {{ Open-NativeClaude {provider} }}' in source
-    for provider in menu_science.values():
-        assert f'"{provider}" {{ Open-Science {provider} }}' in source
-    assert 'Invoke-Fkctl (@("claude") + $claudeArguments)' in source
+    for provider in menu_workspace.values():
+        assert f'"{provider}" {{ Open-ProviderWorkspace {provider} }}' in source
+        assert f'"{provider}" {{ Open-Science {provider} }}' not in source
+    assert '"11" { Start-BrowserBridge; Show-BrowserStatus; Show-BrowserMcpInfo }' in source
+    assert '"browser-start" { Start-BrowserBridge }' in source
+    assert "function Start-DesktopProcess" in source
+    assert "$shell.ShellExecute" in source
+    assert "Start-Process -FilePath $chrome" not in source
+    assert "Open-NativeClaude -Mode $claudeMode" in source
+    assert "Runtime: WSL distro=$Distro; Linux user=$resolvedUser" in native
+    assert '"claude-menu" { Show-NativeClaudeMenu }' in source
+    for number, provider in menu_claude.items():
+        assert f'Write-Host "  {number} Start Claude Code in WSL' in source
+        launcher = kit_root / "windows" / {
+            "19": "40-Start-WSL-Claude-Code-DeepSeek.cmd",
+            "20": "41-Start-WSL-Claude-Code-Kimi.cmd",
+            "21": "42-Start-WSL-Claude-Code-GLM.cmd",
+            "22": "43-Start-WSL-Claude-Code-Codex.cmd",
+        }[number]
+        launcher_source = launcher.read_text(encoding="utf-8-sig").lower()
+        assert "-action claude" in launcher_source
+        assert f"-remainingargs {provider}" in launcher_source
+        assert "%*" not in launcher_source
+    root_launcher = (kit_root / "Start-Claude-Code-in-WSL.cmd").read_text(
+        encoding="utf-8-sig"
+    ).lower()
+    assert "-action claude-menu" in root_launcher
+    browser_launcher = (kit_root / "windows" / "30-Start-Browser-Bridge.cmd").read_text(
+        encoding="utf-8-sig"
+    ).lower()
+    assert "-action browser-start" in browser_launcher
+    assert "browser-science" not in browser_launcher
 
 
 def main() -> int:
@@ -42,7 +71,10 @@ def main() -> int:
         print("usage: windows_entry_contract.py /path/to/windows/FinalKit.ps1", file=sys.stderr)
         return 2
     verify(Path(sys.argv[1]).resolve())
-    print("WINDOWS_ENTRY_CONTRACT_OK science=7-10+provider-actions claude=19-22+claude-action")
+    print(
+        "WINDOWS_ENTRY_CONTRACT_OK no_claude_account=true "
+        "workspace=7-10+provider-actions claude=19-22+40-43+root-menu runtime=wsl"
+    )
     return 0
 
 

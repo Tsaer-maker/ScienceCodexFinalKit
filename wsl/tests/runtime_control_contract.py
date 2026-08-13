@@ -63,19 +63,6 @@ def verify(manager_path: Path) -> None:
         manager = module.RuntimeManager(paths)
         paths.data_dir.mkdir(parents=True, exist_ok=True)
 
-        # The long-lived daemon never inherits Windows drive paths or a caller
-        # working directory. FinalKit owns only the local endpoint; Claude
-        # Science itself owns its supported account sign-in.
-        os.environ["PATH"] = "/mnt/c/Windows/System32:/usr/bin:/mnt/d/Tools"
-        os.environ["PWD"] = "/mnt/d/Tools/ScienceCodexFinalKit"
-        daemon_environment = manager.science_environment("http://127.0.0.1:9876")
-        assert daemon_environment["PATH"] == module.LINUX_SYSTEM_PATH
-        assert daemon_environment["PWD"] == str(paths.science_home)
-        assert daemon_environment["HOME"] == str(paths.science_home)
-        assert "ANTHROPIC_API_KEY" not in daemon_environment
-        assert "ANTHROPIC_AUTH_TOKEN" not in daemon_environment
-        assert "/mnt/" not in daemon_environment["PATH"]
-
         original_run = module.subprocess.run
         original_live = module.process_is_live
         original_cmdline = module.process_cmdline_parts
