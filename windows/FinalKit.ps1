@@ -3,10 +3,10 @@ param(
   [ValidateSet(
     "help", "menu", "clear", "build", "bootstrap",
     "configure-deepseek", "configure-kimi", "configure-glm", "configure-codex", "configure-codex-device",
-    "login-linux-codex", "deepseek", "kimi", "glm", "codex", "claude", "science",
+    "login-linux-codex", "deepseek", "kimi", "glm", "codex", "claude", "claude-menu",
     "restart", "smoke", "test-deepseek", "test-kimi", "test-glm", "test-codex", "test-codex-tiers",
     "models", "discover-models", "update-runtime", "update-models", "update-tools",
-    "status", "doctor", "stop", "browser-start", "browser-science", "browser-status", "browser-stop",
+    "status", "doctor", "stop", "browser-start", "browser-status", "browser-stop",
     "browser-mcp-info", "init-project", "windows-review"
   )]
   [string]$Action = "help",
@@ -41,6 +41,11 @@ $PackageVersion = if (Test-Path -LiteralPath $VersionFile) { (Get-Content -Liter
 $BrowserStateRoot = Join-Path $env:LOCALAPPDATA "ScienceCodexFinalKit"
 $BrowserProfile = Join-Path $BrowserStateRoot "ChromeProfile"
 $BrowserState = Join-Path $BrowserStateRoot "browser.json"
+$BrowserMcpRoot = Join-Path $BrowserStateRoot "BrowserMcp"
+$BrowserMcpPackage = "chrome-devtools-mcp@1.2.0"
+$BrowserMcpLauncher = Join-Path $BrowserStateRoot "browser-mcp.cmd"
+$BrowserNodeVersion = "v24.19.0"
+$BrowserNodeRoot = Join-Path $BrowserStateRoot "Node-$BrowserNodeVersion"
 $script:ResolvedLinuxUser = ""
 
 function ConvertTo-NativeArgumentString {
@@ -709,9 +714,10 @@ function Invoke-Build {
   $installer = "$wslKitRoot/wsl/install-final-stack.sh"
   Write-Host "[1/4] Ubuntu 24.04 system dependencies ..."
   Invoke-WslNative -AsUser root -Command @("bash", $installer, "--system")
-  Write-Host "[2/4] Per-user Claude Science, Claude Code, Codex and provider switcher ..."
+  Write-Host "[2/4] Per-user Claude Code, Codex, provider switcher and optional compatibility files ..."
   Invoke-WslNative -AsUser $user -Command @("bash", $installer, "--user")
   Write-Host "[3/4] Pinned browser bridge dependencies ..."
+  Resolve-BrowserMcpRuntime | Out-Null
   Invoke-Fkctl -Arguments @("doctor")
   Write-Host "[4/4] Windows Codex collaboration lane ..."
   $windowsCodex = Get-Command codex -ErrorAction SilentlyContinue
@@ -752,7 +758,7 @@ function Invoke-ToolsUpdate {
   Assert-FinalKitInstalled
   $user = Resolve-LinuxUser
   $wslKitRoot = Convert-ToWslMountPath -WindowsPath $KitRoot
-  Write-Host "This network operation updates official Claude Science, Claude Code, Codex CLI," -ForegroundColor Cyan
+  Write-Host "This network operation updates official Claude Code, Codex CLI," -ForegroundColor Cyan
   Write-Host "plus the Node/Chrome MCP versions pinned by this package. FinalKit auth and model routes are preserved."
   if (-not $Force) {
     $confirmation = Read-Host "Continue with the official tool update? [y/N]"
@@ -762,6 +768,7 @@ function Invoke-ToolsUpdate {
     }
   }
   Invoke-WslNative -AsUser $user -Command @("bash", "$wslKitRoot/wsl/install-final-stack.sh", "--tools")
+  Resolve-BrowserMcpRuntime | Out-Null
   Write-Host "TOOLS_UPDATE_OK linux_user=$user" -ForegroundColor Green
 }
 
@@ -853,14 +860,27 @@ function Invoke-ModelUpdateInteractive {
 function Open-NativeClaude {
   param(
     [ValidateSet("deepseek", "kimi", "glm", "codex")][string]$Mode,
-    [string[]]$Arguments = @()
+    [string[]]$Arguments = @(),
+    [switch]$WithBrowser
   )
+  $browserArguments = @()
+  if ($WithBrowser) {
+    Assert-FkctlCapability -Capability "native-browser-mcp" -ActionLabel "native Claude Code browser bridge"
+    Start-BrowserBridge
+    Show-BrowserStatus
+    Resolve-BrowserMcpRuntime | Out-Null
+    $mcpConfig = Get-FkctlOutput -Arguments @("browser-mcp-config", "--browser-url", (Get-BrowserEndpoint))
+    if (-not $mcpConfig.StartsWith("/")) { throw "WSL did not return an absolute browser MCP config path: $mcpConfig" }
+    $browserArguments = @("--mcp-config", $mcpConfig)
+  }
   $forwarded = @()
   foreach ($argument in @($Arguments)) {
     $forwarded += @($argument -split ',' | Where-Object { $_ -ne "" })
   }
   if ($forwarded.Count -gt 0) {
-    Invoke-Fkctl (@("claude", $Mode) + $forwarded)
+    $resolvedUser = Resolve-LinuxUser
+    Write-Host "Runtime: WSL distro=$Distro; Linux user=$resolvedUser; client=Claude Code; provider=$Mode" -ForegroundColor Cyan
+    Invoke-Fkctl (@("claude", $Mode) + $browserArguments + $forwarded)
     return
   }
   $user = Resolve-LinuxUser
@@ -868,32 +888,39 @@ function Open-NativeClaude {
   if ($output) { Write-Host $output }
   $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
   if (-not $wsl) { throw "wsl.exe was not found" }
-  $terminalArgs = @("-d", $Distro, "-u", $user, "--", (Get-FkctlPath), "claude", $Mode)
+  $terminalArgs = @("-d", $Distro, "-u", $user, "--cd", "/home/$user", "--", (Get-FkctlPath), "claude", $Mode) + $browserArguments
   [void](Start-Process -FilePath $wsl.Source -ArgumentList $terminalArgs)
-  Write-Host "Opened native Claude Code with $Mode in a separate WSL terminal." -ForegroundColor Green
+  Write-Host "Runtime: WSL distro=$Distro; Linux user=$user; client=Claude Code; provider=$Mode" -ForegroundColor Cyan
+  Write-Host "Opened native Claude Code in a separate WSL terminal; Windows only launched the terminal and did not use a Windows Claude profile." -ForegroundColor Green
+  if ($WithBrowser) {
+    Write-Host "Browser tools: isolated Windows Chrome -> Windows loopback MCP -> this WSL Claude Code session." -ForegroundColor Green
+  }
 }
 
-function Open-Science {
+function Open-ProviderWorkspace {
   param([ValidateSet("deepseek", "kimi", "glm", "codex")][string]$Mode)
-  $user = Resolve-LinuxUser
-  $output = Get-WslOutput -AsUser $user -Command (@(Get-FkctlPath) + @("start", $Mode))
-  if ($output) { Write-Host $output }
-  $urls = @($output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^https?://\S+$' })
-  $url = if ($urls.Count -gt 0) { $urls[-1] } else { Get-FkctlOutput -Arguments @("url") }
-  Write-Host "Claude Science requires its own supported Claude account sign-in; provider API keys and ChatGPT/Codex login authenticate only the selected gateway." -ForegroundColor Yellow
-  Write-Host "Claude Science: $url"
-  if (-not $NoBrowser) { Start-Process -FilePath $url }
+  Open-NativeClaude -Mode $Mode -WithBrowser:(-not $NoBrowser)
 }
 
-function Open-CurrentScience {
-  $user = Resolve-LinuxUser
-  $output = Get-WslOutput -AsUser $user -Command (@(Get-FkctlPath) + @("restart"))
-  if ($output) { Write-Host $output }
-  $urls = @($output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^https?://\S+$' })
-  $url = if ($urls.Count -gt 0) { $urls[-1] } else { Get-FkctlOutput -Arguments @("url") }
-  Write-Host "Claude Science requires its own supported Claude account sign-in; provider API keys and ChatGPT/Codex login authenticate only the selected gateway." -ForegroundColor Yellow
-  Write-Host "Claude Science: $url"
-  if (-not $NoBrowser) { Start-Process -FilePath $url }
+function Show-NativeClaudeMenu {
+  Write-Host ""
+  Write-Host "Start native Claude Code in WSL" -ForegroundColor Cyan
+  Write-Host "  Configuration owner: selected Ubuntu WSL Linux user"
+  Write-Host "  Windows role: launch the interactive WSL terminal only"
+  Write-Host "  1  DeepSeek"
+  Write-Host "  2  Kimi"
+  Write-Host "  3  GLM"
+  Write-Host "  4  ChatGPT Codex"
+  Write-Host "  0  Cancel"
+  $selection = (Read-Host "Select").Trim()
+  switch ($selection) {
+    "1" { Open-NativeClaude deepseek }
+    "2" { Open-NativeClaude kimi }
+    "3" { Open-NativeClaude glm }
+    "4" { Open-NativeClaude codex }
+    "0" { return }
+    default { throw "Unknown Claude Code provider selection: $selection" }
+  }
 }
 
 function Get-ChromePath {
@@ -910,6 +937,71 @@ function Get-ChromePath {
 
 function Get-BrowserEndpoint { return "http://127.0.0.1:$BrowserPort" }
 
+function Resolve-BrowserMcpRuntime {
+  New-Item -ItemType Directory -Path $BrowserStateRoot -Force | Out-Null
+  $nodePath = Join-Path $BrowserNodeRoot "node.exe"
+  $npmPath = Join-Path $BrowserNodeRoot "npm.cmd"
+  $actualNodeVersion = ""
+  if ((Test-Path -LiteralPath $nodePath -PathType Leaf) -and (Test-Path -LiteralPath $npmPath -PathType Leaf)) {
+    try {
+      $actualNodeVersion = [string](& $nodePath --version 2>$null | Select-Object -First 1)
+      $actualNodeVersion = $actualNodeVersion.Trim()
+    } catch {
+      $actualNodeVersion = ""
+    }
+  }
+  if ($actualNodeVersion -ne $BrowserNodeVersion) {
+    $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+    if ($architecture -notin @("x64", "arm64")) { throw "Unsupported Windows Node.js architecture: $architecture" }
+    $archiveName = "node-$BrowserNodeVersion-win-$architecture.zip"
+    $baseUrl = "https://nodejs.org/dist/$BrowserNodeVersion"
+    $temporaryRoot = Join-Path $env:TEMP ("finalkit-node-" + [guid]::NewGuid().ToString("N"))
+    $archive = Join-Path $temporaryRoot $archiveName
+    $checksums = Join-Path $temporaryRoot "SHASUMS256.txt"
+    $expanded = Join-Path $temporaryRoot "expanded"
+    New-Item -ItemType Directory -Path $temporaryRoot,$expanded -Force | Out-Null
+    try {
+      Write-Host "Installing verified portable Windows Node.js $BrowserNodeVersion for the browser bridge ..." -ForegroundColor Cyan
+      Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/SHASUMS256.txt" -OutFile $checksums
+      Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/$archiveName" -OutFile $archive
+      $checksumLine = Get-Content -LiteralPath $checksums | Where-Object { $_ -match "\s+$([regex]::Escape($archiveName))$" } | Select-Object -First 1
+      if (-not $checksumLine) { throw "Official Node.js checksum entry is missing: $archiveName" }
+      $expected = ($checksumLine -split '\s+')[0].ToLowerInvariant()
+      $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+      if ($actual -ne $expected) { throw "Portable Node.js SHA256 verification failed" }
+      & tar.exe -xf $archive -C $expanded
+      if ($LASTEXITCODE -ne 0) { throw "Windows tar could not extract the verified portable Node.js archive" }
+      $source = Join-Path $expanded "node-$BrowserNodeVersion-win-$architecture"
+      if (-not (Test-Path -LiteralPath (Join-Path $source "node.exe") -PathType Leaf)) { throw "Portable Node.js archive layout is invalid" }
+      if (Test-Path -LiteralPath $BrowserNodeRoot) { Remove-Item -LiteralPath $BrowserNodeRoot -Recurse -Force }
+      Move-Item -LiteralPath $source -Destination $BrowserNodeRoot
+    } finally {
+      if (Test-Path -LiteralPath $temporaryRoot) { Remove-Item -LiteralPath $temporaryRoot -Recurse -Force }
+    }
+  }
+  $actualNodeVersion = [string](& $nodePath --version 2>$null | Select-Object -First 1)
+  if ($LASTEXITCODE -ne 0 -or $actualNodeVersion.Trim() -ne $BrowserNodeVersion) {
+    throw "Portable Windows Node.js version verification failed: expected $BrowserNodeVersion"
+  }
+  $entry = Join-Path $BrowserMcpRoot "node_modules\chrome-devtools-mcp\build\src\bin\chrome-devtools-mcp.js"
+  $packageJson = Join-Path $BrowserMcpRoot "node_modules\chrome-devtools-mcp\package.json"
+  $expectedMcpVersion = $BrowserMcpPackage.Split('@')[-1]
+  $actualMcpVersion = if (Test-Path -LiteralPath $packageJson) { (Get-Content -Raw $packageJson | ConvertFrom-Json).version } else { "" }
+  if (-not (Test-Path -LiteralPath $entry -PathType Leaf) -or $actualMcpVersion -ne $expectedMcpVersion) {
+    New-Item -ItemType Directory -Path $BrowserMcpRoot -Force | Out-Null
+    Write-Host "Installing the pinned Windows browser MCP once: $BrowserMcpPackage" -ForegroundColor Cyan
+    & $npmPath --prefix $BrowserMcpRoot install --no-audit --no-fund $BrowserMcpPackage | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "Pinned Windows browser MCP installation failed" }
+  }
+  if (-not (Test-Path -LiteralPath $entry -PathType Leaf)) { throw "Browser MCP CLI entrypoint is missing: $entry" }
+  $launcherContent = "@echo off`r`n`"$nodePath`" `"$entry`" --browser-url=$(Get-BrowserEndpoint) --slim`r`n"
+  [System.IO.File]::WriteAllText($BrowserMcpLauncher, $launcherContent, [System.Text.Encoding]::ASCII)
+  return [pscustomobject]@{
+    NodeWindows = $nodePath
+    EntryWindows = $entry
+  }
+}
+
 function Test-BrowserEndpoint {
   try {
     $response = Invoke-RestMethod -Uri "$(Get-BrowserEndpoint)/json/version" -TimeoutSec 2
@@ -917,12 +1009,29 @@ function Test-BrowserEndpoint {
   } catch { return $false }
 }
 
+function Start-DesktopProcess {
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [string[]]$ArgumentList = @()
+  )
+  $quoted = foreach ($argument in $ArgumentList) {
+    if ($argument.Contains('"')) { throw "Desktop process argument contains an unsupported quote" }
+    '"' + $argument + '"'
+  }
+  $shell = New-Object -ComObject Shell.Application
+  try {
+    $shell.ShellExecute($FilePath, ($quoted -join " "), (Split-Path -Parent $FilePath), "open", 1)
+  } finally {
+    if ($shell) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
+  }
+}
+
 function Start-BrowserBridge {
   param([string]$InitialUrl = "about:blank")
   if (Test-BrowserEndpoint) {
     Write-Host "Browser bridge is already reachable: $(Get-BrowserEndpoint)"
     if ($InitialUrl -ne "about:blank") {
-      Start-Process -FilePath (Get-ChromePath) -ArgumentList @("--user-data-dir=$BrowserProfile", $InitialUrl) | Out-Null
+      Start-DesktopProcess -FilePath (Get-ChromePath) -ArgumentList @("--user-data-dir=$BrowserProfile", $InitialUrl)
     }
     return
   }
@@ -937,7 +1046,7 @@ function Start-BrowserBridge {
     "--no-default-browser-check",
     $InitialUrl
   )
-  $process = Start-Process -FilePath $chrome -ArgumentList $arguments -PassThru
+  Start-DesktopProcess -FilePath $chrome -ArgumentList $arguments
   for ($i = 0; $i -lt 50; $i++) {
     if (Test-BrowserEndpoint) { break }
     Start-Sleep -Milliseconds 200
@@ -960,22 +1069,12 @@ function Start-BrowserBridge {
   Write-Warning "Only sign in to sites you intentionally expose to this isolated automation profile."
 }
 
-function Open-ScienceInBrowserBridge {
-  $url = Get-FkctlOutput -Arguments @("url")
-  Start-BrowserBridge -InitialUrl $url
-  Write-Host "Claude Science opened in the isolated automation Chrome: $url" -ForegroundColor Green
-  Show-BrowserMcpInfo -ScienceReady
-}
-
 function Show-BrowserStatus {
   $reachable = Test-BrowserEndpoint
   Write-Host "Browser endpoint: $(Get-BrowserEndpoint)"
   Write-Host "Isolated profile: $BrowserProfile"
   Write-Host "Status: $(if ($reachable) {'reachable'} else {'stopped'})"
-  if ($reachable -and (Test-WslDistro)) {
-    & wsl.exe -d $Distro -u (Resolve-LinuxUser) -- curl -fsS --max-time 3 "$(Get-BrowserEndpoint)/json/version" | Out-Null
-    if ($LASTEXITCODE -eq 0) { Write-Host "WSL reachability: OK" } else { Write-Warning "WSL cannot reach Windows loopback; enable WSL mirrored networking and retry." }
-  }
+  if ($reachable) { Write-Host "Browser MCP host: Windows (same loopback namespace as Chrome)" }
 }
 
 function Stop-BrowserBridge {
@@ -990,19 +1089,13 @@ function Stop-BrowserBridge {
 }
 
 function Show-BrowserMcpInfo {
-  param([switch]$ScienceReady)
+  Resolve-BrowserMcpRuntime | Out-Null
   $user = Resolve-LinuxUser
-  $linuxHome = "/home/$user"
-  $binary = "$linuxHome/.local/bin/chrome-devtools-mcp-finalkit"
-  if (-not $ScienceReady) {
-    Write-Host "Open current Science: .\FinalKit.ps1 -Action browser-science"
-    Write-Host "Browser only:        .\FinalKit.ps1 -Action browser-start"
-  }
-  Write-Host "Claude Science > Customize > Connectors > Custom MCP (stdio):"
-  Write-Host "  Command: $binary"
-  Write-Host "  Arguments: --browser-url=$(Get-BrowserEndpoint) --slim"
-  Write-Host "Optional Claude Code registration (run inside this WSL user):"
-  Write-Host "  claude mcp add chrome-devtools -- $binary --browser-url=$(Get-BrowserEndpoint) --slim"
+  Write-Host "Default no-Claude-account workflow: menu 7-10 starts this browser and injects a session-only MCP config into WSL Claude Code."
+  Write-Host "Browser only: .\FinalKit.ps1 -Action browser-start"
+  Write-Host "MCP process owner: Windows Node.js; client owner: WSL user $user"
+  Write-Host "MCP endpoint: $(Get-BrowserEndpoint)"
+  Write-Host "FinalKit does not persist this in global Claude Code settings; each menu 7-10 session receives --mcp-config explicitly."
   Write-Warning "This MCP can inspect and control every tab opened in the isolated Chrome profile."
 }
 
@@ -1017,21 +1110,12 @@ function Initialize-ProjectHandoff {
   $targetDir = Join-Path $projectPath ".science-codex"
   $target = Join-Path $targetDir "HANDOFF.md"
   $template = Join-Path $KitRoot "project-template\HANDOFF.md"
-  $reviewSkillSource = Join-Path $KitRoot "claude-science-skills\reviewing-codex-science\SKILL.md"
-  $reviewSkill = Join-Path $KitRoot "claude-science-skills\reviewing-codex-science.zip"
   if (Test-Path -LiteralPath $target) {
     Write-Host "Handoff already exists; unchanged: $target"
   } else {
     New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
     Copy-Item -LiteralPath $template -Destination $target
     Write-Host "Created collaboration handoff: $target"
-  }
-  if ((Test-Path -LiteralPath $reviewSkillSource -PathType Leaf) -and (Test-Path -LiteralPath $reviewSkill -PathType Leaf)) {
-    Write-Host "Claude Science review skill source: $reviewSkillSource"
-    Write-Host "Portable skill ZIP: $reviewSkill"
-    Write-Host "Publish from the user-controlled Claude Science browser with customize + host.skills; see operation.md section 9.2"
-  } else {
-    Write-Warning "Claude Science review skill source or package is missing: $reviewSkillSource ; $reviewSkill"
   }
 }
 
@@ -1051,20 +1135,26 @@ function Invoke-WindowsReview {
 function Show-Menu {
   while ($true) {
     Write-Host ""
-    Write-Host "Science SwitchModel / FinalKit $PackageVersion"
+    Write-Host "FinalKit no-account WSL workbench $PackageVersion"
     Write-Host "  Running from: $KitRoot" -ForegroundColor DarkGray
     Write-Host "  Default route: Opus=Sol max | Sonnet=Terra max | Haiku=Luna max; menu 17 persists future models" -ForegroundColor Cyan
     Write-Host "  1  Clear selected Ubuntu WSL (confirmed + backup)"
-    Write-Host "  2  First install / full repair WSL + Science + Claude + Codex"
+    Write-Host "  2  First install / full repair WSL + Claude Code + Codex + browser tools"
     Write-Host "  3  Configure DeepSeek"
     Write-Host "  4  Configure Kimi"
     Write-Host "  5  Configure GLM"
     Write-Host "  6  Configure ChatGPT Codex"
-    Write-Host "  7  Start Science + DeepSeek   8 + Kimi   9 + GLM   10 + Codex"
-    Write-Host "  11 Open current Science in automation Chrome"
-    Write-Host "  12 Status   13 Doctor   14 Stop Science/gateway   15 Stop automation Chrome"
+    Write-Host "  7  Start WSL Claude Code + browser + DeepSeek"
+    Write-Host "  8  Start WSL Claude Code + browser + Kimi"
+    Write-Host "  9  Start WSL Claude Code + browser + GLM"
+    Write-Host "  10 Start WSL Claude Code + browser + ChatGPT Codex"
+    Write-Host "  11 Start/check isolated automation Chrome"
+    Write-Host "  12 Status   13 Doctor   14 Stop gateway   15 Stop automation Chrome"
     Write-Host "  16 Update FinalKit runtime   17 Update provider models   18 Update official tools"
-    Write-Host "  19 Claude Code + DeepSeek   20 + Kimi   21 + GLM   22 + Codex"
+    Write-Host "  19 Start Claude Code in WSL + DeepSeek"
+    Write-Host "  20 Start Claude Code in WSL + Kimi"
+    Write-Host "  21 Start Claude Code in WSL + GLM"
+    Write-Host "  22 Start Claude Code in WSL + ChatGPT Codex"
     Write-Host "  0  Exit"
     $selection = Read-Host "Select"
     try {
@@ -1078,11 +1168,11 @@ function Show-Menu {
           Assert-FkctlCapability -Capability "browser-codex-oauth" -ActionLabel "ChatGPT Codex browser login"
           Invoke-Fkctl @("configure-codex")
         }
-        "7" { Open-Science deepseek }
-        "8" { Open-Science kimi }
-        "9" { Open-Science glm }
-        "10" { Open-Science codex }
-        "11" { Open-ScienceInBrowserBridge }
+        "7" { Open-ProviderWorkspace deepseek }
+        "8" { Open-ProviderWorkspace kimi }
+        "9" { Open-ProviderWorkspace glm }
+        "10" { Open-ProviderWorkspace codex }
+        "11" { Start-BrowserBridge; Show-BrowserStatus; Show-BrowserMcpInfo }
         "12" { Invoke-Fkctl @("status") }
         "13" { Invoke-Fkctl @("doctor") }
         "14" { Invoke-Fkctl @("stop") }
@@ -1105,7 +1195,7 @@ function Show-Menu {
 
 function Show-Help {
   @"
-Science SwitchModel / FinalKit $PackageVersion
+FinalKit no-account WSL workbench $PackageVersion
 
 1. Clear (optional, destructive, exact-name confirmation, backup by default):
   .\FinalKit.ps1 -Action clear
@@ -1120,9 +1210,9 @@ Providers and start:
   .\FinalKit.ps1 -Action configure-codex
   .\FinalKit.ps1 -Action configure-codex-device  # beta fallback when browser OAuth cannot return to WSL
   .\FinalKit.ps1 -Action test-codex-tiers        # explicit 3-request Sol/Terra/Luna account acceptance test
-  .\FinalKit.ps1 -Action deepseek | kimi | glm | codex  # start Claude Science with the selected route
-  .\FinalKit.ps1 -Action science                         # open Science; supported Claude sign-in required
-  .\FinalKit.ps1 -Action claude -RemainingArgs deepseek,--help  # explicit native Claude Code path
+  .\FinalKit.ps1 -Action deepseek | kimi | glm | codex  # WSL Claude Code + isolated Windows browser; no Claude account
+  .\FinalKit.ps1 -Action deepseek -NoBrowser             # WSL Claude Code only
+  .\FinalKit.ps1 -Action claude -RemainingArgs deepseek,--help  # scripted native Claude Code path
 
 Independent updates (no WSL rebuild):
   .\FinalKit.ps1 -Action update-runtime
@@ -1135,15 +1225,12 @@ Independent updates (no WSL rebuild):
 
 Isolated Windows browser bridge:
   .\FinalKit.ps1 -Action browser-start
-  .\FinalKit.ps1 -Action browser-science
   .\FinalKit.ps1 -Action browser-mcp-info
   .\FinalKit.ps1 -Action browser-stop
 
 Collaboration:
   .\FinalKit.ps1 -Action init-project -Project D:\path\to\project
   .\FinalKit.ps1 -Action windows-review -Project D:\path\to\project
-  Publish claude-science-skills\reviewing-codex-science\SKILL.md from the Claude Science browser with customize + host.skills
-  The sibling ZIP is only for Claude surfaces that expose standard custom-Skills upload
 
 Defaults: distro=$Distro; normal per-Windows-user WSL storage; Linux user=auto from the current Windows username (or -LinuxUser)
 "@
@@ -1194,19 +1281,23 @@ try {
       Invoke-Fkctl @("configure-codex-device")
     }
     "login-linux-codex" { Invoke-Fkctl @("login-linux-codex") }
-    "deepseek" { Open-Science deepseek }
-    "kimi" { Open-Science kimi }
-    "glm" { Open-Science glm }
-    "codex" { Open-Science codex }
+    "deepseek" { Open-ProviderWorkspace deepseek }
+    "kimi" { Open-ProviderWorkspace kimi }
+    "glm" { Open-ProviderWorkspace glm }
+    "codex" { Open-ProviderWorkspace codex }
     "claude" {
       if (-not $RemainingArgs -or $RemainingArgs.Count -lt 1) { throw "claude needs provider first: deepseek|kimi|glm|codex" }
       $claudeArguments = @()
       foreach ($argument in @($RemainingArgs)) {
         $claudeArguments += @($argument -split ',' | Where-Object { $_ -ne "" })
       }
-      Invoke-Fkctl (@("claude") + $claudeArguments)
+      $claudeMode = $claudeArguments[0]
+      if ($claudeMode -notin @("deepseek", "kimi", "glm", "codex")) {
+        throw "claude provider must be deepseek, kimi, glm, or codex"
+      }
+      Open-NativeClaude -Mode $claudeMode -Arguments @($claudeArguments | Select-Object -Skip 1)
     }
-    "science" { Open-CurrentScience }
+    "claude-menu" { Show-NativeClaudeMenu }
     "restart" {
       Invoke-Fkctl @("restart")
       $url = Get-FkctlOutput @("url")
@@ -1225,7 +1316,6 @@ try {
     "doctor" { Invoke-Fkctl @("doctor"); if (Get-Command codex -ErrorAction SilentlyContinue) { codex --version; codex login status } }
     "stop" { Invoke-Fkctl @("stop") }
     "browser-start" { Start-BrowserBridge }
-    "browser-science" { Open-ScienceInBrowserBridge }
     "browser-status" { Show-BrowserStatus }
     "browser-stop" { Stop-BrowserBridge }
     "browser-mcp-info" { Show-BrowserMcpInfo }

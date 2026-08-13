@@ -53,7 +53,8 @@ targets=(
   "$test_root/bridge.requirements.resolved.txt"
   "$test_root/versions.txt"
   "$test_home/.local/bin/fkctl"
-  "$test_home/.local/bin/chrome-devtools-mcp-finalkit"
+  "$test_home/.science-finalkit/.codex/auth.json"
+  "$test_home/.finalkit-client/.codex/auth.json"
 )
 
 for target in "${targets[@]}"; do

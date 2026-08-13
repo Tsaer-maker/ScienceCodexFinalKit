@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-# Science SwitchModel / FinalKit v3 installer.
+# FinalKit no-account WSL workbench installer.
 # Windows invokes --system once as root and --user as the ordinary WSL user.
 # It never creates a passwordless-sudo rule and never changes Windows/WSL proxy
 # settings, .wslconfig, Docker, or another distribution.
@@ -103,50 +103,6 @@ download_and_run() {
   trap - RETURN
 }
 
-install_node_and_browser_mcp() {
-  local root="$1"
-  local real_home="$2"
-  local machine node_arch archive base_url checksum archive_path expected actual node_dir mcp_dir temp_dir
-  machine="$(uname -m)"
-  case "$machine" in
-    x86_64) node_arch="x64" ;;
-    aarch64|arm64) node_arch="arm64" ;;
-    *) die "Unsupported Node.js architecture: $machine" ;;
-  esac
-  archive="node-${NODE_VERSION}-linux-${node_arch}.tar.xz"
-  base_url="https://nodejs.org/dist/${NODE_VERSION}"
-  node_dir="$root/node-${NODE_VERSION}"
-  mcp_dir="$root/browser-mcp"
-  if [[ ! -x "$node_dir/bin/node" ]]; then
-    checksum="$(mktemp)"
-    archive_path="$(mktemp --suffix=.tar.xz)"
-    temp_dir="$(mktemp -d "$root/.node.XXXXXX")"
-    trap 'rm -f "${checksum:-}" "${archive_path:-}"; [[ -z "${temp_dir:-}" ]] || rm -rf -- "$temp_dir"' RETURN
-    network_retry_direct curl -fL --retry 3 --connect-timeout 20 "$base_url/SHASUMS256.txt" -o "$checksum"
-    network_retry_direct curl -fL --retry 3 --connect-timeout 20 "$base_url/$archive" -o "$archive_path"
-    expected="$(awk -v name="$archive" '$2 == name {print $1}' "$checksum")"
-    [[ -n "$expected" ]] || die "Node.js checksum entry is missing for $archive"
-    actual="$(sha256sum "$archive_path" | awk '{print $1}')"
-    [[ "$actual" == "$expected" ]] || die "Node.js checksum verification failed"
-    tar -xJf "$archive_path" --strip-components=1 -C "$temp_dir"
-    mv -- "$temp_dir" "$node_dir"
-    temp_dir=""
-    rm -f "$checksum" "$archive_path"
-    trap - RETURN
-  fi
-  ln -sfn "$node_dir/bin/node" "$real_home/.local/bin/node"
-  ln -sfn "$node_dir/bin/npm" "$real_home/.local/bin/npm"
-  ln -sfn "$node_dir/bin/npx" "$real_home/.local/bin/npx"
-  ln -sfn "$node_dir" "$root/node-current"
-  if [[ ! -x "$mcp_dir/node_modules/.bin/chrome-devtools-mcp" ]] || \
-     [[ "$(jq -r '.version // empty' "$mcp_dir/node_modules/chrome-devtools-mcp/package.json" 2>/dev/null || true)" != "$CHROME_MCP_VERSION" ]]; then
-    mkdir -p "$mcp_dir"
-    network_retry_direct "$node_dir/bin/npm" --prefix "$mcp_dir" install --no-audit --no-fund \
-      "chrome-devtools-mcp@$CHROME_MCP_VERSION"
-  fi
-  [[ -x "$mcp_dir/node_modules/.bin/chrome-devtools-mcp" ]] || die "Chrome DevTools MCP installation failed"
-}
-
 ensure_bridge_checkout() {
   local bridge_dir="$1"
   local origin current changed proxy_sha
@@ -238,15 +194,19 @@ write_versions_metadata() {
   bridge_commit="$(tr -d '\r\n' <"$root/bridge.commit")"
   trap 'rm -f -- "${versions_pending:-}"' RETURN
   {
-    printf 'package=Science SwitchModel / FinalKit\n'
+    printf 'package=FinalKit no-account WSL workbench\n'
     printf 'package_version=%s\n' "$runtime_version"
     printf 'installed_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'bridge_commit=%s\n' "$bridge_commit"
-    printf 'claude_science='; "$science_bin" --version | head -n 1
+    if [[ -x "$science_bin" ]]; then
+      printf 'claude_science_optional='; "$science_bin" --version | head -n 1
+    else
+      printf 'claude_science_optional=not-installed\n'
+    fi
     printf 'claude_code='; "$claude_bin" --version | head -n 1
     printf 'codex='; "$codex_bin" --version | head -n 1
-    printf 'node='; "$real_home/.local/bin/node" --version
-    printf 'chrome_devtools_mcp=%s\n' "$CHROME_MCP_VERSION"
+    printf 'windows_node=%s\n' "$NODE_VERSION"
+    printf 'windows_chrome_devtools_mcp=%s\n' "$CHROME_MCP_VERSION"
     printf 'python='; python3 --version
   } >"$versions_pending"
   chmod 600 "$versions_pending"
@@ -261,13 +221,14 @@ install_user() {
   [[ "$EUID" -ne 0 ]] || die "--user/--runtime must run as the ordinary WSL user"
   verify_ubuntu
 
-  local real_home root bridge_dir science_bin claude_bin codex_bin science_home legacy_science_home
+  local real_home root bridge_dir science_bin claude_bin codex_bin client_home science_home legacy_science_home
   real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
   [[ -n "$real_home" && "$real_home" != "/root" ]] || die "Could not resolve an ordinary-user home"
   export HOME="$real_home"
   export PATH="$real_home/.local/bin:$PATH"
   root="${FINALKIT_ROOT:-$real_home/.local/share/science-codex-finalkit}"
   bridge_dir="$root/bridge"
+  client_home="$real_home/.finalkit-client"
   science_home="$real_home/.science-finalkit"
   legacy_science_home="$root/science-home"
   science_bin="$real_home/.local/bin/claude-science"
@@ -282,13 +243,7 @@ install_user() {
     note "Migrating the draft Science profile to the short AF_UNIX-safe path..."
     mv -- "$legacy_science_home" "$science_home"
   fi
-  install -d -m 700 "$science_home"
-
-  if [[ "$install_mode" == "full" && ( ! -x "$science_bin" || "${FINALKIT_UPGRADE_TOOLS:-0}" == "1" ) ]]; then
-    note "Installing official Claude Science..."
-    download_and_run "https://claude.ai/install-claude-science.sh" "Claude Science"
-  fi
-  [[ -x "$science_bin" ]] || die "Claude Science was not installed at $science_bin"
+  install -d -m 700 "$client_home"
 
   if [[ "$install_mode" == "full" && ( ! -x "$claude_bin" || "${FINALKIT_UPGRADE_TOOLS:-0}" == "1" ) ]]; then
     note "Installing official native Linux Claude Code (stable)..."
@@ -303,12 +258,8 @@ install_user() {
   [[ -x "$codex_bin" ]] || die "Codex CLI was not installed at $codex_bin"
 
   if [[ "$install_mode" == "full" ]]; then
-    note "Installing pinned Node.js LTS and optional Chrome DevTools MCP bridge..."
-    install_node_and_browser_mcp "$root" "$real_home"
+    note "Browser MCP runs on Windows so it shares Chrome's loopback; WSL browser dependencies are not installed."
   else
-    [[ -x "$real_home/.local/bin/node" ]] || die "Node.js is missing; use --tools or the full Build"
-    [[ -x "$real_home/.local/bin/chrome-devtools-mcp-finalkit" ]] || \
-      die "FinalKit browser wrapper is missing; use the full Build once"
     [[ -d "$bridge_dir/.git" ]] || die "Connector checkout is missing; use the full Build once"
     git -C "$bridge_dir" cat-file -e "$BRIDGE_REF^{commit}" 2>/dev/null || \
       die "Pinned connector commit is not available locally; use the full Build with network access"
@@ -343,19 +294,22 @@ install_user() {
   note "Verifying the offline Codex route and model-catalog contract..."
   "$bridge_dir/.venv/bin/python" \
     "$SCRIPT_DIR/tests/connector_contract.py" "$bridge_dir/proxy.py"
-  note "Verifying the offline Claude Science ownership/control contract..."
+  note "Verifying the legacy optional Science ownership/control safety contract..."
   python3 "$SCRIPT_DIR/tests/runtime_control_contract.py" \
     "$SCRIPT_DIR/runtime/switch_manager.py"
-  note "Verifying the restart-stable Claude Science local-identity contract..."
+  note "Verifying exact removal of obsolete FinalKit Science virtual identities..."
   "$bridge_dir/.venv/bin/python" \
     "$SCRIPT_DIR/tests/science_identity_contract.py" \
     "$SCRIPT_DIR/runtime/science_identity.py"
   note "Verifying persistent model-route migration and update semantics..."
   python3 "$SCRIPT_DIR/tests/model_routes_contract.py" \
     "$SCRIPT_DIR/runtime/switch_manager.py"
-  note "Verifying the offline Windows Start Science / native Claude entry contract..."
+  note "Verifying the offline no-account Windows/native Claude entry contract..."
   python3 "$SCRIPT_DIR/tests/windows_entry_contract.py" \
     "$SCRIPT_DIR/../windows/FinalKit.ps1"
+  note "Verifying no-account Claude Code route labels and loopback browser MCP config..."
+  python3 "$SCRIPT_DIR/tests/native_client_contract.py" \
+    "$SCRIPT_DIR/runtime/switch_manager.py"
   if [[ "$install_mode" == "full" ]]; then
     note "Verifying runtime-update rollback semantics..."
     bash "$SCRIPT_DIR/tests/installer_update_contract.sh" "$SCRIPT_DIR/install-final-stack.sh"
@@ -365,7 +319,6 @@ install_user() {
   install -m 700 "$SCRIPT_DIR/runtime/science_identity.py" "$root/runtime/science_identity.py"
   install -m 700 "$SCRIPT_DIR/runtime/switch_manager.py" "$root/runtime/switch_manager.py"
   install -m 700 "$SCRIPT_DIR/fkctl" "$real_home/.local/bin/fkctl"
-  install -m 700 "$SCRIPT_DIR/chrome-devtools-mcp-finalkit" "$real_home/.local/bin/chrome-devtools-mcp-finalkit"
   generate_identity_files "$root"
   chmod 600 "$root/bridge.commit" "$root/bridge.requirements.resolved.txt" \
     "$root/instance.id" "$root/secrets/gateway-path.token" \
@@ -374,8 +327,18 @@ install_user() {
   # A repair install replaces runtime owners.  Close only this FinalKit
   # instance first; the manager refuses to kill a PID whose identity differs.
   "$real_home/.local/bin/fkctl" stop
+  if [[ -d "$science_home/.claude-science" ]]; then
+    note "Removing only exact obsolete FinalKit virtual Science identities; unknown credentials are preserved..."
+    "$bridge_dir/.venv/bin/python" "$SCRIPT_DIR/runtime/science_identity.py" ensure \
+      --data-dir "$science_home/.claude-science" >/dev/null
+  fi
+  if [[ -f "$science_home/.codex/auth.json" && ! -e "$client_home/.codex/auth.json" ]]; then
+    note "Migrating the FinalKit-owned Codex auth cache out of the legacy Science-named directory..."
+    install -d -m 700 "$client_home/.codex"
+    mv -- "$science_home/.codex/auth.json" "$client_home/.codex/auth.json"
+    chmod 600 "$client_home/.codex/auth.json"
+  fi
   "$real_home/.local/bin/fkctl" prepare
-  "$real_home/.local/bin/fkctl" init-profile
 
   FINALKIT_CANDIDATE_VERSION="$PACKAGE_VERSION" "$real_home/.local/bin/fkctl" doctor
   "$real_home/.local/bin/fkctl" smoke
@@ -386,7 +349,7 @@ install_user() {
     note "FinalKit runtime update completed; provider auth and model routes were preserved."
     note "The runtime is stopped. Start the provider you want from the Windows menu."
   else
-    note "Science SwitchModel installation completed."
+    note "FinalKit no-account WSL workbench installation completed."
     note "Next: configure DeepSeek, Kimi, GLM and/or ChatGPT Codex per Linux user."
   fi
 }
@@ -413,7 +376,8 @@ update_runtime() {
     "$root/bridge.requirements.resolved.txt"
     "$root/versions.txt"
     "$real_home/.local/bin/fkctl"
-    "$real_home/.local/bin/chrome-devtools-mcp-finalkit"
+    "$real_home/.science-finalkit/.codex/auth.json"
+    "$real_home/.finalkit-client/.codex/auth.json"
   )
   mkdir -p "$backup/files"
   for target in "${targets[@]}"; do
@@ -458,18 +422,16 @@ update_tools() {
   science_bin="$real_home/.local/bin/claude-science"
   claude_bin="$real_home/.local/bin/claude"
   codex_bin="$real_home/.local/bin/codex"
-  auth_file="$real_home/.science-finalkit/.codex/auth.json"
+  auth_file="$real_home/.finalkit-client/.codex/auth.json"
   [[ -x "$real_home/.local/bin/fkctl" && -f "$root/bridge.commit" ]] || \
     die "FinalKit is not installed for this Linux user; use the full Build"
   auth_before=""
   [[ ! -f "$auth_file" ]] || auth_before="$(sha256sum "$auth_file" | awk '{print $1}')"
   "$real_home/.local/bin/fkctl" stop
-  note "Updating official Claude Science, Claude Code and Codex CLI..."
-  download_and_run "https://claude.ai/install-claude-science.sh" "Claude Science"
+  note "Updating official Claude Code and Codex CLI..."
   download_and_run "https://claude.ai/install.sh" "Claude Code" "claude"
   download_and_run "https://chatgpt.com/codex/install.sh" "Codex CLI" "codex"
-  note "Updating the package-pinned Node.js and Chrome DevTools MCP dependencies..."
-  install_node_and_browser_mcp "$root" "$real_home"
+  note "Windows owns the package-pinned Node.js and Chrome DevTools MCP dependencies."
   [[ -x "$bridge_dir/.venv/bin/pip" ]] || die "Connector Python environment is missing; use the full Build"
   expected_requirements="$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' \
     "$SCRIPT_DIR/requirements.lock" | LC_ALL=C sort -f)"
@@ -484,7 +446,7 @@ update_tools() {
   "$bridge_dir/.venv/bin/pip" check
   "$bridge_dir/.venv/bin/pip" freeze >"$root/bridge.requirements.resolved.txt"
   chmod 600 "$root/bridge.requirements.resolved.txt"
-  [[ -x "$science_bin" && -x "$claude_bin" && -x "$codex_bin" ]] || die "an official client update did not install all expected binaries"
+  [[ -x "$claude_bin" && -x "$codex_bin" ]] || die "an official client update did not install all expected binaries"
   if [[ -n "$auth_before" ]]; then
     [[ -f "$auth_file" ]] || die "Codex auth disappeared during the tool update"
     [[ "$(sha256sum "$auth_file" | awk '{print $1}')" == "$auth_before" ]] || \
