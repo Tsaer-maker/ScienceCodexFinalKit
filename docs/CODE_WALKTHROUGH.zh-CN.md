@@ -1,4 +1,4 @@
-# Science SwitchModel / FinalKit 3.1.3 代码剖析
+# Science SwitchModel / FinalKit 3.1.4 代码剖析
 
 本文面向维护者，解释永久 owner、安装路径、provider 请求、事务切换、浏览器桥与多用户边界。README 负责普通用户操作；这里负责“为什么代码这样写”。
 
@@ -15,6 +15,7 @@
 | `wsl/tests/runtime_control_contract.py` | 无凭据、无真实进程验证 Science stopped/healthy/stale/lock-conflict 控制语义 | 强杀 WSL、真实 daemon 可用性、模型请求 |
 | `wsl/tests/science_identity_contract.py` | 无真实凭据验证 login-required、Fernet/v2 精确移除和未知凭据保护 | 真实 Claude 登录、网络认证 |
 | `wsl/tests/model_routes_contract.py` | 无凭据、无真实进程验证配置迁移、dry-run、原子持久化、未来 provider 保留 | 厂商账号是否接受某模型 ID |
+| `wsl/tests/windows_entry_contract.py` | 无凭据、无进程锁定菜单 7–10/四个 provider action 为 Science，19–22/claude action 为 Claude Code | 真实浏览器与 CLI 交互 |
 | `wsl/tests/installer_update_contract.sh` | 临时 fixture 验证 runtime 更新失败精确回滚和成功提交 | 真实 WSL 服务重启、供应商网络 |
 
 `wsl/fkctl` 只是稳定入口：解析真实 Linux home 后 `exec` 系统 Python 运行 manager。`.cmd` 文件也只是给普通用户的薄入口，不复制业务逻辑。
@@ -90,7 +91,7 @@ installer 通过临时文件下载并运行三个官方 installer：
 
 `Build` 仍是首次安装与完整修复 owner，但不再承担所有日常变更：
 
-- `install-final-stack.sh --runtime` 只部署包内 runtime owner 和受控 connector patch。它先跑离线 connector、runtime-control、science-identity、model-route contract，完整 Build 另跑 runtime-update rollback contract；失败时按精确文件备份恢复，provider/Codex 认证与模型配置不属于替换集合。Science OAuth 清理属于 3.1.3 的显式兼容边界：只移除已完整认证为 FinalKit 虚拟身份的旧文件。
+- `install-final-stack.sh --runtime` 只部署包内 runtime owner 和受控 connector patch。它先跑离线 connector、runtime-control、science-identity、model-route 和 Windows-entry contract，完整 Build 另跑 runtime-update rollback contract；失败时按精确文件备份恢复，provider/Codex 认证与模型配置不属于替换集合。Science OAuth 清理自 3.1.3 起属于显式兼容边界：只移除已完整认证为 FinalKit 虚拟身份的旧文件。
 - `fkctl discover-models` 只读请求 DeepSeek/Kimi/GLM 包内固定的官方模型目录 URL，以当前 Linux 用户已经保存的 provider key 鉴权；只解析合法 `data[].id`，不做生成请求、不打印 key、不写配置。网络层先直连，再只对 transport failure 尝试继承代理；HTTP 认证/权限失败不会换通道重放。`fkctl update-models` 才更新 `config/model-routes.json`。该 JSON 是模型选择的唯一持久 owner，`bridge/config.json` 是可再生的 Codex 兼容派生配置。更新支持 `--dry-run --json`，用临时文件、`fsync` 和 `os.replace` 原子提交；若修改的是当前 backend，必须显式 `--restart`，失败恢复旧配置与已观察到的 runtime。
 - `install-final-stack.sh --tools` 是明确联网的官方客户端/依赖更新。它在更新前停止 FinalKit，更新官方客户端、Node/MCP 与 `requirements.lock` 后核对 Codex auth 文件字节哈希未变，并保留模型路由。
 
@@ -229,7 +230,7 @@ HOME=~/.science-finalkit
 ANTHROPIC_BASE_URL=<verified local gateway>
 ```
 
-Science 0.1.27 的 Web UI 需要其自身支持的 Claude 账号登录；DeepSeek/Kimi/GLM API key 和 ChatGPT/Codex OAuth 只认证 FinalKit gateway，不能代替 Science 会话。旧版 FinalKit 曾写入虚拟 refresh token，Science 会把它发往官方 OAuth refresh endpoint，得到 `invalid_grant` 后将页面判为 logged-out。3.1.3 只在能完整解密并验证为旧 FinalKit Fernet/v2 虚拟身份时原子移除它；未知或真实凭据一律原样保留。原生 `fkctl claude <provider>` 不启动 Science，因此只准备 provider/Codex 认证即可使用。Codex 的官方 device/browser auth 仍独立保存在 `~/.science-finalkit/.codex/auth.json`。
+Science 0.1.27 的 Web UI 需要其自身支持的 Claude 账号登录；DeepSeek/Kimi/GLM API key 和 ChatGPT/Codex OAuth 只认证 FinalKit gateway，不能代替 Science 会话。旧版 FinalKit 曾写入虚拟 refresh token，Science 会把它发往官方 OAuth refresh endpoint，得到 `invalid_grant` 后将页面判为 logged-out。自 3.1.3 起只在能完整解密并验证为旧 FinalKit Fernet/v2 虚拟身份时原子移除它；未知或真实凭据一律原样保留。原生 `fkctl claude <provider>` 不启动 Science，因此只准备 provider/Codex 认证即可使用。Codex 的官方 device/browser auth 仍独立保存在 `~/.science-finalkit/.codex/auth.json`。
 
 短路径避免 Science sandbox 的多层 AF_UNIX socket 超过 Linux `sun_path` 限制。所有 Science status/stop/serve/url 子进程还固定在 WSL ext4 的 `~/.science-finalkit` 工作目录运行，并使用纯 Linux PATH；即使安装包位于 D/E 盘、微信临时目录或网盘，detached daemon 也不会继承 `/mnt/<drive>` 的 9p/DrvFS cwd/PATH 并卡在 `p9_client_rpc`。manager 用 Science 自己的 status 读取真实 daemon PID，再同时核对 `/proc/<pid>/cmdline`、`HOME`、`--data-dir`、lock PID、Linux process state 与 endpoint，而不是只相信启动命令退出码。对同一完整 owner 的一次瞬时 control socket/JSON 失败只做短暂有限重试；PID/lock/HOME/data-dir 身份冲突立即 fail-closed。即使官方 status 返回 running，只要 owner 已进入 Linux `D`（uninterruptible I/O），页面和 control socket 就不能再作为健康证据，Status/Doctor/Start/Smoke 会返回 `FINALKIT_SCIENCE_CONTROL_UNAVAILABLE`。manager 不对这类进程发送信号，而是要求用户从 Windows 精确 terminate 选定 WSL distribution 后做菜单 16 runtime 更新，只有 runtime 缺失或完整栈损坏时才用菜单 2 修复。
 
@@ -248,7 +249,7 @@ Chrome 136+ 要求远程调试使用非默认 `--user-data-dir`。`Start-Browser
 
 WSL 侧 `chrome-devtools-mcp-finalkit` 以固定 Node 绝对路径启动 MCP，再通过 `--browser-url=http://127.0.0.1:9223` 连接 Windows Chrome。包装入口不依赖交互 shell 的 PATH。FinalKit 不自动改 Science 或 Claude Code MCP 配置，因为该 MCP 能读取/控制隔离 profile 中的所有页面，启用必须是用户的显式决定。
 
-`browser-start` 只建立一个可自动化的空浏览器，适合普通网页任务；`browser-science` 先从运行时取得当前带会话参数的 Science URL，再把该 URL 交给同一个隔离 Chrome。菜单 `19` 调用后者；菜单 `11` 负责打开 Science，菜单 `7–10` 则直接进入不依赖 Science 会话的原生 Claude Code。
+`browser-start` 只建立一个可自动化的空浏览器，适合普通网页任务；`browser-science` 先从运行时取得当前带会话参数的 Science URL，再把该 URL 交给同一个隔离 Chrome。菜单 `7–10` 保持 Start Science 语义，菜单 `11` 调用 `browser-science`；不依赖 Science 会话的原生 Claude Code 明确放在菜单 `19–22` 和 `-Action claude`。
 
 ## 11. Windows Codex 与 Claude Science 审阅闭环
 

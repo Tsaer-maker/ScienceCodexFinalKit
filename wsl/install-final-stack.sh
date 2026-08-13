@@ -353,6 +353,9 @@ install_user() {
   note "Verifying persistent model-route migration and update semantics..."
   python3 "$SCRIPT_DIR/tests/model_routes_contract.py" \
     "$SCRIPT_DIR/runtime/switch_manager.py"
+  note "Verifying the offline Windows Start Science / native Claude entry contract..."
+  python3 "$SCRIPT_DIR/tests/windows_entry_contract.py" \
+    "$SCRIPT_DIR/../windows/FinalKit.ps1"
   if [[ "$install_mode" == "full" ]]; then
     note "Verifying runtime-update rollback semantics..."
     bash "$SCRIPT_DIR/tests/installer_update_contract.sh" "$SCRIPT_DIR/install-final-stack.sh"
