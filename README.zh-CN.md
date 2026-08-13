@@ -1,4 +1,4 @@
-# Science SwitchModel / FinalKit 3.1.1
+# Science SwitchModel / FinalKit 3.1.2
 
 这是一个面向普通 Windows 用户的可重建科研 Agent 环境：在标准 Ubuntu 24.04 WSL2 内安装 Claude Science、原生 Linux Claude Code、Linux Codex CLI，以及 DeepSeek、Kimi、GLM、ChatGPT/Codex 四种后端；Windows 侧继续使用已登录的 Codex，并可通过一份项目交接文件和一个显式启用的隔离浏览器桥与 WSL 协作。
 
@@ -73,7 +73,7 @@ Build 完成四件事：
 
 Build 可重复运行用于修复。它不会建立 passwordless sudo，不修改 `.wslconfig`、Windows 代理或默认浏览器，不复制其他用户的登录状态。
 
-3.0.1–3.0.3 依次修复无发行版、本地化 WSL 输出以及首次安装需要提升时的 Build 中断。3.0.4 将 ChatGPT/Codex 默认授权改为官方浏览器 OAuth，并让官方 WSL Codex 缓存成为 connector 唯一凭据 owner。3.0.5 增加 `Windows Codex 实施 -> Claude Science 独立审阅 -> Windows Codex 核验/修复` 闭环和标准审阅 skill。3.0.6 校准本地 Science skill 发布面，同时修正 Codex 三档路由。3.0.7 去掉精确发行号门禁，按命令 capability 兼容旧 runtime，并让 Codex `/v1/models` 透明显示真实三档模型。3.1.0 将升级拆成 FinalKit runtime、厂商模型路由和官方工具三个独立入口；3.1.1 又为 DeepSeek/Kimi/GLM 增加按当前账号读取官方可调用模型目录、编号选择和确认式更新。模型路由成为每个 Linux 用户持久拥有、原子写入、可预览且不会被以后软件包默认值覆盖的配置。发行号只用于识别分发包和诊断，不是运行门禁；beta device code 仅保留为显式备用。
+3.0.1–3.0.3 依次修复无发行版、本地化 WSL 输出以及首次安装需要提升时的 Build 中断。3.0.4 将 ChatGPT/Codex 默认授权改为官方浏览器 OAuth，并让官方 WSL Codex 缓存成为 connector 唯一凭据 owner。3.0.5 增加 `Windows Codex 实施 -> Claude Science 独立审阅 -> Windows Codex 核验/修复` 闭环和标准审阅 skill。3.0.6 校准本地 Science skill 发布面，同时修正 Codex 三档路由。3.0.7 去掉精确发行号门禁，按命令 capability 兼容旧 runtime，并让 Codex `/v1/models` 透明显示真实三档模型。3.1.0 将升级拆成 FinalKit runtime、厂商模型路由和官方工具三个独立入口；3.1.1 又为 DeepSeek/Kimi/GLM 增加按当前账号读取官方可调用模型目录、编号选择和确认式更新；3.1.2 将 Claude Science 0.1.27 切到官方环境变量支持的 API-key-only BYOK 模式，原子移除可验证的旧 FinalKit 虚拟 OAuth，避免 `invalid_grant` 后快速 sign out，并用纯 Linux PATH/PWD 避免 WSL DrvFS/9p 阻塞。模型路由成为每个 Linux 用户持久拥有、原子写入、可预览且不会被以后软件包默认值覆盖的配置。发行号只用于识别分发包和诊断，不是运行门禁；beta device code 仅保留为显式备用。
 
 ### 多用户模型
 
@@ -322,7 +322,7 @@ HGSX 的离线 Docker 可能适合供应商封装、固定大环境或受控演�
 
 `smoke` 会依次启动 DeepSeek/Kimi/GLM 本地离线 gateway，验证 provider 身份、私密 path、PID/start ticks 和 Claude Science endpoint；占位 key 只存在匿名 pipe 中，不落盘，也不连接供应商。
 
-Build 还会调用 `wsl/tests/connector_contract.py`，在临时配置中替换认证与 HTTP client，逐档捕获 connector 最终准备发送的 Responses payload。只有模型目录恰好为三条、Opus/Sonnet/Haiku 分别成为 Sol/Terra/Luna 且 `reasoning.effort=max` 才通过；`wsl/tests/runtime_control_contract.py` 另行覆盖 Science 正常停止、健康 owner、失联 control socket、PID/lock 冲突和“不得发送信号”的失败路径；`wsl/tests/model_routes_contract.py` 覆盖旧错误默认值迁移、dry-run、原子持久化、非法 ID 和未来 provider 保留；`wsl/tests/installer_update_contract.sh` 用临时 fixture 覆盖 runtime 更新失败的精确文件回滚与成功提交。四者都不读取真实 auth、不连接网络，也不产生账号用量。
+Build 还会调用 `wsl/tests/connector_contract.py`，在临时配置中替换认证与 HTTP client，逐档捕获 connector 最终准备发送的 Responses payload。只有模型目录恰好为三条、Opus/Sonnet/Haiku 分别成为 Sol/Terra/Luna 且 `reasoning.effort=max` 才通过；`wsl/tests/runtime_control_contract.py` 另行覆盖 Science 正常停止、健康 owner、一次瞬时 control socket 恢复、持续失联、Linux `D` 状态、PID/lock 冲突和“不得发送信号”的失败路径；`wsl/tests/science_identity_contract.py` 覆盖 API-key-only 重复执行、旧 Fernet/v2 虚拟身份迁移和未知凭据拒绝覆盖；`wsl/tests/model_routes_contract.py` 覆盖旧错误默认值迁移、dry-run、原子持久化、非法 ID 和未来 provider 保留；`wsl/tests/installer_update_contract.sh` 用临时 fixture 覆盖 runtime 更新失败的精确文件回滚与成功提交。这五组契约都不读取真实 auth、不连接网络，也不产生账号用量。
 
 真实后端最小请求：
 
@@ -351,7 +351,7 @@ fkctl doctor
 - direct gateway 仅 bind `127.0.0.1`，入口包含随机私密 path；
 - provider URL 是源码固定白名单，且不跟随 redirect；
 - manager 停进程前核对 PID、Linux start ticks 和 owner 脚本路径；
-- Science 的假本地 OAuth 只用于接受本机 BYOK gateway，不产生 Anthropic 订阅或服务端权限；
+- Science 0.1.27 以 `ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL` 的本地 API-key-only BYOK 模式连接 gateway；不伪造 Claude OAuth、订阅或服务端权限。旧 FinalKit 虚拟 token 只有在完整识别后才会被迁移删除，未知或真实 Science 凭据拒绝覆盖；
 - ChatGPT/Codex 由隔离 HOME 内的官方 Linux Codex CLI 登录缓存唯一持有；connector 读写同一缓存，不复制 Windows Codex refresh token，也不再维护第二份 refresh chain；意外 `401` 仅在共享缓存确实刷新后重试一次；
 - 浏览器桥只使用独立 Chrome profile；
 - `HANDOFF.md` 只传事实和文件路径，不传账号秘密；
@@ -372,6 +372,7 @@ fkctl doctor
 | `wsl/tests/connector_contract.py` | 无凭据、无网络验证 Codex 三档目录与最终请求 payload |
 | `wsl/tests/model_routes_contract.py` | 无凭据、无网络验证旧配置迁移、dry-run、持久保留与未来 provider 合并 |
 | `wsl/tests/runtime_control_contract.py` | 无凭据、无进程信号验证 Science owner 与失联控制面 |
+| `wsl/tests/science_identity_contract.py` | 无真实凭据验证 API-key-only 状态、旧虚拟身份精确迁移与未知凭据拒绝覆盖 |
 | `wsl/tests/installer_update_contract.sh` | 临时 fixture 验证 runtime 更新失败精确回滚、成功提交 |
 | `wsl/chrome-devtools-mcp-finalkit` | 固定 Node 绝对路径的 MCP 薄入口 |
 | `wsl/connector-security.patch` | Codex connector 的窄安全补丁 |

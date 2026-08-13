@@ -1,4 +1,4 @@
-# Science SwitchModel / FinalKit 3.1.1 操作手册
+# Science SwitchModel / FinalKit 3.1.2 操作手册
 
 本手册是 FinalKit 的唯一运行与维护入口，面向首次安装者、日常使用者和本机管理员。架构、安全设计与源码职责见 [README.zh-CN.md](README.zh-CN.md) 和 [代码剖析](docs/CODE_WALKTHROUGH.zh-CN.md)。
 
@@ -781,7 +781,9 @@ fkctl logs science
 | API 返回 model not found | 查看 provider 当前模型可用性；不要修改上游 URL |
 | gateway stopped | 运行对应启动命令 |
 | gateway identity mismatch | 先 `-Action stop`，再启动；不要手工 kill 未知进程 |
-| `FINALKIT_SCIENCE_CONTROL_UNAVAILABLE`，或 Status 显示 `control unavailable` | 先用 `wsl.exe --list --verbose` 确认本包选中的发行版；关闭该发行版中的任务后，从 Windows 执行 `wsl.exe --terminate Ubuntu-24.04`（名称按实际替换），再运行菜单 `16 Update FinalKit runtime` 和对应 provider 启动；若 runtime 文件本身缺失才用菜单 `2`。manager 已验证进程 owner 但不会强杀失联 daemon；不要选 Clear |
+| `FINALKIT_SCIENCE_CONTROL_UNAVAILABLE`、Status 显示 `control unavailable`，或 owner state 为 `D` | 3.1.2 已把 Science cwd/PWD/HOME 固定到 WSL ext4、用纯 Linux PATH 启动，并对一次瞬时 socket 失败做短暂重试；旧 daemon 或持续 Linux `D` 状态仍须先用 `wsl.exe --list --verbose` 确认本包选中的发行版并关闭其中其他任务，再从 Windows执行 `wsl.exe --terminate Ubuntu-24.04`（名称按实际替换），运行菜单 `16 Update FinalKit runtime` 和对应 provider 启动。terminate 只重启该发行版的 WSL 内核实例，不注销发行版、不删除文件、不清 API/Codex 认证；若 runtime 文件本身缺失才用菜单 `2`。manager 不强杀失联/不可中断 daemon；不要选 Clear |
+| Start 后很快 sign out，日志出现 `invalid_grant` 或 `treating as logged-out` | 旧 FinalKit/HGSX 0.1.25 风格虚拟 OAuth 与 Science 0.1.27 不兼容。运行菜单 `16 Update FinalKit runtime`；3.1.2 会在停机边界识别并原子移除旧 FinalKit Fernet/v2 虚拟身份，改用 API-key-only BYOK。未知或真实 Claude Science 凭据不会被覆盖。然后重新 Start；不需要重新配置 DeepSeek/Kimi/GLM 或 Codex auth |
+| 日志只有 `growthbook: not signed in — flags stay at defaults` | 这是 API-key-only BYOK 没有 Claude.ai 个性化/实验开关账号的正常提示，不等于 Science 工作台退出，也不影响本地 gateway 推理。始终从菜单 Start 打开的最新 nonce URL 进入；旧标签页可关闭 |
 | Science 页面没有打开 | 运行 `status`，再运行 `fkctl url` 获取新一次性 URL |
 | 端口被占用 | 查明占用者；FinalKit 不会强占第三方进程 |
 | 浏览器 `Status: stopped` | 重新运行 `browser-start` |

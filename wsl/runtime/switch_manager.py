@@ -35,6 +35,7 @@ DEFAULT_ROOT = Path.home() / ".local" / "share" / "science-codex-finalkit"
 DEFAULT_GATEWAY_PORT = 9876
 DEFAULT_SCIENCE_PORT = 8765
 NO_PROXY_LOOPBACK = "127.0.0.1,localhost,::1"
+LINUX_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 API_PROVIDERS = {
     "deepseek": {
         "label": "DeepSeek",
@@ -83,6 +84,8 @@ RUNTIME_CAPABILITIES = (
     "persistent-model-routes",
     "provider-model-discovery",
     "runtime-update-v1",
+    "science-linux-only-runtime",
+    "science-api-key-session",
     "shared-official-codex-auth",
 )
 
@@ -124,6 +127,7 @@ class Paths:
         self.bridge_commit = self.root / "bridge.commit"
         self.versions = self.root / "versions.txt"
         self.direct_gateway = self.runtime / "direct_gateway.py"
+        self.science_identity = self.runtime / "science_identity.py"
         self.science = Path.home() / ".local" / "bin" / "claude-science"
         self.claude = Path.home() / ".local" / "bin" / "claude"
         self.codex = Path.home() / ".local" / "bin" / "codex"
@@ -211,6 +215,25 @@ def private_child_environment(home: Path) -> dict[str, str]:
     environment["HOME"] = str(home)
     environment["PYTHONUNBUFFERED"] = "1"
     append_no_proxy(environment)
+    return environment
+
+
+def science_child_environment(home: Path) -> dict[str, str]:
+    """Return a Linux-only environment for the long-lived Science daemon.
+
+    WSL imports the Windows PATH and caller PWD by default.  Claude Science
+    inspects available tools during MCP warm-up, so retaining `/mnt/c` or
+    `/mnt/d` entries can block the daemon in DrvFS/9p and take its control
+    socket down.  Browser opening is performed by the Windows wrapper, so the
+    daemon does not need Windows executables in PATH.
+    """
+
+    environment = private_child_environment(home)
+    environment["PATH"] = LINUX_SYSTEM_PATH
+    environment["PWD"] = str(home)
+    environment.pop("OLDPWD", None)
+    environment.pop("BROWSER", None)
+    environment.pop("WSLENV", None)
     return environment
 
 
@@ -428,9 +451,9 @@ class RuntimeManager:
             (self.p.claude, "Claude Code"),
             (self.p.codex, "Linux Codex CLI"),
             (self.p.direct_gateway, "direct gateway"),
+            (self.p.science_identity, "Science local identity helper"),
             (self.p.bridge_python, "connector Python"),
             (self.p.bridge / "proxy.py", "connector proxy"),
-            (self.p.bridge / "setup-token.py", "Science token helper"),
         )
         for path, label in required:
             if not path.is_file():
@@ -1082,14 +1105,45 @@ class RuntimeManager:
         self.p.gateway_record.unlink(missing_ok=True)
 
     def science_environment(self, endpoint: str) -> dict[str, str]:
-        environment = os.environ.copy()
-        environment["HOME"] = str(self.p.science_home)
+        environment = science_child_environment(self.p.science_home)
         for name in ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
             environment.pop(name, None)
         environment["ANTHROPIC_BASE_URL"] = endpoint
-        environment["ANTHROPIC_AUTH_TOKEN"] = "finalkit-local"
+        environment["ANTHROPIC_API_KEY"] = "finalkit-local"
         append_no_proxy(environment)
         return environment
+
+    def ensure_science_identity(self, *, check_only: bool = False) -> dict[str, Any]:
+        """Enforce the isolated API-key-only Science auth boundary."""
+
+        result = subprocess.run(
+            [
+                str(self.p.bridge_python),
+                str(self.p.science_identity),
+                "check" if check_only else "ensure",
+                "--data-dir",
+                str(self.p.data_dir),
+            ],
+            env=science_child_environment(self.p.science_home),
+            cwd=self.p.science_home,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise FinalKitError(
+                (result.stderr or result.stdout).strip()
+                or "FinalKit could not establish the isolated Claude Science local identity"
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise FinalKitError("Science local identity helper returned invalid JSON") from exc
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise FinalKitError("Science local identity helper did not verify its result")
+        return payload
 
     def science_process_identity(self, pid: int) -> bool:
         if not process_is_live(pid):
@@ -1133,15 +1187,33 @@ class RuntimeManager:
             result.update(owner)
         return result
 
-    def science_status(self) -> dict[str, Any]:
+    @staticmethod
+    def science_process_persistently_blocked(pid: int) -> bool:
+        """Require repeated D-state observations before declaring a stall.
+
+        A newly detached Science process can enter Linux D state for a very
+        short filesystem read and recover normally.  The historical DrvFS/9p
+        failure stays in D across observations.  Treating one sample as final
+        caused a healthy first Start to roll back, so sample the exact verified
+        PID over a small bounded window.
+        """
+
+        for delay in (0.0, 0.15, 0.35):
+            if delay:
+                time.sleep(delay)
+            if process_state(pid) != "D":
+                return False
+        return True
+
+    def _science_status_once(self) -> dict[str, Any]:
         if not self.p.science.is_file():
             return {"running": False}
-        environment = os.environ.copy()
-        environment["HOME"] = str(self.p.science_home)
+        environment = science_child_environment(self.p.science_home)
         try:
             result = subprocess.run(
                 [str(self.p.science), "status", "--data-dir", str(self.p.data_dir)],
                 env=environment,
+                cwd=self.p.science_home,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1173,6 +1245,13 @@ class RuntimeManager:
                     "Claude Science status PID failed FinalKit owner identity verification",
                     owner or ({"pid": pid, "owned": False, "process_state": process_state(pid) or "unknown"} if pid else None),
                 )
+            if self.science_process_persistently_blocked(pid):
+                blocked_owner = owner or {"pid": pid, "owned": True}
+                blocked_owner["process_state"] = "D"
+                return self.science_control_error(
+                    "Claude Science owner is blocked in uninterruptible I/O; its page and control socket are not reliable",
+                    blocked_owner,
+                )
             if owner and (not owner.get("owned") or int(owner.get("pid", 0) or 0) != pid):
                 return self.science_control_error(
                     "Claude Science status PID conflicts with the live operon.lock owner",
@@ -1185,6 +1264,46 @@ class RuntimeManager:
             )
         return status_value
 
+    def science_status(self) -> dict[str, Any]:
+        """Read daemon status with bounded recovery from a transient socket miss.
+
+        Claude Science 0.1.27 can briefly fail one control-socket request while
+        the owned daemon is still alive and its next request succeeds.  Retry
+        only transport/parse failures for the same fully owned lock process.
+        Identity conflicts remain fail-closed on their first observation.
+        """
+
+        status = self._science_status_once()
+        if not status.get("control_error"):
+            return status
+        detail = str(status.get("detail") or "")
+        retryable = (
+            status.get("owned") is True
+            and str(status.get("process_state") or "").upper() != "D"
+            and (
+                status.get("control_error") == "timeout"
+                or "could not reach daemon control socket" in detail.lower()
+                or "invalid status json" in detail.lower()
+            )
+            and "conflicts" not in detail.lower()
+            and "identity verification" not in detail.lower()
+        )
+        if not retryable:
+            return status
+        first_detail = detail
+        for delay in (0.2, 0.5, 1.0):
+            time.sleep(delay)
+            retried = self._science_status_once()
+            if not retried.get("control_error"):
+                retried["control_recovered"] = True
+                retried["control_recovered_from"] = first_detail[:200]
+                return retried
+            retry_detail = str(retried.get("detail") or "")
+            if "conflicts" in retry_detail.lower() or "identity verification" in retry_detail.lower():
+                return retried
+            status = retried
+        return status
+
     @staticmethod
     def science_recovery_message(status: dict[str, Any]) -> str:
         pid = status.get("pid", "unknown")
@@ -1192,7 +1311,8 @@ class RuntimeManager:
         detail = status.get("detail", "control socket unavailable")
         return (
             "FINALKIT_SCIENCE_CONTROL_UNAVAILABLE: "
-            f"{detail} (PID {pid}, state {state}). FinalKit did not kill an unverified process. "
+            f"{detail} (PID {pid}, state {state}). FinalKit did not force-kill a daemon "
+            "after its official control path failed. "
             "From Windows run: wsl.exe --terminate <your Ubuntu distro>; then run menu 16 "
             "Update FinalKit runtime and start the provider again. Use menu 2 only when the "
             "runtime is missing or the full stack is damaged. Do not use Clear."
@@ -1201,13 +1321,13 @@ class RuntimeManager:
     def science_stop(self) -> None:
         if not self.p.science.is_file():
             return
-        environment = os.environ.copy()
-        environment["HOME"] = str(self.p.science_home)
+        environment = science_child_environment(self.p.science_home)
         stop_detail = ""
         try:
             result = subprocess.run(
                 [str(self.p.science), "stop", "--data-dir", str(self.p.data_dir)],
                 env=environment,
+                cwd=self.p.science_home,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1234,7 +1354,7 @@ class RuntimeManager:
                 file=sys.stderr,
             )
 
-    def science_start(self, endpoint: str) -> dict[str, Any]:
+    def science_start(self, endpoint: str, *, ensure_identity: bool = True) -> dict[str, Any]:
         current = self.science_status()
         if current.get("control_error"):
             raise FinalKitError(self.science_recovery_message(current))
@@ -1244,6 +1364,10 @@ class RuntimeManager:
                 return current
             raise FinalKitError("Claude Science is running with a different backend endpoint")
 
+        if ensure_identity:
+            identity = self.ensure_science_identity()
+            if str(identity.get("action", "")).startswith("removed-"):
+                print("Removed the obsolete FinalKit virtual OAuth identity; Claude Science now uses API-key-only BYOK mode.")
         environment = self.science_environment(endpoint)
         with open(self.p.science_boot_log, "a", encoding="utf-8") as log_handle:
             os.chmod(self.p.science_boot_log, 0o600)
@@ -1262,6 +1386,7 @@ class RuntimeManager:
                     "--no-auto-update",
                 ],
                 env=environment,
+                cwd=self.p.science_home,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 timeout=60,
@@ -1284,11 +1409,11 @@ class RuntimeManager:
         raise FinalKitError(f"Claude Science did not become ready; see {self.p.science_boot_log}")
 
     def science_url(self) -> str:
-        environment = os.environ.copy()
-        environment["HOME"] = str(self.p.science_home)
+        environment = science_child_environment(self.p.science_home)
         result = subprocess.run(
             [str(self.p.science), "url", "--data-dir", str(self.p.data_dir)],
             env=environment,
+            cwd=self.p.science_home,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1407,6 +1532,7 @@ class RuntimeManager:
         previous_gateway_running = bool(
             previous_record and self.gateway_identity(previous_record) and self.gateway_health(previous_record)
         )
+
         previous_science_status = self.science_status()
         if previous_science_status.get("control_error"):
             raise FinalKitError(self.science_recovery_message(previous_science_status))
@@ -1491,7 +1617,11 @@ class RuntimeManager:
                     raise FinalKitError("stop the active FinalKit runtime before initializing its profile")
                 endpoint = self.spawn_gateway("deepseek", key_override="finalkit-local-smoke-key")
                 try:
-                    self.science_start(endpoint)
+                    # A first Science boot creates encryption.key.  Once that
+                    # bootstrap completes, the helper can prove there is no
+                    # stale FinalKit virtual OAuth identity.  Normal starts
+                    # always require that API-key-only boundary.
+                    self.science_start(endpoint, ensure_identity=False)
                     for _ in range(160):
                         if key_file.is_file() and key_file.stat().st_size > 0:
                             break
@@ -1501,19 +1631,8 @@ class RuntimeManager:
                     self.stop_gateway()
             if not key_file.is_file() or key_file.stat().st_size == 0:
                 raise FinalKitError(f"Claude Science did not create {key_file}")
-            environment = private_child_environment(self.p.science_home)
-            result = subprocess.run(
-                [str(self.p.bridge_python), str(self.p.bridge / "setup-token.py")],
-                cwd=self.p.bridge,
-                env=environment,
-                timeout=60,
-                check=False,
-            )
-            if result.returncode != 0:
-                raise FinalKitError("the isolated Claude Science login state could not be created")
-            token_dir = self.p.data_dir / ".oauth-tokens"
-            if not token_dir.is_dir() or not any(token_dir.glob("*.enc")):
-                raise FinalKitError("Claude Science OAuth token readback failed")
+            identity = self.ensure_science_identity()
+            print(f"Science local identity is ready ({identity.get('action', 'verified')}).")
 
     def configure_provider(self, provider_name: str) -> None:
         if provider_name not in API_PROVIDERS:
@@ -1819,7 +1938,15 @@ class RuntimeManager:
             checks.append((label, ok, detail))
 
         add("Ubuntu 24.04", Path("/etc/os-release").read_text(errors="replace").find('VERSION_ID="24.04"') >= 0)
-        print(f"[INFO] distribution metadata: {self.installed_package_version()} (not a runtime gate)")
+        installed_metadata = self.installed_package_version()
+        candidate_metadata = os.environ.get("FINALKIT_CANDIDATE_VERSION", "").strip()
+        if candidate_metadata and candidate_metadata != installed_metadata:
+            print(
+                f"[INFO] distribution metadata before verification: {installed_metadata}; "
+                f"candidate runtime under test: {candidate_metadata} (neither is a runtime gate)"
+            )
+        else:
+            print(f"[INFO] distribution metadata: {installed_metadata} (not a runtime gate)")
         add("Claude Science", os.access(self.p.science, os.X_OK), str(self.p.science))
         add("Claude Code", os.access(self.p.claude, os.X_OK), str(self.p.claude))
         add("Linux Codex CLI", os.access(self.p.codex, os.X_OK), str(self.p.codex))
@@ -1836,8 +1963,17 @@ class RuntimeManager:
             add(label, path.is_file() and path.stat().st_size > 0, str(path))
             if path.exists():
                 add(f"{label} permission 600", stat.S_IMODE(path.stat().st_mode) == 0o600)
-        token_dir = self.p.data_dir / ".oauth-tokens"
-        add("isolated Science login", token_dir.is_dir() and any(token_dir.glob("*.enc")), str(token_dir))
+        try:
+            science_identity = self.ensure_science_identity(check_only=True)
+            science_identity_ok = science_identity.get("schema") == "science-api-key-only"
+        except FinalKitError as exc:
+            science_identity_ok = False
+            science_identity = {"error": str(exc)}
+        add(
+            "isolated Science API-key-only auth",
+            science_identity_ok,
+            str(science_identity.get("schema") or science_identity.get("error") or self.p.data_dir),
+        )
         if self.codex_auth_configured():
             add("official isolated Codex login", self.codex_login_status(), str(self.p.codex_auth))
             add("Codex auth permission 600", stat.S_IMODE(self.p.codex_auth.stat().st_mode) == 0o600)

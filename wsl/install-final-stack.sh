@@ -344,6 +344,10 @@ install_user() {
   note "Verifying the offline Claude Science ownership/control contract..."
   python3 "$SCRIPT_DIR/tests/runtime_control_contract.py" \
     "$SCRIPT_DIR/runtime/switch_manager.py"
+  note "Verifying the restart-stable Claude Science local-identity contract..."
+  "$bridge_dir/.venv/bin/python" \
+    "$SCRIPT_DIR/tests/science_identity_contract.py" \
+    "$SCRIPT_DIR/runtime/science_identity.py"
   note "Verifying persistent model-route migration and update semantics..."
   python3 "$SCRIPT_DIR/tests/model_routes_contract.py" \
     "$SCRIPT_DIR/runtime/switch_manager.py"
@@ -353,6 +357,7 @@ install_user() {
   fi
 
   install -m 700 "$SCRIPT_DIR/runtime/direct_gateway.py" "$root/runtime/direct_gateway.py"
+  install -m 700 "$SCRIPT_DIR/runtime/science_identity.py" "$root/runtime/science_identity.py"
   install -m 700 "$SCRIPT_DIR/runtime/switch_manager.py" "$root/runtime/switch_manager.py"
   install -m 700 "$SCRIPT_DIR/fkctl" "$real_home/.local/bin/fkctl"
   install -m 700 "$SCRIPT_DIR/chrome-devtools-mcp-finalkit" "$real_home/.local/bin/chrome-devtools-mcp-finalkit"
@@ -365,11 +370,9 @@ install_user() {
   # instance first; the manager refuses to kill a PID whose identity differs.
   "$real_home/.local/bin/fkctl" stop
   "$real_home/.local/bin/fkctl" prepare
-  if [[ "$install_mode" == "full" ]]; then
-    "$real_home/.local/bin/fkctl" init-profile
-  fi
+  "$real_home/.local/bin/fkctl" init-profile
 
-  "$real_home/.local/bin/fkctl" doctor
+  FINALKIT_CANDIDATE_VERSION="$PACKAGE_VERSION" "$real_home/.local/bin/fkctl" doctor
   "$real_home/.local/bin/fkctl" smoke
   # Publish release metadata only after every runtime check passes.
   write_versions_metadata "$root" "$real_home" "$science_bin" "$claude_bin" "$codex_bin" "$PACKAGE_VERSION"
@@ -396,6 +399,7 @@ update_runtime() {
   backup="$(mktemp -d /tmp/finalkit-runtime-update.XXXXXX)"
   targets=(
     "$root/runtime/direct_gateway.py"
+    "$root/runtime/science_identity.py"
     "$root/runtime/switch_manager.py"
     "$root/bridge/proxy.py"
     "$root/bridge/config.json"

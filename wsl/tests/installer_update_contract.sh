@@ -44,6 +44,7 @@ verify_ubuntu() { :; }
 
 targets=(
   "$test_root/runtime/direct_gateway.py"
+  "$test_root/runtime/science_identity.py"
   "$test_root/runtime/switch_manager.py"
   "$test_root/bridge/proxy.py"
   "$test_root/bridge/config.json"

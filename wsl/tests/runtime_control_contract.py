@@ -38,8 +38,10 @@ def load_manager(manager_path: Path, home: Path):
 class FakeRun:
     def __init__(self, results: list[subprocess.CompletedProcess[str]]):
         self.results = list(results)
+        self.calls: list[tuple[tuple, dict]] = []
 
     def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
         if not self.results:
             raise AssertionError(f"unexpected subprocess.run call: {args!r}")
         return self.results.pop(0)
@@ -60,6 +62,19 @@ def verify(manager_path: Path) -> None:
         paths.science.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
         manager = module.RuntimeManager(paths)
         paths.data_dir.mkdir(parents=True, exist_ok=True)
+
+        # The long-lived daemon never inherits Windows drive paths or a caller
+        # working directory.  Science uses its supported API-key BYOK path;
+        # Claude OAuth/auth-token state is deliberately absent.
+        os.environ["PATH"] = "/mnt/c/Windows/System32:/usr/bin:/mnt/d/Tools"
+        os.environ["PWD"] = "/mnt/d/Tools/ScienceCodexFinalKit"
+        daemon_environment = manager.science_environment("http://127.0.0.1:9876")
+        assert daemon_environment["PATH"] == module.LINUX_SYSTEM_PATH
+        assert daemon_environment["PWD"] == str(paths.science_home)
+        assert daemon_environment["HOME"] == str(paths.science_home)
+        assert daemon_environment["ANTHROPIC_API_KEY"] == "finalkit-local"
+        assert "ANTHROPIC_AUTH_TOKEN" not in daemon_environment
+        assert "/mnt/" not in daemon_environment["PATH"]
 
         original_run = module.subprocess.run
         original_live = module.process_is_live
@@ -89,9 +104,11 @@ def verify(manager_path: Path) -> None:
 
         try:
             # Normal stopped state remains usable and does not become a failure.
-            module.subprocess.run = FakeRun([completed(0, '{"running": false}\n')])
+            stopped_run = FakeRun([completed(0, '{"running": false}\n')])
+            module.subprocess.run = stopped_run
             stopped = manager.science_status()
             assert stopped == {"running": False}, stopped
+            assert Path(stopped_run.calls[0][1]["cwd"]) == paths.science_home
 
             # A healthy daemon must pass the complete lock/PID/argv/HOME/data-dir identity proof.
             live_pids = {PID}
@@ -102,8 +119,41 @@ def verify(manager_path: Path) -> None:
             healthy = manager.science_status()
             assert healthy.get("running") is True and not healthy.get("control_error"), healthy
 
+            # One transient control-socket miss for the same fully owned daemon
+            # is retried and recovered instead of blocking a healthy Start.
+            module.subprocess.run = FakeRun(
+                [
+                    completed(1, stderr="could not reach daemon control socket"),
+                    completed(0, json.dumps({"running": True, "pid": PID, "port": 8765})),
+                ]
+            )
+            transient = manager.science_status()
+            assert transient.get("running") is True and transient.get("control_recovered") is True
+
+            # Even a successful official status is rejected when the verified
+            # owner is blocked in Linux uninterruptible I/O (D state).
+            module.process_state = lambda pid: "D"
+            module.subprocess.run = FakeRun(
+                [completed(0, json.dumps({"running": True, "pid": PID, "port": 8765}))]
+            )
+            blocked = manager.science_status()
+            assert blocked.get("control_error") == "unavailable", blocked
+            assert blocked.get("process_state") == "D", blocked
+
+            # One transient D observation during detached startup is healthy;
+            # only a sustained D state is the historical DrvFS/9p stall.
+            states = iter(("D", "S"))
+            module.process_state = lambda pid: next(states, "S")
+            module.subprocess.run = FakeRun(
+                [completed(0, json.dumps({"running": True, "pid": PID, "port": 8765}))]
+            )
+            transient_io = manager.science_status()
+            assert transient_io.get("running") is True
+            assert not transient_io.get("control_error"), transient_io
+            module.process_state = lambda pid: "S"
+
             # A live owned process plus a failed control socket is an explicit error, not stopped.
-            module.subprocess.run = FakeRun([completed(1, stderr="control socket unavailable")])
+            module.subprocess.run = FakeRun([completed(1, stderr="non-retryable control failure")])
             stale = manager.science_status()
             assert stale.get("running") is True and stale.get("control_error") == "unavailable", stale
             assert stale.get("pid") == PID and stale.get("owned") is True, stale

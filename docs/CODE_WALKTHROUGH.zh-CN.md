@@ -1,4 +1,4 @@
-# Science SwitchModel / FinalKit 3.1.1 代码剖析
+# Science SwitchModel / FinalKit 3.1.2 代码剖析
 
 本文面向维护者，解释永久 owner、安装路径、provider 请求、事务切换、浏览器桥与多用户边界。README 负责普通用户操作；这里负责“为什么代码这样写”。
 
@@ -10,8 +10,10 @@
 | `wsl/install-final-stack.sh` | system/user 两阶段安装、官方客户端、固定 Node/MCP、固定 connector、runtime 部署、初始验收 | 日常 gateway 进程、模型请求、Windows 浏览器进程 |
 | `wsl/runtime/switch_manager.py` | provider 事务、私密状态、进程身份、Science endpoint、回滚、doctor/smoke/test | Anthropic HTTP 直通细节、研究分析逻辑 |
 | `wsl/runtime/direct_gateway.py` | DeepSeek/Kimi/GLM 固定白名单、认证头、模型角色映射、流式响应 | ChatGPT/Codex 协议翻译、管理 UI、任意 URL 代理 |
+| `wsl/runtime/science_identity.py` | 校验 API-key-only 边界、精确识别并移除旧 FinalKit 虚拟 OAuth | 创建 Claude.ai 账号、伪造订阅、覆盖未知/真实凭据 |
 | `wsl/tests/connector_contract.py` | 无凭据、无网络捕获三档 connector 的模型目录、alias 解析和最终 Responses payload | 账号权限、服务端可用性、真实模型质量 |
 | `wsl/tests/runtime_control_contract.py` | 无凭据、无真实进程验证 Science stopped/healthy/stale/lock-conflict 控制语义 | 强杀 WSL、真实 daemon 可用性、模型请求 |
+| `wsl/tests/science_identity_contract.py` | 无真实凭据验证 API-key-only 重复执行、Fernet/v2 迁移和未知凭据保护 | 真实 Claude 登录、网络认证 |
 | `wsl/tests/model_routes_contract.py` | 无凭据、无真实进程验证配置迁移、dry-run、原子持久化、未来 provider 保留 | 厂商账号是否接受某模型 ID |
 | `wsl/tests/installer_update_contract.sh` | 临时 fixture 验证 runtime 更新失败精确回滚和成功提交 | 真实 WSL 服务重启、供应商网络 |
 
@@ -88,7 +90,7 @@ installer 通过临时文件下载并运行三个官方 installer：
 
 `Build` 仍是首次安装与完整修复 owner，但不再承担所有日常变更：
 
-- `install-final-stack.sh --runtime` 只部署包内 runtime owner 和受控 connector patch。它先跑离线 connector、runtime-control、model-route contract，完整 Build 另跑 runtime-update rollback contract；失败时按精确文件备份恢复，认证与模型配置不属于替换集合。
+- `install-final-stack.sh --runtime` 只部署包内 runtime owner 和受控 connector patch。它先跑离线 connector、runtime-control、science-identity、model-route contract，完整 Build 另跑 runtime-update rollback contract；失败时按精确文件备份恢复，provider/Codex 认证与模型配置不属于替换集合。Science OAuth 迁移属于 3.1.2 的显式兼容边界：只移除已完整认证为 FinalKit 虚拟身份的旧文件。
 - `fkctl discover-models` 只读请求 DeepSeek/Kimi/GLM 包内固定的官方模型目录 URL，以当前 Linux 用户已经保存的 provider key 鉴权；只解析合法 `data[].id`，不做生成请求、不打印 key、不写配置。网络层先直连，再只对 transport failure 尝试继承代理；HTTP 认证/权限失败不会换通道重放。`fkctl update-models` 才更新 `config/model-routes.json`。该 JSON 是模型选择的唯一持久 owner，`bridge/config.json` 是可再生的 Codex 兼容派生配置。更新支持 `--dry-run --json`，用临时文件、`fsync` 和 `os.replace` 原子提交；若修改的是当前 backend，必须显式 `--restart`，失败恢复旧配置与已观察到的 runtime。
 - `install-final-stack.sh --tools` 是明确联网的官方客户端/依赖更新。它在更新前停止 FinalKit，更新官方客户端、Node/MCP 与 `requirements.lock` 后核对 Codex auth 文件字节哈希未变，并保留模型路由。
 
@@ -224,10 +226,12 @@ Science 使用隔离短 HOME：
 HOME=~/.science-finalkit
 --data-dir=~/.science-finalkit/.claude-science
 ANTHROPIC_BASE_URL=<verified local gateway>
-ANTHROPIC_AUTH_TOKEN=finalkit-local-token
+ANTHROPIC_API_KEY=finalkit-local
 ```
 
-短路径避免 Science sandbox 的多层 AF_UNIX socket 超过 Linux `sun_path` 限制。manager 用 Science 自己的 status 读取真实 daemon PID，再同时核对 `/proc/<pid>/cmdline`、`HOME`、`--data-dir`、lock PID 与 endpoint，而不是只相信启动命令退出码。若进程仍在但 control socket 超时、返回非零或与 lock 冲突，Status/Doctor/Start/Smoke 统一返回 `FINALKIT_SCIENCE_CONTROL_UNAVAILABLE`；manager 不对这类进程发送信号，而是要求用户从 Windows 精确 terminate 选定 WSL distribution 后做菜单 16 runtime 更新，只有 runtime 缺失或完整栈损坏时才用菜单 2 修复。
+Science 0.1.27 在这一路径使用原生 API-key BYOK 会话，不创建或伪造 Claude.ai OAuth 账号。旧版 FinalKit 曾写入虚拟 refresh token，Science 会把它发往官方 OAuth refresh endpoint，得到 `invalid_grant` 后将页面判为 logged-out。3.1.2 只在能完整解密并验证为旧 FinalKit Fernet/v2 虚拟身份时原子移除它；未知或真实凭据一律拒绝覆盖。Codex 的官方 device/browser auth 仍独立保存在 `~/.science-finalkit/.codex/auth.json`，不参与这次迁移。
+
+短路径避免 Science sandbox 的多层 AF_UNIX socket 超过 Linux `sun_path` 限制。所有 Science status/stop/serve/url 子进程还固定在 WSL ext4 的 `~/.science-finalkit` 工作目录运行，并使用纯 Linux PATH；即使安装包位于 D/E 盘、微信临时目录或网盘，detached daemon 也不会继承 `/mnt/<drive>` 的 9p/DrvFS cwd/PATH 并卡在 `p9_client_rpc`。manager 用 Science 自己的 status 读取真实 daemon PID，再同时核对 `/proc/<pid>/cmdline`、`HOME`、`--data-dir`、lock PID、Linux process state 与 endpoint，而不是只相信启动命令退出码。对同一完整 owner 的一次瞬时 control socket/JSON 失败只做短暂有限重试；PID/lock/HOME/data-dir 身份冲突立即 fail-closed。即使官方 status 返回 running，只要 owner 已进入 Linux `D`（uninterruptible I/O），页面和 control socket 就不能再作为健康证据，Status/Doctor/Start/Smoke 会返回 `FINALKIT_SCIENCE_CONTROL_UNAVAILABLE`。manager 不对这类进程发送信号，而是要求用户从 Windows 精确 terminate 选定 WSL distribution 后做菜单 16 runtime 更新，只有 runtime 缺失或完整栈损坏时才用菜单 2 修复。
 
 `fkctl claude <mode> [args...]` 对原生 Linux Claude Code 临时设置同一个本地 endpoint，并清除外部 `ANTHROPIC_*` 和 Bedrock/Vertex 选择变量。真实 provider key 仍只在 gateway 进程内。
 
