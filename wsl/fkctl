@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+REAL_HOME="${REAL_HOME:-$(getent passwd "$(id -un)" | cut -d: -f6)}"
+ROOT="${FINALKIT_ROOT:-$REAL_HOME/.local/share/science-codex-finalkit}"
+MANAGER="$ROOT/runtime/switch_manager.py"
+
+if [[ ! -f "$MANAGER" ]]; then
+  printf 'ERROR: FinalKit manager is missing: %s\n' "$MANAGER" >&2
+  printf 'Run the Windows bootstrap command again.\n' >&2
+  exit 1
+fi
+
+export HOME="$REAL_HOME"
+exec /usr/bin/python3 "$MANAGER" --root "$ROOT" "$@"

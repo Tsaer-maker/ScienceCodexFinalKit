@@ -1,0 +1,559 @@
+diff --git a/proxy.py b/proxy.py
+index 5db7334..cc38afd 100755
+--- a/proxy.py
++++ b/proxy.py
+@@ -22,6 +22,8 @@ import os
+ import re
+ import base64
+ import hashlib
++import hmac
++import tempfile
+ import secrets
+ import subprocess
+ import sys
+@@ -44,13 +46,58 @@ from starlette.middleware.base import BaseHTTPMiddleware
+ APP_DIR = Path(__file__).resolve().parent
+ PROXY_DIR = Path(os.environ.get("CLAUDE_SCIENCE_PROXY_DIR", str(APP_DIR))).expanduser()
+ CONFIG_FILE = PROXY_DIR / "config.json"
+-CODEX_AUTH_FILE = PROXY_DIR / "codex-auth.json"
+-CODEX_CLI_AUTH_FILE = Path.home() / ".codex" / "auth.json"
++# FinalKit keeps one credential owner: the official Codex CLI cache under the
++# isolated HOME. The connector refreshes it instead of a copied token chain.
++CODEX_AUTH_FILE = Path.home() / ".codex" / "auth.json"
++CODEX_CLI_AUTH_FILE = CODEX_AUTH_FILE
+ STATIC_DIR = PROXY_DIR / "static"
+ TOKEN_DIR = Path.home() / ".claude-science" / ".oauth-tokens"
+ ENC_KEY_FILE = Path.home() / ".claude-science" / "encryption.key"
+ 
+ 
++def _read_finalkit_private(fd_env: str, fallback_env: str) -> str:
++    """Read a small controller value from an inherited descriptor."""
++    raw_fd = os.environ.pop(fd_env, "")
++    if raw_fd:
++        try:
++            fd = int(raw_fd)
++            with os.fdopen(fd, "r", encoding="utf-8") as handle:
++                value = handle.read(4097)
++            if len(value) > 4096:
++                raise ValueError("private controller value is too large")
++            return value.strip()
++        except (OSError, TypeError, ValueError):
++            return ""
++    return os.environ.pop(fallback_env, "")
++
++
++FINALKIT_CONTROL_TOKEN = _read_finalkit_private(
++    "FINALKIT_CONTROL_FD", "FINALKIT_CONTROL_TOKEN"
++)
++FINALKIT_INSTANCE_ID = _read_finalkit_private(
++    "FINALKIT_INSTANCE_FD", "FINALKIT_INSTANCE_ID"
++)
++FINALKIT_BACKEND = os.environ.get("FINALKIT_BACKEND", "codex")
++
++
++def _atomic_private_json(path: Path, payload: dict) -> None:
++    """Persist a credential cache without exposing a partial refresh chain."""
++    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
++    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as handle:
++            json.dump(payload, handle, indent=2)
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.chmod(temporary, 0o600)
++        os.replace(temporary, path)
++    finally:
++        try:
++            os.unlink(temporary)
++        except FileNotFoundError:
++            pass
++
++
+ # ---------------------------------------------------------------------------
+ # Config persistence
+ # ---------------------------------------------------------------------------
+@@ -70,6 +117,7 @@ class Config:
+         "codex_client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+         "codex_backend_url": "https://chatgpt.com/backend-api/codex",
+         "codex_model": "gpt-5.6-sol",
++        "codex_reasoning_effort": "max",
+         "codex_model_map": {},
+         "default_backend": "deepseek",
+         "force_model": "",
+@@ -98,6 +146,7 @@ class Config:
+         "codex_client_id": "CODEX_CLIENT_ID",
+         "codex_backend_url": "CODEX_BACKEND_URL",
+         "codex_model": "CODEX_MODEL",
++        "codex_reasoning_effort": "CODEX_REASONING_EFFORT",
+         "codex_model_map": "CODEX_MODEL_MAP",
+         "default_backend": "DEFAULT_BACKEND",
+         "force_model": "FORCE_MODEL",
+@@ -192,6 +241,8 @@ class Config:
+     @property
+     def codex_model(self) -> str: return self._data["codex_model"]
+     @property
++    def codex_reasoning_effort(self) -> str: return self._data["codex_reasoning_effort"]
++    @property
+     def codex_model_map(self) -> dict: return self._data["codex_model_map"]
+     @property
+     def default_backend(self) -> str: return self._data["default_backend"]
+@@ -244,12 +295,31 @@ class Config:
+         elif backend == "openai":
+             if self.openai_auth_mode == "codex_device":
+                 base_url = self.codex_backend_url.rstrip("/")
++                mapped_from_alias = self.codex_model_map.get(model)
++                if not mapped_from_alias:
++                    # Claude Science can append dated/model-version suffixes.
++                    # Prefer the longest configured family prefix so a new UI
++                    # build keeps the intended Opus/Sonnet/Haiku tier route.
++                    candidates = (
++                        (alias, target)
++                        for alias, target in self.codex_model_map.items()
++                        if isinstance(alias, str)
++                        and isinstance(target, str)
++                        and (model == alias or model.startswith(alias + "-"))
++                    )
++                    mapped_from_alias = next(
++                        (target for _, target in sorted(candidates, key=lambda item: len(item[0]), reverse=True)),
++                        None,
++                    )
+                 mapped_model = (
+                     self.force_model
+-                    or self.codex_model_map.get(model)
++                    or mapped_from_alias
+                     or self.codex_model
+                     or "gpt-5.6-sol"
+                 )
++                reasoning_effort = str(self.codex_reasoning_effort).strip().lower()
++                if reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
++                    raise ValueError(f"Unsupported Codex reasoning effort: {reasoning_effort}")
+                 auth_header = codex_auth_store.authorization_header()
+                 return {
+                     "backend": "codex",
+@@ -257,6 +327,7 @@ class Config:
+                     "auth_header": auth_header,
+                     "base_url": base_url,
+                     "account_id": codex_auth_store.account_id(),
++                    "reasoning_effort": reasoning_effort,
+                 }
+             base_url = normalize_openai_base_url(self.openai_base_url)
+             mapped_model = self.force_model or self.openai_model_map.get(model, model)
+@@ -294,7 +365,7 @@ def bearer_auth_header(token: str, backend: str) -> str:
+ 
+ 
+ class CodexAuthStore:
+-    """Local token cache for OpenAI Codex device-code authentication."""
++    """Adapter over the official Codex CLI ChatGPT credential cache."""
+ 
+     def __init__(self, path: Path):
+         self.path = path
+@@ -305,15 +376,41 @@ class CodexAuthStore:
+         try:
+             with open(self.path) as f:
+                 data = json.load(f)
+-            return data if isinstance(data, dict) else {}
++            if not isinstance(data, dict):
++                return {}
++            tokens = data.get("tokens")
++            if isinstance(tokens, dict):
++                normalized = _normalize_codex_token_response(
++                    {
++                        "access_token": tokens.get("access_token"),
++                        "refresh_token": tokens.get("refresh_token"),
++                        "id_token": tokens.get("id_token"),
++                        "chatgpt_account_id": tokens.get("account_id"),
++                    },
++                    config.codex_client_id,
++                )
++                return normalized
++            return {}
+         except Exception:
+             return {}
+ 
+     def save(self, data: dict):
+-        PROXY_DIR.mkdir(parents=True, exist_ok=True)
+-        with open(self.path, "w") as f:
+-            json.dump(data, f, indent=2)
+-        os.chmod(self.path, 0o600)
++        try:
++            current = json.loads(self.path.read_text(encoding="utf-8"))
++        except (FileNotFoundError, json.JSONDecodeError, OSError):
++            current = {}
++        payload = dict(current) if isinstance(current, dict) else {}
++        payload["auth_mode"] = "chatgpt"
++        payload["OPENAI_API_KEY"] = None
++        tokens = dict(current.get("tokens") or {}) if isinstance(current, dict) else {}
++        for key in ("access_token", "refresh_token", "id_token"):
++            if data.get(key):
++                tokens[key] = data[key]
++        if data.get("chatgpt_account_id"):
++            tokens["account_id"] = data["chatgpt_account_id"]
++        payload["tokens"] = tokens
++        payload["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
++        _atomic_private_json(self.path, payload)
+ 
+     def clear(self):
+         try:
+@@ -347,9 +444,8 @@ class CodexAuthStore:
+         token = refreshed.get("access_token")
+         if not token:
+             raise ValueError(
+-                "OpenAI Codex device auth is not configured. "
+-                f"Open {config.codex_device_url}, enter a code from the dashboard or "
+-                "run ./setup-codex-device.py, then retry."
++                "ChatGPT Codex auth is missing or could not be refreshed. "
++                "Run fkctl configure-codex, then retry."
+             )
+         return f"Bearer {token}"
+ 
+@@ -385,7 +481,7 @@ class CodexAuthStore:
+                 data=payload,
+                 headers={"Content-Type": "application/x-www-form-urlencoded"},
+                 timeout=20,
+-                trust_env=False,
++                trust_env=True,
+             )
+             if resp.status_code != 200:
+                 return self._maybe_import_from_cli(data)
+@@ -398,13 +494,11 @@ class CodexAuthStore:
+             return self._maybe_import_from_cli(data)
+ 
+     def _maybe_import_from_cli(self, data: dict) -> dict:
+-        """Fallback: re-import a fresh token from the Codex CLI auth file.
++        """Re-read the shared cache after another process may have refreshed it.
+ 
+-        The Codex CLI and this bridge share one OAuth credential. OpenAI refresh
+-        tokens are one-time-use, so if the CLI refreshes first it consumes the
+-        refresh_token and the bridge's own refresh returns 401
+-        refresh_token_reused. Re-importing from the CLI keeps the bridge working
+-        without forcing the user to re-run setup-codex-device.py manually.
++        The official CLI and connector share one file. If another request or the
++        CLI rotates a one-time refresh token first, this caller can adopt the
++        newer access/refresh chain instead of forcing another browser login.
+         """
+         if not CODEX_CLI_AUTH_FILE.exists():
+             return data
+@@ -416,9 +510,10 @@ class CodexAuthStore:
+         tokens = cli_data.get("tokens") if isinstance(cli_data, dict) else None
+         if not isinstance(tokens, dict) or not tokens.get("access_token"):
+             return data
+-        new_exp = _exp_from_access_token(tokens.get("access_token", ""))
+-        old_exp = _exp_from_access_token(data.get("access_token", ""))
+-        if new_exp and old_exp and new_exp <= old_exp:
++        if (
++            tokens.get("access_token") == data.get("access_token")
++            and tokens.get("refresh_token") == data.get("refresh_token")
++        ):
+             return data
+         imported = _normalize_codex_token_response(
+             {
+@@ -434,7 +529,7 @@ class CodexAuthStore:
+         merged = dict(data)
+         merged.update(imported)
+         self.save(merged)
+-        print("[proxy] re-imported fresh Codex token from ~/.codex/auth.json (refresh_token was reused)", flush=True)
++        print("[proxy] adopted a newer Codex token from shared ~/.codex/auth.json", flush=True)
+         return merged
+ 
+ 
+@@ -526,7 +621,7 @@ def _new_pkce_pair() -> tuple[str, str]:
+ 
+ async def _post_codex_auth(path: str, payload: dict) -> httpx.Response:
+     url = f"{config.codex_auth_base_url.rstrip('/')}{path}"
+-    async with httpx.AsyncClient(timeout=20, trust_env=False) as c:
++    async with httpx.AsyncClient(timeout=20, trust_env=True) as c:
+         resp = await c.post(url, json=payload)
+         if resp.status_code in {400, 415, 422}:
+             return await c.post(
+@@ -545,7 +640,7 @@ async def _exchange_codex_authorization_code(code: str, code_verifier: str, clie
+         "client_id": client_id,
+         "code_verifier": code_verifier,
+     }
+-    async with httpx.AsyncClient(timeout=20, trust_env=False) as c:
++    async with httpx.AsyncClient(timeout=20, trust_env=True) as c:
+         resp = await c.post(
+             url,
+             data=payload,
+@@ -617,7 +712,7 @@ app = FastAPI(title="Claude Science BYOK Proxy", version="2.0.0")
+ # CORS
+ app.add_middleware(
+     CORSMiddleware,
+-    allow_origins=["*"],
++    allow_origins=["http://127.0.0.1:9876", "http://localhost:9876"],
+     allow_credentials=True,
+     allow_methods=["*"],
+     allow_headers=["*"],
+@@ -653,6 +748,37 @@ async def access_log_middleware(request: Request, call_next):
+     log_local_event(request, response.status_code)
+     return response
+ 
++
++CONTROL_EXACT_PATHS = {
++    "/dashboard",
++    "/docs",
++    "/openapi.json",
++    "/api/config",
++    "/api/test-backend",
++    "/api/setup-global-env",
++    "/api/install-service",
++    "/api/refresh-token",
++    "/api/recent-requests",
++}
++CONTROL_PREFIXES = ("/static/", "/api/codex-device")
++
++
++@app.middleware("http")
++async def finalkit_control_middleware(request: Request, call_next):
++    """Keep browser-facing management routes private to fkctl."""
++    path = request.url.path
++    protected = path in CONTROL_EXACT_PATHS or path.startswith(CONTROL_PREFIXES)
++    if protected:
++        supplied = request.headers.get("X-FinalKit-Control", "")
++        if not FINALKIT_CONTROL_TOKEN or not hmac.compare_digest(
++            supplied, FINALKIT_CONTROL_TOKEN
++        ):
++            return JSONResponse(
++                {"ok": False, "error": "FinalKit control token required"},
++                status_code=403,
++            )
++    return await call_next(request)
++
+ # Static files for dashboard
+ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+ 
+@@ -1607,34 +1733,63 @@ def _codex_headers(backend: dict) -> dict:
+     return headers
+ 
+ 
++def _refresh_codex_backend(backend: dict) -> bool:
++    """Force one shared-cache refresh after an unexpected backend 401."""
++    current = codex_auth_store.load()
++    refreshed = codex_auth_store.refresh(current)
++    token = refreshed.get("access_token")
++    if not token or (
++        token == current.get("access_token")
++        and refreshed.get("refresh_token") == current.get("refresh_token")
++    ):
++        return False
++    backend["auth_header"] = f"Bearer {token}"
++    backend["account_id"] = (
++        refreshed.get("chatgpt_account_id")
++        or _account_id_from_id_token(refreshed.get("id_token", ""))
++    )
++    return True
++
++
+ async def _handle_codex_messages(body: dict, backend: dict, original_model: str, request_id: str, stream: bool):
+     """Route a request to the ChatGPT Codex backend (Responses API)."""
+     responses_body = anthropic_to_codex_responses(body, backend["model"])
++    responses_body["reasoning"] = {"effort": backend["reasoning_effort"]}
+     responses_body["stream"] = True  # Codex backend only reliably supports streaming
+     headers = _codex_headers(backend)
+     client = get_client()
+     url = f"{backend['base_url'].rstrip('/')}/responses"
+ 
+-    print(f"[proxy] → codex | model={backend['model']} | stream={stream} | original_model={original_model}")
++    print(
++        f"[proxy] → codex | model={backend['model']} | "
++        f"effort={backend['reasoning_effort']} | stream={stream} | original_model={original_model}"
++    )
+ 
+     if stream:
+         async def stream_gen():
+             try:
+-                async with client.stream("POST", url, json=responses_body, headers=headers) as backend_resp:
+-                    if backend_resp.status_code != 200:
+-                        try:
+-                            error_text = (await backend_resp.aread()).decode("utf-8", errors="replace")[:500]
+-                        except Exception:
+-                            error_text = "(unreadable response)"
+-                        print(f"[proxy] codex error {backend_resp.status_code}: {error_text}", flush=True)
+-                        log_request("codex", backend["model"], True, f"error {backend_resp.status_code}")
+-                        err_msg = f"Codex backend error {backend_resp.status_code}: {error_text}"
+-                        safe_msg = err_msg.encode("ascii", errors="replace").decode("ascii")
+-                        yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':safe_msg}})}\n\n"
++                for attempt in range(2):
++                    headers = _codex_headers(backend)
++                    async with client.stream("POST", url, json=responses_body, headers=headers) as backend_resp:
++                        if backend_resp.status_code == 401 and attempt == 0:
++                            await backend_resp.aread()
++                            if _refresh_codex_backend(backend):
++                                continue
++                        if backend_resp.status_code != 200:
++                            try:
++                                error_text = (await backend_resp.aread()).decode("utf-8", errors="replace")[:500]
++                            except Exception:
++                                error_text = "(unreadable response)"
++                            print(f"[proxy] codex error {backend_resp.status_code}: {error_text}", flush=True)
++                            log_request("codex", backend["model"], True, f"error {backend_resp.status_code}")
++                            err_msg = f"Codex backend error {backend_resp.status_code}: {error_text}"
++                            safe_msg = err_msg.encode("ascii", errors="replace").decode("ascii")
++                            yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':safe_msg}})}\n\n"
++                            return
++                        log_request("codex", backend["model"], True, "success")
++                        async for event in translate_codex_stream(backend_resp, original_model, request_id):
++                            yield event
+                         return
+-                    log_request("codex", backend["model"], True, "success")
+-                    async for event in translate_codex_stream(backend_resp, original_model, request_id):
+-                        yield event
+             except Exception as e:
+                 log_request("codex", backend["model"], True, "error")
+                 safe_msg = str(e).encode("ascii", errors="replace").decode("ascii")
+@@ -1648,41 +1803,48 @@ async def _handle_codex_messages(body: dict, backend: dict, original_model: str,
+         aggregated = {"output": [], "usage": {}, "status": "completed"}
+         text_acc = ""
+         tool_items: dict[str, dict] = {}
+-        async with client.stream("POST", url, json=responses_body, headers=headers) as backend_resp:
+-            if backend_resp.status_code != 200:
+-                err_text = (await backend_resp.aread()).decode("utf-8", errors="replace")[:500]
+-                print(f"[proxy] codex error {backend_resp.status_code}: {err_text}", flush=True)
+-                log_request("codex", backend["model"], False, f"error {backend_resp.status_code}")
+-                safe_msg = f"Codex backend returned {backend_resp.status_code}: {err_text}".encode("ascii", errors="replace").decode("ascii")
+-                return JSONResponse({"type": "error", "error": {"type": "api_error", "message": safe_msg}}, status_code=backend_resp.status_code)
+-            async for line in backend_resp.aiter_lines():
+-                if not line or not line.startswith("data:"):
+-                    continue
+-                payload = line[5:].strip()
+-                if not payload or payload == "[DONE]":
+-                    continue
+-                try:
+-                    event = json.loads(payload)
+-                except json.JSONDecodeError:
+-                    continue
+-                etype = event.get("type", "")
+-                if etype == "response.output_text.delta":
+-                    text_acc += event.get("delta", "")
+-                elif etype == "response.output_item.done":
+-                    item = event.get("item", {}) or {}
+-                    if item.get("type") == "function_call":
+-                        tool_items[item.get("id") or item.get("call_id", "")] = item
+-                elif etype in ("response.completed", "response.incomplete"):
+-                    resp_obj = event.get("response", {}) or {}
+-                    aggregated["usage"] = resp_obj.get("usage", {}) or {}
+-                    aggregated["status"] = resp_obj.get("status", "completed")
+-                    aggregated["incomplete_details"] = resp_obj.get("incomplete_details", {})
+-                elif etype in ("response.failed", "error"):
+-                    err = event.get("response", {}).get("error") or event.get("error") or {}
+-                    msg = err.get("message", "Codex backend error") if isinstance(err, dict) else str(err)
+-                    log_request("codex", backend["model"], False, "error")
+-                    safe_msg = msg.encode("ascii", errors="replace").decode("ascii")
+-                    return JSONResponse({"type": "error", "error": {"type": "api_error", "message": safe_msg}}, status_code=502)
++        for attempt in range(2):
++            headers = _codex_headers(backend)
++            async with client.stream("POST", url, json=responses_body, headers=headers) as backend_resp:
++                if backend_resp.status_code == 401 and attempt == 0:
++                    await backend_resp.aread()
++                    if _refresh_codex_backend(backend):
++                        continue
++                if backend_resp.status_code != 200:
++                    err_text = (await backend_resp.aread()).decode("utf-8", errors="replace")[:500]
++                    print(f"[proxy] codex error {backend_resp.status_code}: {err_text}", flush=True)
++                    log_request("codex", backend["model"], False, f"error {backend_resp.status_code}")
++                    safe_msg = f"Codex backend returned {backend_resp.status_code}: {err_text}".encode("ascii", errors="replace").decode("ascii")
++                    return JSONResponse({"type": "error", "error": {"type": "api_error", "message": safe_msg}}, status_code=backend_resp.status_code)
++                async for line in backend_resp.aiter_lines():
++                    if not line or not line.startswith("data:"):
++                        continue
++                    payload = line[5:].strip()
++                    if not payload or payload == "[DONE]":
++                        continue
++                    try:
++                        event = json.loads(payload)
++                    except json.JSONDecodeError:
++                        continue
++                    etype = event.get("type", "")
++                    if etype == "response.output_text.delta":
++                        text_acc += event.get("delta", "")
++                    elif etype == "response.output_item.done":
++                        item = event.get("item", {}) or {}
++                        if item.get("type") == "function_call":
++                            tool_items[item.get("id") or item.get("call_id", "")] = item
++                    elif etype in ("response.completed", "response.incomplete"):
++                        resp_obj = event.get("response", {}) or {}
++                        aggregated["usage"] = resp_obj.get("usage", {}) or {}
++                        aggregated["status"] = resp_obj.get("status", "completed")
++                        aggregated["incomplete_details"] = resp_obj.get("incomplete_details", {})
++                    elif etype in ("response.failed", "error"):
++                        err = event.get("response", {}).get("error") or event.get("error") or {}
++                        msg = err.get("message", "Codex backend error") if isinstance(err, dict) else str(err)
++                        log_request("codex", backend["model"], False, "error")
++                        safe_msg = msg.encode("ascii", errors="replace").decode("ascii")
++                        return JSONResponse({"type": "error", "error": {"type": "api_error", "message": safe_msg}}, status_code=502)
++                break
+ 
+         if text_acc:
+             aggregated["output"].append({"type": "message", "content": [{"type": "output_text", "text": text_acc}]})
+@@ -1865,15 +2027,32 @@ async def userinfo_mock(request: Request):
+ @app.get("/v1/models")
+ async def list_models(request: Request):
+-    """Return compatible model list."""
++    """Expose the real Codex route behind Claude-compatible model IDs."""
++    effort = str(config.codex_reasoning_effort).strip().lower()
++    aliases = (
++        ("claude-opus-4-8", "claude-opus", config.codex_model),
++        ("claude-sonnet-4-5", "claude-sonnet", config.codex_model),
++        ("claude-haiku-4-5-20251001", "claude-haiku", config.codex_model),
++    )
+     models = [
+-        {"id": "claude-sonnet-4-5", "type": "model", "display_name": "Claude Sonnet 4.5"},
+-        {"id": "claude-opus-4-8", "type": "model", "display_name": "Claude Opus 4.8"},
+-        {"id": "claude-haiku-4-5-20251001", "type": "model", "display_name": "Claude Haiku 4.5"},
+-        {"id": "deepseek-chat", "type": "model", "display_name": "DeepSeek Chat"},
+-        {"id": "deepseek-reasoner", "type": "model", "display_name": "DeepSeek Reasoner"},
+-        {"id": "gpt-4o", "type": "model", "display_name": "GPT-4o"},
++        {
++            "id": model_id,
++            "type": "model",
++            "display_name": (
++                "ChatGPT Codex | "
++                f"{config.codex_model_map.get(family) or fallback} | "
++                f"{effort}"
++            ),
++        }
++        for model_id, family, fallback in aliases
+     ]
+-    return JSONResponse({"data": models, "has_more": False, "first_id": models[0]["id"], "last_id": models[-1]["id"]})
++    return JSONResponse(
++        {
++            "data": models,
++            "has_more": False,
++            "first_id": models[0]["id"],
++            "last_id": models[-1]["id"],
++        }
++    )
+ 
+ 
+ # Add proper organization endpoint (not just catch-all)
+@@ -2056,10 +2218,11 @@ async def api_test_backend(request: Request):
+             "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ping"}]}],
+             "stream": True,
+             "store": False,
++            "reasoning": {"effort": config.codex_reasoning_effort},
+         }
+         url = f"{config.codex_backend_url.rstrip('/')}/responses"
+         try:
+-            async with httpx.AsyncClient(timeout=20, trust_env=False) as c:
++            async with httpx.AsyncClient(timeout=20, trust_env=True) as c:
+                 async with c.stream("POST", url, json=probe_body, headers=_codex_headers(backend)) as resp:
+                     if resp.status_code == 200:
+                         await resp.aclose()
+@@ -2083,7 +2246,7 @@ async def api_test_backend(request: Request):
+         return {"ok": False, "error": "Custom provider requires an API Base URL"}
+ 
+     try:
+-        async with httpx.AsyncClient(timeout=10, trust_env=False) as c:
++        async with httpx.AsyncClient(timeout=10, trust_env=True) as c:
+             resp = await c.get(url, headers={"Authorization": auth_header})
+             if resp.status_code == 200:
+                 data = resp.json()
+@@ -2263,6 +2426,9 @@ async def api_anthropic_catch_all(request: Request, path: str):
+ async def health():
+     return {
+         "status": "ok",
++        "finalkit_instance": FINALKIT_INSTANCE_ID,
++        "finalkit_backend": FINALKIT_BACKEND,
++        "control_protected": bool(FINALKIT_CONTROL_TOKEN),
+         "deepseek_configured": bool(config.deepseek_api_key),
+         "openai_configured": bool(config.openai_api_key) or (
+             config.openai_auth_mode == "codex_device" and codex_auth_store.is_configured()
