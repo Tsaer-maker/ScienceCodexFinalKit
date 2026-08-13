@@ -321,7 +321,7 @@ index 5db7334..cc38afd 100755
  # Static files for dashboard
  app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
  
-@@ -1607,34 +1733,63 @@ def _codex_headers(backend: dict) -> dict:
+@@ -1607,34 +1733,66 @@ def _codex_headers(backend: dict) -> dict:
      return headers
  
  
@@ -379,6 +379,9 @@ index 5db7334..cc38afd 100755
 +                            await backend_resp.aread()
 +                            if _refresh_codex_backend(backend):
 +                                continue
++                        if backend_resp.status_code in {502, 503, 504} and attempt == 0:
++                            await backend_resp.aread()
++                            continue
 +                        if backend_resp.status_code != 200:
 +                            try:
 +                                error_text = (await backend_resp.aread()).decode("utf-8", errors="replace")[:500]
@@ -400,7 +403,7 @@ index 5db7334..cc38afd 100755
              except Exception as e:
                  log_request("codex", backend["model"], True, "error")
                  safe_msg = str(e).encode("ascii", errors="replace").decode("ascii")
-@@ -1648,41 +1803,48 @@ async def _handle_codex_messages(body: dict, backend: dict, original_model: str,
+@@ -1648,41 +1806,51 @@ async def _handle_codex_messages(body: dict, backend: dict, original_model: str,
          aggregated = {"output": [], "usage": {}, "status": "completed"}
          text_acc = ""
          tool_items: dict[str, dict] = {}
@@ -446,6 +449,9 @@ index 5db7334..cc38afd 100755
 +                    await backend_resp.aread()
 +                    if _refresh_codex_backend(backend):
 +                        continue
++                if backend_resp.status_code in {502, 503, 504} and attempt == 0:
++                    await backend_resp.aread()
++                    continue
 +                if backend_resp.status_code != 200:
 +                    err_text = (await backend_resp.aread()).decode("utf-8", errors="replace")[:500]
 +                    print(f"[proxy] codex error {backend_resp.status_code}: {err_text}", flush=True)
@@ -484,7 +490,7 @@ index 5db7334..cc38afd 100755
  
          if text_acc:
              aggregated["output"].append({"type": "message", "content": [{"type": "output_text", "text": text_acc}]})
-@@ -1865,15 +2027,32 @@ async def userinfo_mock(request: Request):
+@@ -1865,15 +2033,32 @@ async def userinfo_mock(request: Request):
  @app.get("/v1/models")
  async def list_models(request: Request):
 -    """Return compatible model list."""
@@ -525,7 +531,7 @@ index 5db7334..cc38afd 100755
  
  
  # Add proper organization endpoint (not just catch-all)
-@@ -2056,10 +2218,11 @@ async def api_test_backend(request: Request):
+@@ -2056,10 +2224,11 @@ async def api_test_backend(request: Request):
              "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ping"}]}],
              "stream": True,
              "store": False,
@@ -538,7 +544,7 @@ index 5db7334..cc38afd 100755
                  async with c.stream("POST", url, json=probe_body, headers=_codex_headers(backend)) as resp:
                      if resp.status_code == 200:
                          await resp.aclose()
-@@ -2083,7 +2246,7 @@ async def api_test_backend(request: Request):
+@@ -2083,7 +2252,7 @@ async def api_test_backend(request: Request):
          return {"ok": False, "error": "Custom provider requires an API Base URL"}
  
      try:
@@ -547,7 +553,7 @@ index 5db7334..cc38afd 100755
              resp = await c.get(url, headers={"Authorization": auth_header})
              if resp.status_code == 200:
                  data = resp.json()
-@@ -2263,6 +2426,9 @@ async def api_anthropic_catch_all(request: Request, path: str):
+@@ -2263,6 +2432,9 @@ async def api_anthropic_catch_all(request: Request, path: str):
  async def health():
      return {
          "status": "ok",

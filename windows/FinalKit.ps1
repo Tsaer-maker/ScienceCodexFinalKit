@@ -3,7 +3,7 @@ param(
   [ValidateSet(
     "help", "menu", "clear", "build", "bootstrap",
     "configure-deepseek", "configure-kimi", "configure-glm", "configure-codex", "configure-codex-device",
-    "login-linux-codex", "deepseek", "kimi", "glm", "codex", "claude",
+    "login-linux-codex", "deepseek", "kimi", "glm", "codex", "claude", "science",
     "restart", "smoke", "test-deepseek", "test-kimi", "test-glm", "test-codex", "test-codex-tiers",
     "models", "discover-models", "update-runtime", "update-models", "update-tools",
     "status", "doctor", "stop", "browser-start", "browser-science", "browser-status", "browser-stop",
@@ -850,18 +850,36 @@ function Invoke-ModelUpdateInteractive {
   Invoke-Fkctl ($arguments + @("--restart"))
 }
 
-function Open-Science {
-  param([ValidateSet("deepseek", "kimi", "glm", "codex")][string]$Mode)
+function Open-NativeClaude {
+  param(
+    [ValidateSet("deepseek", "kimi", "glm", "codex")][string]$Mode,
+    [string[]]$Arguments = @()
+  )
+  $forwarded = @()
+  foreach ($argument in @($Arguments)) {
+    $forwarded += @($argument -split ',' | Where-Object { $_ -ne "" })
+  }
+  if ($forwarded.Count -gt 0) {
+    Invoke-Fkctl (@("claude", $Mode) + $forwarded)
+    return
+  }
   $user = Resolve-LinuxUser
-  $output = Get-WslOutput -AsUser $user -Command (@(Get-FkctlPath) + @("start", $Mode))
+  $output = Get-WslOutput -AsUser $user -Command (@(Get-FkctlPath) + @("gateway", $Mode))
+  if ($output) { Write-Host $output }
+  $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
+  if (-not $wsl) { throw "wsl.exe was not found" }
+  $terminalArgs = @("-d", $Distro, "-u", $user, "--", (Get-FkctlPath), "claude", $Mode)
+  [void](Start-Process -FilePath $wsl.Source -ArgumentList $terminalArgs)
+  Write-Host "Opened native Claude Code with $Mode in a separate WSL terminal." -ForegroundColor Green
+}
+
+function Open-CurrentScience {
+  $user = Resolve-LinuxUser
+  $output = Get-WslOutput -AsUser $user -Command (@(Get-FkctlPath) + @("restart"))
   if ($output) { Write-Host $output }
   $urls = @($output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^https?://\S+$' })
   $url = if ($urls.Count -gt 0) { $urls[-1] } else { Get-FkctlOutput -Arguments @("url") }
-  if ($Mode -eq "codex" -and $output -notmatch '(?m)^EFFECTIVE_ROUTE=') {
-    Write-Warning "Start succeeded through the installed legacy Codex route. Run menu 16 to deploy the current runtime; use menu 2 only if FinalKit is missing or damaged."
-  } else {
-    Write-Host "Note: Science uses Claude-compatible IDs; the menu title and EFFECTIVE_ROUTE expose the actual provider/model route." -ForegroundColor Cyan
-  }
+  Write-Host "Claude Science requires its own supported Claude account sign-in; provider API keys and ChatGPT/Codex login authenticate only the selected gateway." -ForegroundColor Yellow
   Write-Host "Claude Science: $url"
   if (-not $NoBrowser) { Start-Process -FilePath $url }
 }
@@ -1030,10 +1048,11 @@ function Show-Menu {
     Write-Host "  4  Configure Kimi"
     Write-Host "  5  Configure GLM"
     Write-Host "  6  Configure ChatGPT Codex"
-    Write-Host "  7  Start DeepSeek   8 Start Kimi   9 Start GLM   10 Start Codex"
-    Write-Host "  11 Open current Science in automation Chrome"
+    Write-Host "  7  Claude Code + DeepSeek   8 + Kimi   9 + GLM   10 + Codex"
+    Write-Host "  11 Open Claude Science with current route (Claude sign-in required)"
     Write-Host "  12 Status   13 Doctor   14 Stop Science/gateway   15 Stop automation Chrome"
     Write-Host "  16 Update FinalKit runtime   17 Update provider models   18 Update official tools"
+    Write-Host "  19 Open current Science in automation Chrome"
     Write-Host "  0  Exit"
     $selection = Read-Host "Select"
     try {
@@ -1047,11 +1066,11 @@ function Show-Menu {
           Assert-FkctlCapability -Capability "browser-codex-oauth" -ActionLabel "ChatGPT Codex browser login"
           Invoke-Fkctl @("configure-codex")
         }
-        "7" { Open-Science deepseek }
-        "8" { Open-Science kimi }
-        "9" { Open-Science glm }
-        "10" { Open-Science codex }
-        "11" { Open-ScienceInBrowserBridge }
+        "7" { Open-NativeClaude deepseek }
+        "8" { Open-NativeClaude kimi }
+        "9" { Open-NativeClaude glm }
+        "10" { Open-NativeClaude codex }
+        "11" { Open-CurrentScience }
         "12" { Invoke-Fkctl @("status") }
         "13" { Invoke-Fkctl @("doctor") }
         "14" { Invoke-Fkctl @("stop") }
@@ -1059,6 +1078,7 @@ function Show-Menu {
         "16" { Invoke-RuntimeUpdate }
         "17" { Invoke-ModelUpdateInteractive }
         "18" { Invoke-ToolsUpdate }
+        "19" { Open-ScienceInBrowserBridge }
         "0" { return }
         default { Write-Warning "Unknown selection" }
       }
@@ -1085,7 +1105,8 @@ Providers and start:
   .\FinalKit.ps1 -Action configure-codex
   .\FinalKit.ps1 -Action configure-codex-device  # beta fallback when browser OAuth cannot return to WSL
   .\FinalKit.ps1 -Action test-codex-tiers        # explicit 3-request Sol/Terra/Luna account acceptance test
-  .\FinalKit.ps1 -Action deepseek | kimi | glm | codex
+  .\FinalKit.ps1 -Action deepseek | kimi | glm | codex  # native Claude Code; no Science login needed
+  .\FinalKit.ps1 -Action science                         # open Science; supported Claude sign-in required
   .\FinalKit.ps1 -Action claude -RemainingArgs deepseek,--help
 
 Independent updates (no WSL rebuild):
@@ -1158,14 +1179,19 @@ try {
       Invoke-Fkctl @("configure-codex-device")
     }
     "login-linux-codex" { Invoke-Fkctl @("login-linux-codex") }
-    "deepseek" { Open-Science deepseek }
-    "kimi" { Open-Science kimi }
-    "glm" { Open-Science glm }
-    "codex" { Open-Science codex }
+    "deepseek" { Open-NativeClaude -Mode deepseek -Arguments @($RemainingArgs) }
+    "kimi" { Open-NativeClaude -Mode kimi -Arguments @($RemainingArgs) }
+    "glm" { Open-NativeClaude -Mode glm -Arguments @($RemainingArgs) }
+    "codex" { Open-NativeClaude -Mode codex -Arguments @($RemainingArgs) }
     "claude" {
       if (-not $RemainingArgs -or $RemainingArgs.Count -lt 1) { throw "claude needs provider first: deepseek|kimi|glm|codex" }
-      Invoke-Fkctl (@("claude") + $RemainingArgs)
+      $claudeArguments = @()
+      foreach ($argument in @($RemainingArgs)) {
+        $claudeArguments += @($argument -split ',' | Where-Object { $_ -ne "" })
+      }
+      Invoke-Fkctl (@("claude") + $claudeArguments)
     }
+    "science" { Open-CurrentScience }
     "restart" {
       Invoke-Fkctl @("restart")
       $url = Get-FkctlOutput @("url")

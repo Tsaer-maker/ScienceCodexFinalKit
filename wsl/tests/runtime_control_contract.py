@@ -64,15 +64,15 @@ def verify(manager_path: Path) -> None:
         paths.data_dir.mkdir(parents=True, exist_ok=True)
 
         # The long-lived daemon never inherits Windows drive paths or a caller
-        # working directory.  Science uses its supported API-key BYOK path;
-        # Claude OAuth/auth-token state is deliberately absent.
+        # working directory. FinalKit owns only the local endpoint; Claude
+        # Science itself owns its supported account sign-in.
         os.environ["PATH"] = "/mnt/c/Windows/System32:/usr/bin:/mnt/d/Tools"
         os.environ["PWD"] = "/mnt/d/Tools/ScienceCodexFinalKit"
         daemon_environment = manager.science_environment("http://127.0.0.1:9876")
         assert daemon_environment["PATH"] == module.LINUX_SYSTEM_PATH
         assert daemon_environment["PWD"] == str(paths.science_home)
         assert daemon_environment["HOME"] == str(paths.science_home)
-        assert daemon_environment["ANTHROPIC_API_KEY"] == "finalkit-local"
+        assert "ANTHROPIC_API_KEY" not in daemon_environment
         assert "ANTHROPIC_AUTH_TOKEN" not in daemon_environment
         assert "/mnt/" not in daemon_environment["PATH"]
 

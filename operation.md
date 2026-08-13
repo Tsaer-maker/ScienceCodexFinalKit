@@ -1,4 +1,4 @@
-# Science SwitchModel / FinalKit 3.1.2 操作手册
+# Science SwitchModel / FinalKit 3.1.3 操作手册
 
 本手册是 FinalKit 的唯一运行与维护入口，面向首次安装者、日常使用者和本机管理员。架构、安全设计与源码职责见 [README.zh-CN.md](README.zh-CN.md) 和 [代码剖析](docs/CODE_WALKTHROUGH.zh-CN.md)。
 
@@ -33,7 +33,7 @@ D:\Tools\ScienceCodexFinalKit
 2. 双击 `SwitchModel.cmd`，选择 `2 Install/repair`，或直接双击 `Build.cmd`；该入口用于首次安装和完整修复，普通 runtime/模型/工具升级改用菜单 `16/17/18`；
 3. 首次启用 WSL 时允许一次 UAC；若 FinalKit 要求重启，重启并登录回同一个 Windows 账号，再执行一次 Build；
 4. 看到 `BUILD_OK` 和 `SMOKE_OK` 后，返回菜单配置自己拥有的 DeepSeek、Kimi、GLM API key 或 ChatGPT Codex 登录；
-5. 先运行对应的真实后端测试，再启动 Claude Science。
+5. 先运行对应的真实后端测试，再用菜单 `7–10` 进入原生 Claude Code；只有另有支持的 Claude 账号时才用菜单 `11` 进入 Claude Science。
 
 `Clear` 只用于确实存在且明确要删除的旧 Ubuntu。新电脑、空 WSL、Build 中断或普通网络失败都不应先 Clear。
 
@@ -446,16 +446,17 @@ SwitchModel.cmd
 
 | 菜单 | 作用 |
 |---|---|
-| 7–10 | 切换到指定后端、启动 gateway 与 Claude Science，并在默认浏览器打开 Science |
-| 11 | 将已经运行的当前 Claude Science URL 打开到可被 MCP 控制的隔离 Chrome；不会切换模型 |
+| 7–10 | 切换到指定后端并进入原生 Claude Code；不启动 Science，也不要求 Science 登录 |
+| 11 | 用当前 route 启动/打开 Claude Science；Science 自身支持的 Claude 账号登录是独立前提 |
 | 12 | 只读显示运行状态 |
 | 13 | 只读检查安装、权限、connector 和进程身份 |
 | 14 | 停止 Claude Science 和 FinalKit gateway，不关闭自动化 Chrome |
 | 15 | 只停止 FinalKit 隔离自动化 Chrome，不停止 Science |
+| 19 | 将已经运行的当前 Claude Science URL 打开到可被 MCP 控制的隔离 Chrome；不会切换模型 |
 
-因此 `10` 与 `11–13` 不能互相替代：要用 ChatGPT/Codex 后端启动 Science，选择 `10`；只有在还要让 Science/Claude 通过 Chrome DevTools MCP 操作网页时才再选择 `11`。
+因此 `7–10` 与 `11` 不能互相替代：只准备 DeepSeek/Kimi/GLM API key 或 ChatGPT/Codex 登录即可使用 `7–10` 的原生 Claude Code；要进入 Claude Science 工作台才选择 `11` 并完成 Science 自己支持的 Claude 账号登录。需要通过 Chrome DevTools MCP 操作网页时再选择 `19`。
 
-### 6.2 直接启动 Claude Science
+### 6.2 直接使用 provider
 
 ```powershell
 # DeepSeek
@@ -471,16 +472,16 @@ SwitchModel.cmd
 .\windows\FinalKit.ps1 -Action codex
 ```
 
-成功后会打印 Claude Science 的一次性 URL，并在默认 Windows 浏览器中打开。
+成功后会启动对应 gateway 并进入原生 Claude Code。退出 Claude Code 不会泄露真实 provider key；后端可由下一次 `7–10` 选择重新切换。
 
 Codex 启动的关键输出应类似：
 
 ```text
 ACTIVE_MODE=codex
-EFFECTIVE_ROUTE=Science Opus -> ChatGPT Codex gpt-5.6-sol (effort=max); Sonnet -> gpt-5.6-terra (effort=max); Haiku -> gpt-5.6-luna (effort=max)
+EFFECTIVE_ROUTE=Opus request alias -> ChatGPT Codex gpt-5.6-sol (effort=max); Sonnet -> gpt-5.6-terra (effort=max); Haiku -> gpt-5.6-luna (effort=max)
 ```
 
-模型 ID 仍是 Claude 兼容家族是预期行为；新版 gateway 会把下拉框标题显示为对应的真实 Codex 模型和 effort。若仍看到 `Claude Opus 4.8`，依次检查：菜单 `12 Status` 是否仍报告旧 distribution metadata；运行菜单 `16 Update FinalKit runtime` 后是否重新执行了 `10 Start Codex`；浏览器是否已重新打开或硬刷新；菜单 `13 Doctor` 中 connector security patch 是否为 `OK`。如果 runtime 尚未安装，才先用菜单 `2`。如果这些均正常，查看 Science bootstrap/gateway 日志，排除 `/v1/models` 拉取失败后使用离线默认列表的情况。发行包版本只用于识别 ZIP 和诊断，不参与 Start/Stop/Status 等命令放行；Windows 入口始终调用当前 WSL 用户已经部署的 `fkctl`。只有在调用该 runtime 尚未提供的新命令时，才会提示补齐能力；普通启动不会因为版本文本不同而被封锁。
+原生 Claude Code 不使用 Science 下拉框；实际 route 以 `EFFECTIVE_ROUTE`、`status` 和 gateway 日志为准。菜单 `11` 打开的 Science 必须先完成其支持的 Claude 账号登录，登录后 `/v1/models` 才能把兼容 ID 的标题显示为真实 provider/model；若页面仍只有 Opus/Sonnet/Haiku fallback 并提示 `No credentials`，这是 Science 未登录，不是 DeepSeek/Codex 后端失败。发行包版本只用于识别 ZIP 和诊断，不参与 Start/Stop/Status 等命令放行；Windows 入口始终调用当前 WSL 用户已经部署的 `fkctl`。只有调用该 runtime 尚未提供的新命令时才提示补齐 capability。
 
 ### 6.3 切换 provider
 
@@ -491,7 +492,7 @@ EFFECTIVE_ROUTE=Science Opus -> ChatGPT Codex gpt-5.6-sol (effort=max); Sonnet -
 .\windows\FinalKit.ps1 -Action kimi
 ```
 
-FinalKit 会停止当前 Science、验证并停止旧 gateway、启动新 gateway、重启 Science、核对 endpoint，最后才提交新模式。不要手工编辑 gateway 配置。
+FinalKit 会复用健康的同后端 gateway；切换后端时，若 Science 正在运行，会先通过其控制面安全停止，再替换 gateway。`7–10` 不重启 Science；菜单 `11` 才把当前 route 接入 Science。不要手工编辑 gateway 配置。
 
 ### 6.4 状态与停止
 
@@ -500,7 +501,7 @@ FinalKit 会停止当前 Science、验证并停止旧 gateway、启动新 gatewa
 .\windows\FinalKit.ps1 -Action stop
 ```
 
-健康运行应显示：
+仅使用原生 Claude Code 时，健康状态可显示 `Gateway: healthy`、`Claude Science: stopped`；打开 Science 后还应显示：
 
 ```text
 Gateway:            healthy
@@ -568,7 +569,7 @@ Claude Code 只取得本地 gateway endpoint，不取得真实 provider key。
 .\windows\FinalKit.ps1 -Action browser-status
 ```
 
-菜单 `11` 会进一步把当前已经运行的 Claude Science URL 直接打开到该隔离 Chrome；单独的 `browser-start` 仍只启动可自动化浏览器，便于没有 Science 的网页任务。
+菜单 `19` 会把当前已经运行的 Claude Science URL 打开到该隔离 Chrome；单独的 `browser-start` 仍只启动可自动化浏览器，便于没有 Science 的网页任务。
 
 成功判据：
 
@@ -781,9 +782,9 @@ fkctl logs science
 | API 返回 model not found | 查看 provider 当前模型可用性；不要修改上游 URL |
 | gateway stopped | 运行对应启动命令 |
 | gateway identity mismatch | 先 `-Action stop`，再启动；不要手工 kill 未知进程 |
-| `FINALKIT_SCIENCE_CONTROL_UNAVAILABLE`、Status 显示 `control unavailable`，或 owner state 为 `D` | 3.1.2 已把 Science cwd/PWD/HOME 固定到 WSL ext4、用纯 Linux PATH 启动，并对一次瞬时 socket 失败做短暂重试；旧 daemon 或持续 Linux `D` 状态仍须先用 `wsl.exe --list --verbose` 确认本包选中的发行版并关闭其中其他任务，再从 Windows执行 `wsl.exe --terminate Ubuntu-24.04`（名称按实际替换），运行菜单 `16 Update FinalKit runtime` 和对应 provider 启动。terminate 只重启该发行版的 WSL 内核实例，不注销发行版、不删除文件、不清 API/Codex 认证；若 runtime 文件本身缺失才用菜单 `2`。manager 不强杀失联/不可中断 daemon；不要选 Clear |
-| Start 后很快 sign out，日志出现 `invalid_grant` 或 `treating as logged-out` | 旧 FinalKit/HGSX 0.1.25 风格虚拟 OAuth 与 Science 0.1.27 不兼容。运行菜单 `16 Update FinalKit runtime`；3.1.2 会在停机边界识别并原子移除旧 FinalKit Fernet/v2 虚拟身份，改用 API-key-only BYOK。未知或真实 Claude Science 凭据不会被覆盖。然后重新 Start；不需要重新配置 DeepSeek/Kimi/GLM 或 Codex auth |
-| 日志只有 `growthbook: not signed in — flags stay at defaults` | 这是 API-key-only BYOK 没有 Claude.ai 个性化/实验开关账号的正常提示，不等于 Science 工作台退出，也不影响本地 gateway 推理。始终从菜单 Start 打开的最新 nonce URL 进入；旧标签页可关闭 |
+| `FINALKIT_SCIENCE_CONTROL_UNAVAILABLE`、Status 显示 `control unavailable`，或 owner state 为 `D` | FinalKit 把 Science cwd/PWD/HOME 固定到 WSL ext4、用纯 Linux PATH 启动，并对一次瞬时 socket 失败做短暂重试；旧 daemon 或持续 Linux `D` 状态仍须先用 `wsl.exe --list --verbose` 确认本包选中的发行版并关闭其中其他任务，再从 Windows 执行 `wsl.exe --terminate Ubuntu-24.04`（名称按实际替换），运行菜单 `16 Update FinalKit runtime`。terminate 不注销发行版、不删除文件、不清 API/Codex 认证；若 runtime 文件本身缺失才用菜单 `2`。原生 `7–10` 与 Science 账号状态解耦，但持续失联的已运行 Science 仍会阻止安全切换，避免误杀未知进程 |
+| Science 很快 sign out，日志出现 `invalid_grant` 或 `treating as logged-out` | 旧 FinalKit/HGSX 风格虚拟 OAuth 与当前 Science 不兼容。运行菜单 `16`；3.1.3 只移除能完整识别的旧 FinalKit Fernet/v2 虚拟身份，未知或真实凭据原样保留。随后选择 `11` 并用 Science 自己支持的 Claude 账号登录；不能用 DeepSeek API key 或 ChatGPT/Codex OAuth 替代 |
+| Science `/api/models` 或页面提示 `No credentials`，只显示 Opus/Sonnet/Haiku fallback | Science 未登录；这不证明 provider gateway 失败。先运行对应 `test-*`，再用 `7–10` 直接使用 provider；确需 Science 时选择 `11` 完成其官方登录 |
 | Science 页面没有打开 | 运行 `status`，再运行 `fkctl url` 获取新一次性 URL |
 | 端口被占用 | 查明占用者；FinalKit 不会强占第三方进程 |
 | 浏览器 `Status: stopped` | 重新运行 `browser-start` |
@@ -913,7 +914,7 @@ cd C:\Tools\ScienceCodexFinalKit   # 或你自己的稳定解压目录
 # 查看状态
 .\windows\FinalKit.ps1 -Action status
 
-# 把当前运行中的 Science 打开到可自动化的隔离 Chrome
+# 可选：已有受支持 Claude 登录并启动 Science 后，打开到自动化 Chrome
 .\windows\FinalKit.ps1 -Action browser-science
 
 # 网页任务结束
@@ -930,8 +931,9 @@ cd C:\Tools\ScienceCodexFinalKit   # 或你自己的稳定解压目录
 1. 运行 `status` 和 `doctor`，确认发行版、客户端、connector、权限与运行身份；
 2. 只配置自己拥有的一种 provider：DeepSeek、Kimi、GLM 或 ChatGPT Codex；
 3. 运行对应的 `test-deepseek`、`test-kimi`、`test-glm` 或 `test-codex`；
-4. 看到 `BACKEND_OK mode=<provider>` 后，再运行同名启动动作；
-5. 最后再次运行 `status`，应看到 gateway healthy、Claude Science running、runtime identity matched；
-6. 只有确实需要页面自动化时才运行 `browser-science` 和 `browser-mcp-info`。
+4. 看到 `BACKEND_OK mode=<provider>` 后，再运行菜单 `7–10` 的同名 Claude Code 动作；
+5. 最后再次运行 `status`，应看到 `Gateway: healthy`；此时 `Claude Science: stopped` 是允许的；
+6. 确需 Science 工作台时再选 `11`，完成 Science 自己支持的 Claude 账号登录，并确认 `Claude Science: running`、`Runtime identity: matched`；
+7. 只有确实需要页面自动化时才运行菜单 `19` / `browser-science` 和 `browser-mcp-info`。
 
 API key 只能在配置命令的隐藏提示中输入，不要发到聊天、截图、`.cmd`、README 或项目文件。已经公开过的 key 应在供应商控制台轮换。

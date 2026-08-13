@@ -29,7 +29,8 @@ EFFORT = "max"
 
 
 class FakeResponse:
-    status_code = 200
+    def __init__(self, status_code: int = 200) -> None:
+        self.status_code = status_code
 
     async def aread(self) -> bytes:
         return b""
@@ -41,22 +42,27 @@ class FakeResponse:
 
 
 class FakeStream:
+    def __init__(self, response: FakeResponse | None = None) -> None:
+        self.response = response or FakeResponse()
+
     async def __aenter__(self) -> FakeResponse:
-        return FakeResponse()
+        return self.response
 
     async def __aexit__(self, exc_type, exc, traceback) -> bool:
         return False
 
 
 class CaptureClient:
-    def __init__(self) -> None:
+    def __init__(self, statuses: list[int] | None = None) -> None:
         self.requests: list[dict] = []
+        self.statuses = list(statuses or [])
 
     def stream(self, method: str, url: str, *, json: dict, headers: dict) -> FakeStream:
         self.requests.append(
             {"method": method, "url": url, "json": json, "headers": headers}
         )
-        return FakeStream()
+        status = self.statuses.pop(0) if self.statuses else 200
+        return FakeStream(FakeResponse(status))
 
 
 def load_connector(proxy_path: Path, config_dir: Path):
@@ -139,6 +145,24 @@ async def verify(proxy_path: Path) -> None:
             if outbound["json"].get("reasoning") != {"effort": EFFORT}:
                 raise AssertionError(f"{alias} outbound effort drifted: {outbound['json']!r}")
 
+        retry_client = CaptureClient([502, 200])
+        connector.get_client = lambda: retry_client
+        alias = "claude-opus-4-8"
+        backend = connector.config.resolve_backend(alias)
+        response = await connector._handle_codex_messages(
+            {
+                "model": alias,
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Return BACKEND_OK"}],
+            },
+            backend,
+            alias,
+            "msg_retry_contract",
+            False,
+        )
+        if response.status_code != 200 or len(retry_client.requests) != 2:
+            raise AssertionError("one transient pre-response Codex 502 was not retried exactly once")
+
 
 def main() -> int:
     if len(sys.argv) != 2:
@@ -149,7 +173,7 @@ def main() -> int:
         print(f"connector is missing: {proxy_path}", file=sys.stderr)
         return 2
     asyncio.run(verify(proxy_path))
-    print("CONNECTOR_CONTRACT_OK catalog=3 routes=sol,terra,luna effort=max network=disabled")
+    print("CONNECTOR_CONTRACT_OK catalog=3 routes=sol,terra,luna effort=max retry502=once network=disabled")
     return 0
 
 

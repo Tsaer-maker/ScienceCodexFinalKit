@@ -322,8 +322,10 @@ install_user() {
     python3 -m venv "$bridge_dir/.venv"
   fi
   local expected_requirements installed_requirements
-  expected_requirements="$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' \
-    "$SCRIPT_DIR/requirements.lock" | LC_ALL=C sort -f)"
+  # Source archives extracted on Windows may expose CRLF through /mnt/<drive>.
+  # Compare package semantics, not the transport newline representation.
+  expected_requirements="$(tr -d '\r' <"$SCRIPT_DIR/requirements.lock" | \
+    sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' | LC_ALL=C sort -f)"
   installed_requirements="$("$bridge_dir/.venv/bin/pip" freeze | LC_ALL=C sort -f)"
   if [[ "$expected_requirements" == "$installed_requirements" ]] && \
      "$bridge_dir/.venv/bin/pip" check >/dev/null; then

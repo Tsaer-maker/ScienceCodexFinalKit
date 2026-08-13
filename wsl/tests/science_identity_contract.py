@@ -103,7 +103,8 @@ def verify(helper_path: Path) -> None:
         created_dir.mkdir(mode=0o700)
         write_keys(module, created_dir)
         created = module.ensure_identity(created_dir)
-        assert created["action"] == "reused" and created["schema"] == "science-api-key-only"
+        assert created["action"] == "reused" and created["schema"] == "science-login-required"
+        assert created["authenticated"] is False
         reused = module.ensure_identity(created_dir)
         assert reused["action"] == "reused"
 
@@ -113,11 +114,11 @@ def verify(helper_path: Path) -> None:
         legacy_identity(module, legacy_dir, keys["OAUTH_ENCRYPTION_KEY"])
         legacy_status = module.inspect_identity(legacy_dir)
         assert legacy_status["schema"] == "science-local-legacy"
-        assert legacy_status["migration_required"] is True
+        assert legacy_status["removal_required"] is True
         migrated = module.ensure_identity(legacy_dir)
         assert migrated["action"] == "removed-science-local-legacy"
         assert not (legacy_dir / ".oauth-tokens").exists()
-        assert module.inspect_identity(legacy_dir)["schema"] == "science-api-key-only"
+        assert module.inspect_identity(legacy_dir)["schema"] == "science-login-required"
 
         v2_dir = root / "v2"
         v2_dir.mkdir(mode=0o700)
@@ -125,12 +126,12 @@ def verify(helper_path: Path) -> None:
         v2_identity(module, v2_dir, keys["OAUTH_ENCRYPTION_KEY"])
         v2_status = module.inspect_identity(v2_dir)
         assert v2_status["schema"] == "science-local-v2"
-        assert v2_status["migration_required"] is True
+        assert v2_status["removal_required"] is True
         migrated = module.ensure_identity(v2_dir)
         assert migrated["action"] == "removed-science-local-v2"
         assert not (v2_dir / ".oauth-tokens").exists()
         assert not (v2_dir / "active-org.json").exists()
-        assert module.inspect_identity(v2_dir)["schema"] == "science-api-key-only"
+        assert module.inspect_identity(v2_dir)["schema"] == "science-login-required"
 
         unknown_dir = root / "unknown"
         unknown_dir.mkdir(mode=0o700)
@@ -141,17 +142,14 @@ def verify(helper_path: Path) -> None:
         unknown.write_bytes(b"do-not-overwrite")
         unknown.chmod(0o600)
         before_unknown = unknown.read_bytes()
-        try:
-            module.ensure_identity(unknown_dir)
-        except module.IdentityError as exc:
-            assert "refusing to overwrite" in str(exc)
-        else:
-            raise AssertionError("unknown credential was not rejected")
+        preserved = module.ensure_identity(unknown_dir)
+        assert preserved["schema"] == "science-credentials-preserved"
+        assert preserved["action"] == "reused"
         assert unknown.read_bytes() == before_unknown
         assert not (unknown_dir / "active-org.json").exists()
 
     print(
-        "SCIENCE_IDENTITY_CONTRACT_OK schema=api-key-only reuse=yes "
+        "SCIENCE_IDENTITY_CONTRACT_OK empty=login-required reuse=yes "
         "legacy=removed v2=removed unknown=preserved"
     )
 

@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Own and validate FinalKit's isolated Claude Science BYOK auth boundary.
+"""Audit FinalKit's isolated Claude Science credential boundary.
 
-Claude Science 0.1.27 stores OAuth state as a v2 AES-256-GCM envelope.  Older
-FinalKit builds inherited the connector's Fernet helper and wrote a fake,
-non-empty refresh token.  Current Science tries that value against the real
-Claude OAuth endpoint, receives ``invalid_grant``, and signs the local UI out.
+Claude Science 0.1.27 requires its own supported Claude account sign-in before
+the web application will load provider models.  A DeepSeek/Kimi/GLM API key or
+a ChatGPT/Codex login authenticates FinalKit's local gateway, not the Science
+web application.  Older FinalKit builds wrote two exact synthetic OAuth
+shapes; current Science refreshes those values against the real Claude OAuth
+service and then signs the UI out.
 
-Claude Science 0.1.27 supports a cleaner BYOK path: no Claude OAuth token at
-all, with ``ANTHROPIC_API_KEY`` and ``ANTHROPIC_BASE_URL`` supplied to the
-daemon.  This helper removes only cryptographically recognized FinalKit
-virtual identities and verifies that the isolated profile is in that API-key
-mode.  It never overwrites an unknown or real Claude Science account.
+This helper removes only those cryptographically recognized legacy FinalKit
+identities.  An empty profile remains explicitly ``login-required`` and every
+unknown or real credential is preserved byte-for-byte for Claude Science to
+own.  FinalKit never manufactures a replacement account identity.
 """
 
 from __future__ import annotations
@@ -194,8 +195,6 @@ def _token_files(token_dir: Path) -> list[Path]:
     ):
         raise IdentityError("unsafe Science OAuth token directory")
     files = sorted(token_dir.iterdir(), key=lambda item: item.name)
-    if len(files) > 4:
-        raise IdentityError("Science OAuth token directory has an unexpected credential set")
     return files
 
 
@@ -219,12 +218,15 @@ def _validate_current(data_dir: Path, keys: dict[str, str]) -> dict[str, str] | 
     assert raw is not None
     if not raw.startswith(b"v2:"):
         return None
-    token = _decode_json(
-        _decrypt_v2(raw, keys["OAUTH_ENCRYPTION_KEY"]), "local Science v2 identity"
-    )
-    active_raw = _read_private(data_dir / "active-org.json")
-    assert active_raw is not None
-    active = _decode_json(active_raw, "Science active organization")
+    try:
+        token = _decode_json(
+            _decrypt_v2(raw, keys["OAUTH_ENCRYPTION_KEY"]), "local Science v2 identity"
+        )
+        active_raw = _read_private(data_dir / "active-org.json")
+        assert active_raw is not None
+        active = _decode_json(active_raw, "Science active organization")
+    except IdentityError:
+        return None
     account = token.get("account_uuid")
     org = token.get("org_uuid")
     checks = (
@@ -242,7 +244,7 @@ def _validate_current(data_dir: Path, keys: dict[str, str]) -> dict[str, str] | 
         token.get("subscription_type") == "max",
     )
     if not all(checks):
-        raise IdentityError("local Science v2 identity has an unexpected credential shape")
+        return None
     return {"account_uuid": str(account), "org_uuid": str(org)}
 
 
@@ -262,7 +264,10 @@ def _is_exact_legacy(data_dir: Path, keys: dict[str, str]) -> bool:
         decrypted = Fernet(keys["OAUTH_ENCRYPTION_KEY"].encode("ascii")).decrypt(raw)
     except (InvalidToken, ValueError):
         return False
-    token = _decode_json(decrypted, "legacy FinalKit Science identity")
+    try:
+        token = _decode_json(decrypted, "legacy FinalKit Science identity")
+    except IdentityError:
+        return False
     active = _read_private(data_dir / "active-org.json", required=False)
     return bool(
         token.get("account_uuid") == LEGACY_ACCOUNT
@@ -312,38 +317,46 @@ def inspect_identity(data_dir: Path) -> dict[str, Any]:
     files = _token_files(data_dir / ".oauth-tokens")
     active = _read_private(data_dir / "active-org.json", required=False)
     if not files and active is None:
-        return {"ok": True, "schema": "science-api-key-only"}
+        return {
+            "ok": True,
+            "schema": "science-login-required",
+            "authenticated": False,
+        }
     current = _validate_current(data_dir, keys)
     if current is not None:
         return {
             "ok": True,
             "schema": "science-local-v2",
-            "migration_required": True,
+            "removal_required": True,
             **current,
         }
     if _is_exact_legacy(data_dir, keys):
         return {
             "ok": True,
             "schema": "science-local-legacy",
-            "migration_required": True,
+            "removal_required": True,
         }
-    raise IdentityError(
-        "unknown or real Claude Science credentials found; refusing to overwrite them"
-    )
+    return {
+        "ok": True,
+        "schema": "science-credentials-preserved",
+        "authenticated": None,
+        "credential_files": len(files),
+        "active_org_present": active is not None,
+    }
 
 
 def ensure_identity(data_dir: Path) -> dict[str, Any]:
     _private_directory(data_dir, create=True)
     status = inspect_identity(data_dir)
     schema = str(status.get("schema"))
-    if schema == "science-api-key-only":
+    if schema in {"science-login-required", "science-credentials-preserved"}:
         return {**status, "action": "reused"}
     if schema not in {"science-local-legacy", "science-local-v2"}:
         raise IdentityError("unrecognized Science auth state; refusing overwrite")
     _remove_recognized_identity(data_dir)
     verified = inspect_identity(data_dir)
-    if verified.get("schema") != "science-api-key-only":
-        raise IdentityError("Science API-key-only auth migration did not verify")
+    if verified.get("schema") != "science-login-required":
+        raise IdentityError("obsolete FinalKit Science identity removal did not verify")
     return {**verified, "action": f"removed-{schema}"}
 
 
