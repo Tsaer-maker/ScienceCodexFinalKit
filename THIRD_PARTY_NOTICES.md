@@ -1,6 +1,12 @@
 # Third-party notices
 
-FinalKit installs or integrates the following components at runtime.
+Science SwitchModel / FinalKit installs or integrates the following components at runtime.
+
+## Claude Science
+
+- Source/installer: `https://claude.ai/install-claude-science.sh`
+- Vendor: Anthropic
+- FinalKit does not redistribute the Claude Science binary in this package.
 
 ## Claude Code
 
@@ -35,7 +41,7 @@ FinalKit installs or integrates the following components at runtime.
 - Source: `https://github.com/ChromeDevTools/chrome-devtools-mcp`
 - Package: `chrome-devtools-mcp@1.2.0`
 - License: Apache-2.0
-- Installed per Windows user under `%LOCALAPPDATA%\ScienceCodexFinalKit` from npm. It connects only to FinalKit's isolated Chrome profile on Windows loopback.
+- Installed per WSL user from npm. It is optional at runtime and is never connected to the user's default Chrome profile by FinalKit.
 
 ## HGSX
 
@@ -50,4 +56,4 @@ Exact connector dependency versions are recorded in `wsl/requirements.lock`. The
 
 ## Provider services
 
-DeepSeek, Kimi/Moonshot, GLM/BigModel, Anthropic Claude Code, ChatGPT, and Codex are external services governed by their respective terms, account permissions, quotas, and billing. FinalKit does not bypass service authorization, captcha, user limits, subscriptions, or rate limits.
+DeepSeek, Kimi/Moonshot, GLM/BigModel, Anthropic, ChatGPT, and Codex are external services governed by their respective terms, account permissions, quotas, and billing. FinalKit does not bypass service authorization, captcha, user limits, subscriptions, or rate limits.
