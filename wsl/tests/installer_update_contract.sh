@@ -15,6 +15,19 @@ installer="$(readlink -f "$1")"
 # shellcheck disable=SC1090
 source "$installer"
 
+is_managed_bridge_proxy "$MANAGED_BRIDGE_PROXY_SHA256_320" || {
+  printf 'managed connector hash was not admitted\n' >&2
+  exit 1
+}
+is_managed_bridge_proxy "$RECOVERY_BRIDGE_PROXY_SHA256_330" || {
+  printf '3.3.0 recovery connector hash was not admitted\n' >&2
+  exit 1
+}
+if is_managed_bridge_proxy "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"; then
+  printf 'unknown connector hash was admitted\n' >&2
+  exit 1
+fi
+
 fixture="$(mktemp -d /tmp/finalkit-installer-update.XXXXXX)"
 trap 'rm -rf -- "${fixture:-}"' EXIT
 test_home="$fixture/home"
@@ -54,6 +67,8 @@ targets=(
   "$test_root/versions.txt"
   "$test_home/.local/bin/fkctl"
   "$test_home/.local/bin/chrome-devtools-mcp-finalkit"
+  "$test_home/.science-finalkit/.codex/auth.json"
+  "$test_home/.finalkit-client/.codex/auth.json"
 )
 
 for target in "${targets[@]}"; do

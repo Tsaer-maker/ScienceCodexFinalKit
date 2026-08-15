@@ -1,4 +1,4 @@
-# Science SwitchModel / FinalKit 3.1.4 操作手册
+# Science SwitchModel / FinalKit 3.2.3 操作手册
 
 本手册是 FinalKit 的唯一运行与维护入口，面向首次安装者、日常使用者和本机管理员。架构、安全设计与源码职责见 [README.zh-CN.md](README.zh-CN.md) 和 [代码剖析](docs/CODE_WALKTHROUGH.zh-CN.md)。
 
@@ -176,7 +176,7 @@ Linux user    由当前 Windows 用户名安全转换
 6. 固定 Node.js LTS 和 Chrome DevTools MCP；
 7. 固定提交的 ChatGPT/Codex connector；
 8. FinalKit gateway、切换器、Science 隔离 profile；
-9. 不读真实凭据、不访问上游的 connector、Science control、model-route、runtime-update rollback 四组 contract，以及 `doctor` 和不调用外部模型的 `smoke`。
+9. 不读真实凭据、不访问模型上游的 connector、direct-gateway、Science control、Science identity、model-route、Windows-entry、runtime-update rollback 七组 WSL contract，以及 `doctor` 和不调用外部模型的 `smoke`。
 
 ### 3.3 指定 Linux 用户
 
@@ -217,7 +217,8 @@ Build 是幂等修复入口，会复用已经建立的发行版、用户和完�
 
 ```text
 BUILD_OK distro=Ubuntu-24.04 linux_user=<用户>
-CONNECTOR_CONTRACT_OK catalog=3 routes=sol,terra,luna effort=max network=disabled
+CONNECTOR_CONTRACT_OK catalog=3 routes=sol,terra,luna reasoning=max,high,low retry502=once network=disabled
+DIRECT_GATEWAY_CONTRACT_OK
 SMOKE_OK
 ```
 
@@ -243,7 +244,7 @@ SMOKE_OK
 | 菜单 | 命令 | 改什么 | 不改什么 |
 |---|---|---|---|
 | `16 Update FinalKit runtime` | `-Action update-runtime` | 本包的 manager、gateway、connector patch 与契约测试 | 不重建 WSL，不下载官方客户端，不改 API key/OAuth/模型选择 |
-| `17 Update provider models` | `-Action update-models` | 先只读列出 DeepSeek/Kimi/GLM 当前账号可调用模型，再编号/手工选择 main/fast；或手工改 Codex 三档 | 不做生成请求、不改 endpoint 与认证；先 dry-run 预览，确认后原子写入 |
+| `17 Update provider models` | `-Action update-models` | DeepSeek/Kimi/GLM 先只读列出账号模型；Codex 读取本地 CLI 缓存；四个 provider 都逐角色编辑三组 Model/Reasoning | 不做生成请求、不改 endpoint 与认证；先 dry-run 预览，确认后原子写入 |
 | `18 Update official tools` | `-Action update-tools` | 官方 Claude Science、Claude Code、Codex CLI，以及本包固定的 Node/MCP | 不改 FinalKit 模型路由；需要网络并再次确认 |
 
 查看当前配置：
@@ -252,25 +253,35 @@ SMOKE_OK
 .\windows\FinalKit.ps1 -Action models
 ```
 
-普通用户改模型时直接选择菜单 `17`：选择 DeepSeek/Kimi/GLM 后默认只读调用该厂商固定的官方模型目录，显示当前账号实际可调用的 ID；输入编号或完整 ID，检查预览，再确认。目录请求不会生成文本或消耗推理 tokens，也不会写配置。Codex 没有使用厂商 API key 的同类目录，因此继续手工填写三档 ID。对应 WSL CLI 例如：
+普通用户改模型时直接选择菜单 `17`：选择 DeepSeek/Kimi/GLM 后默认只读调用该厂商固定的官方模型目录，显示当前账号可见的 ID；Codex 从当前 Linux Codex home 的 `models_cache.json` 显示模型及逐模型 reasoning 能力。随后四个 provider 都分别输入 Opus、Sonnet、Haiku 的 Model 与 Reasoning，检查预览，再确认。目录请求不会生成文本或消耗推理 tokens，也不会写配置。对应 WSL CLI 例如：
 
 ```bash
 # 只读目录：不回显 key、不生成文本、不写配置
 fkctl discover-models deepseek --json
 
-# 只预览，不写文件
-fkctl update-models deepseek --main deepseek-v5-pro --fast deepseek-v5-flash --dry-run --json
+# 只预览，不写文件；三个 Claude 角色独立
+fkctl update-models deepseek \
+  --opus deepseek-v5-pro --reasoning-opus max \
+  --sonnet deepseek-v5-chat --reasoning-sonnet high \
+  --haiku deepseek-v5-flash --reasoning-haiku none \
+  --dry-run --json
 
 # 写入持久配置；若 DeepSeek 正在运行，同时安全重启这一条 runtime
-fkctl update-models deepseek --main deepseek-v5-pro --fast deepseek-v5-flash --restart
+fkctl update-models deepseek \
+  --opus deepseek-v5-pro --reasoning-opus max \
+  --sonnet deepseek-v5-chat --reasoning-sonnet high \
+  --haiku deepseek-v5-flash --reasoning-haiku none \
+  --restart
 
 # Codex 三档可分别换代，推理强度独立配置
 fkctl update-models codex \
-  --opus gpt-6-sol --sonnet gpt-6-terra --haiku gpt-6-luna \
-  --effort max --restart
+  --opus gpt-6-sol --reasoning-opus max \
+  --sonnet gpt-6-terra --reasoning-sonnet high \
+  --haiku gpt-6-luna --reasoning-haiku low \
+  --restart
 ```
 
-持久配置位于 `~/.local/share/science-codex-finalkit/config/model-routes.json`，权限为 `0600`。新包只为后来新增的内置 provider 补默认项，不覆盖用户已经选定的模型；未知但格式正确的厂商条目也会保留。修改当前未运行的厂商不会打断正在运行的其他厂商。`discover-models` 证明 ID 对该账号可见，但不证明每种协议/套餐都接受真实推理；需要验收时再显式运行会产生最小真实请求的 `test-<provider>`。
+持久配置位于 `~/.local/share/science-codex-finalkit/config/model-routes.json`，权限为 `0600`，每个 profile 只保留 `model_opus/reasoning_opus`、`model_sonnet/reasoning_sonnet`、`model_haiku/reasoning_haiku`。新包只为后来新增的内置 provider 补默认项，不覆盖用户已经选定的模型；旧 `main/fast/shared effort` 和早期长字段会迁移一次。修改当前未运行的厂商不会打断正在运行的其他厂商。`discover-models` 证明 ID 对该账号可见，但不证明每种模型/套餐都接受所有 Reasoning；需要验收时再显式运行会产生最小真实请求的 `test-<provider>`。
 
 厂商可能在不改变 API ID 的情况下升级后台权重。例如 2026-08-13 的 DeepSeek 文档说明 `deepseek-v4-pro` 已指向 DeepSeek-V4-Pro-0813，调用方法和 ID 不变；这种情况无需修改 FinalKit 路由。`discover-models` 解决的是“有哪些可调用 ID”，不是自动抓取新闻或猜测某个 alias 背后的权重日期。
 
@@ -298,6 +309,8 @@ DeepSeek API key (hidden):
 
 输入期间不显示字符或星号，这是正常行为。
 
+保存 key 后，配置器只显示三组短提示：`Opus Model/Reasoning`、`Sonnet Model/Reasoning`、`Haiku Model/Reasoning`。依据 DeepSeek 官方 [Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode) 与 [Anthropic API](https://api-docs.deepseek.com/guides/anthropic_api) 参数，当前 provider 级 Reasoning 选项为 `auto/none/high/max`；`auto` 保留上游默认，`none` 显式关闭 thinking，`high/max` 发送 `thinking.type=enabled` 与 `output_config.effort`。账号模型目录不声明逐模型强度，因此配置器能校验模型 ID 是否可见，但真实模型是否接受所选强度仍由 `test-deepseek` 验收。
+
 ### 4.2 Kimi
 
 ```powershell
@@ -309,6 +322,8 @@ DeepSeek API key (hidden):
 ```text
 windows\03-Configure-Kimi.cmd
 ```
+
+保存 key 后同样分别配置三组 Model/Reasoning。根据官方 [Kimi K3](https://github.com/MoonshotAI/Kimi-K3) 与 [Kimi Code 模型元数据](https://github.com/MoonshotAI/kimi-code/blob/main/docs/en/configuration/config-files.md)，当前 provider 级选项为 `auto/none/low/high/max`；非自动档使用 `thinking.type` 与顶层 `reasoning_effort`。Kimi K3 属于 always-thinking 路线时可能拒绝 `none`，应改用其支持的强度并以 `test-kimi` 为准。
 
 ### 4.3 GLM
 
@@ -322,6 +337,8 @@ windows\03-Configure-Kimi.cmd
 windows\04-Configure-GLM.cmd
 ```
 
+GLM 也逐角色配置 Model/Reasoning。依据智谱官方 [思考模式](https://docs.bigmodel.cn/cn/guide/capabilities/thinking) 与 [Claude 接入](https://docs.bigmodel.cn/cn/guide/develop/claude/introduction)，当前 provider 级选项为 `auto/none/high/max`；非自动档使用 `thinking.type` 与顶层 `reasoning_effort`。模型版本或账号套餐可能进一步收窄能力，以 `test-glm` 的真实响应为准。
+
 ### 4.4 ChatGPT/Codex account backend
 
 ```powershell
@@ -334,7 +351,7 @@ windows\04-Configure-GLM.cmd
 windows\02-Configure-ChatGPT-Codex.cmd
 ```
 
-命令在 Claude Science 的临时 staging HOME 中调用官方 Linux Codex CLI 的默认 `codex login`，显式固定 `cli_auth_credentials_store="file"`，并保留 WSL interop/display 环境以打开 Windows 浏览器 OAuth。只有 staging 缓存结构、`0600` 权限和 `codex login status` 全部通过后，才原子替换隔离 `~/.science-finalkit/.codex/auth.json`；登录取消、403 或验证失败不会破坏原缓存。connector 直接读写同一份官方缓存，不再导出第二份 `codex-auth.json`。
+命令在独立的 FinalKit client staging HOME 中调用官方 Linux Codex CLI 的默认 `codex login`，显式固定 `cli_auth_credentials_store="file"`，并保留 WSL interop/display 环境以打开 Windows 浏览器 OAuth。只有 staging 缓存结构、`0600` 权限和 `codex login status` 全部通过后，才原子替换 `~/.finalkit-client/.codex/auth.json`；登录取消、403 或验证失败不会破坏原缓存。登录验证后，配置器从同一个 Linux Codex home 读取 `models_cache.json`，显示每个模型的 `supported_reasoning_levels` 和说明，再分别询问 Opus、Sonnet、Haiku 的 Model/Reasoning；已知模型会拒绝缓存未声明的强度，`ultra` 也只在具体模型明确声明时可选。connector 直接读写同一份官方缓存，不再导出第二份 `codex-auth.json`，也不会把 Codex OAuth 写进 Science data HOME。
 
 FinalKit 只为这次 Codex 子进程选择网络，不写 `.wslconfig`，也不增删 Windows/WSL 全局代理变量。默认浏览器 OAuth 需要浏览器能把回调送回 WSL CLI 的 `localhost:1455`。若该回调在特定机器上不可用，并且已在 ChatGPT 个人安全设置或工作区权限中启用 device code，可显式运行：
 
@@ -344,6 +361,24 @@ FinalKit 只为这次 Codex 子进程选择网络，不写 `.wslconfig`，也不
 
 device code 是官方标记的 beta 备用流，不再作为菜单 6 的默认路径。若它返回 403，优先使用默认 `configure-codex`；403 也可能表示账号/工作区未启用 device login，而不是 FinalKit 或 WSL 安装损坏。
 
+#### 4.4.1 可选：把当前 Windows Codex 登录一次性迁入 WSL
+
+如果 Windows 官方 Codex CLI 已显示 `Logged in using ChatGPT`，并且你希望 WSL 从同一账号起步，可以双击：
+
+```text
+windows\08-One-Time-Migrate-Windows-Codex-Auth-to-WSL.cmd
+```
+
+等价命令是：
+
+```powershell
+.\windows\FinalKit.ps1 -Action migrate-windows-codex-auth-to-wsl
+```
+
+这是菜单 `24` 的可选一次性动作，不是启动项。脚本显示 Windows 源文件与目标 distro/Linux 用户，要求输入 `MIGRATE`，先安全停止本包自己的 WSL Science/gateway，再把 Windows auth 字节只经子进程 stdin 交给 `fkctl import-codex-auth`。Linux 端只接受 `auth_mode=chatgpt` 且 access/refresh chain 完整、大小不超过 1 MiB 的 JSON；候选先在临时 HOME 中通过官方 `codex login status`，然后才以 `0600` 原子替换 WSL owner。最终验证失败会恢复此前 WSL 文件的精确字节与权限；迁移失败还会尝试用旧登录恢复 Codex Science。
+
+成功后不会建立任何定时、启动或双向同步：Windows 继续拥有 `%CODEX_HOME%\auth.json`，WSL 继续拥有 `~/.finalkit-client/.codex/auth.json`。这能省掉本次 WSL 浏览器登录，但不会向服务端换取两套独立 OAuth 会话；两份文件起初仍是同一 token chain。若上游 refresh-token 轮换使另一份副本后来失效，只需在失效的一侧重新登录。WSL 始终可独立运行 `configure-codex` 或 `configure-codex-device`，Windows 也保留自己的 `codex login`。不要用 `Get-Content`、剪贴板或命令行参数手工搬运 token。
+
 Codex 模式采用三档实际路由：
 
 | Science 请求 ID 家族（不是菜单标题） | 实际 ChatGPT Codex 模型 | 默认推理强度 | 适用倾向 |
@@ -352,7 +387,7 @@ Codex 模式采用三档实际路由：
 | Sonnet（包括带版本/日期后缀的 ID） | `gpt-5.6-terra` | `max` | 智能与成本平衡 |
 | Haiku（包括带版本/日期后缀的 ID） | `gpt-5.6-luna` | `max` | 高频、轻量任务 |
 
-Claude Science 仍使用 Opus / Sonnet / Haiku 家族的兼容 ID 发请求，但 FinalKit 的 `/v1/models` 会把菜单标题透明显示为真实的 `ChatGPT Codex | gpt-5.6-* | max` 路由；它没有修改 Claude Science 前端。标题下的 `Best for scientific rigor`、`Most efficient for simple tasks`、`Fastest, lightweight` 是 Science 按兼容 ID 家族附加的固定说明，不是实际 upstream 名。启动后仍应以 `EFFECTIVE_ROUTE`、`status` / `doctor` 和 gateway 日志中的实际 `model` 与 `effort` 作最终核验。
+Claude Science 仍使用 Opus / Sonnet / Haiku 家族的兼容 ID 发请求，但 FinalKit 的 `/v1/models` 会把菜单标题透明显示为真实的 `ChatGPT Codex | <model> | reasoning=<value>` 路由；它没有修改 Claude Science 前端。标题下的固定家族说明不是实际 upstream 名。启动后仍应以 `EFFECTIVE_ROUTE`、`status` / `doctor` 和 gateway 日志中的实际 `model` 与 `reasoning` 作最终核验。
 
 ### 4.5 查看配置状态
 
@@ -414,7 +449,7 @@ BACKEND_OK mode=glm
 BACKEND_OK mode=codex
 ```
 
-`test-codex` 发送一次 Sol 最小真实请求来验证 OAuth、协议转换与当前 Codex account backend。Sol/Terra/Luna 家族映射和 `max` payload 由发布测试在本地 connector 单元层逐项验证；若需要证明当前账号也实时开放 Terra/Luna，可在取得相应用量授权后再分别进行真实请求，不把额外两次消费混入普通用户默认测试。
+`test-codex` 发送一次当前 Opus Model/Reasoning 的最小真实请求来验证 OAuth、协议转换与当前 Codex account backend。三档独立映射和各自 Reasoning payload 由离线 connector contract 逐项验证；若需要证明当前账号也实时开放 Sonnet/Haiku 路由，可在取得相应用量授权后再分别进行真实请求，不把额外两次消费混入普通用户默认测试。
 
 需要一次性验收当前 ChatGPT 账号的全部三档时，显式运行：
 
@@ -428,7 +463,7 @@ BACKEND_OK mode=codex
 CODEX_TIERS_OK actual configured routes verified
 ```
 
-这条命令会产生三次账号用量，不放进普通 `doctor`、Build 或默认 `test-codex`。若某档返回 model/permission 错误，FinalKit原样失败，不会偷偷改成 Sol；这通常表示当前 ChatGPT 账号型 Codex backend 尚未开放该档，而不是 WSL 安装损坏。公开 OpenAI API 的模型目录能证明模型 ID 和 `reasoning.effort=max` 的协议有效性，但不能替代对当前 ChatGPT 账号权限的真实验收。
+这条命令会产生三次账号用量，不放进普通 `doctor`、Build 或默认 `test-codex`。若某档返回 model/permission 错误，FinalKit 原样失败，不会偷偷改成 Opus 模型；这通常表示当前 ChatGPT 账号型 Codex backend 尚未开放该 Model/Reasoning 组合，而不是 WSL 安装损坏。本地 Codex 能力缓存用于配置校验，仍不能替代当前账号的真实请求验收。
 
 测试失败时先执行 [10. 故障处理](#10-故障处理)，不要重新 Build 或 Clear。
 
@@ -454,7 +489,7 @@ SwitchModel.cmd
 | 15 | 只停止 FinalKit 隔离自动化 Chrome，不停止 Science |
 | 19–22 | 使用同一套 DeepSeek/Kimi/GLM/Codex 配置进入原生 Claude Code；不启动 Science |
 
-因此入口职责是稳定的：`7–10` 是 Claude Science 主路径，`11` 是当前 Science 的自动化浏览器桥，`19–22` 才是额外的原生 Claude Code 路径。四种后端共用同一份 provider/Codex 配置和模型路由；Science 页面本身仍需完成其支持的 Claude 账号登录。
+因此入口职责是稳定的：`7–10` 是 Claude Science 主路径，`11` 是当前 Science 的自动化浏览器桥，`19–22` 才是额外的原生 Claude Code 路径。四种后端共用同一份 provider/Codex 配置和模型路由；3.2.1 由隔离 WSL profile 内的 FinalKit 本地身份满足 Science 身份门禁，不需要 Claude.ai 账号，也不会把任一后端凭据复制进 Science。浏览器仍保留官方本机 nonce/cookie 会话门；它与 Claude.ai 账号登录不是一回事。
 
 ### 6.2 直接启动 Claude Science
 
@@ -472,16 +507,16 @@ SwitchModel.cmd
 .\windows\FinalKit.ps1 -Action codex
 ```
 
-成功后会启动对应 gateway 与 Claude Science，打印一次性 Science URL，并在默认 Windows 浏览器打开。
+成功后会启动对应 gateway 与 Claude Science，先由 runtime 用自己的未共享 nonce 验证 `/api/me` 与真实工作台，再打印另一条一次性 Science URL并在默认 Windows 浏览器打开。浏览器若显示 `Sign in`，点击一次只是接受本机 daemon 会话；不会把你带到 Claude.ai OAuth，也不会读取 provider/Codex 凭据。
 
 Codex 启动的关键输出应类似：
 
 ```text
 ACTIVE_MODE=codex
-EFFECTIVE_ROUTE=Opus request alias -> ChatGPT Codex gpt-5.6-sol (effort=max); Sonnet -> gpt-5.6-terra (effort=max); Haiku -> gpt-5.6-luna (effort=max)
+EFFECTIVE_ROUTE=Opus: Model=gpt-5.6-sol, Reasoning=max; Sonnet: Model=gpt-5.6-terra, Reasoning=max; Haiku: Model=gpt-5.6-luna, Reasoning=max (ChatGPT Codex)
 ```
 
-Science 必须先完成其支持的 Claude 账号登录，登录后 `/v1/models` 才能把兼容 ID 的标题显示为真实 provider/model；若页面仍只有 Opus/Sonnet/Haiku fallback 并提示 `No credentials`，这是 Science 未登录，不是 DeepSeek/Codex 后端失败。实际 route 还可由 `EFFECTIVE_ROUTE`、`status` 和 gateway 日志核验。发行包版本只用于识别 ZIP 和诊断，不参与 Start/Stop/Status 等命令放行；Windows 入口始终调用当前 WSL 用户已经部署的 `fkctl`。只有调用该 runtime 尚未提供的新命令时才提示补齐 capability。
+菜单 `7–10` 会先校验或原子创建 FinalKit 本地身份，再启动同一条 loopback gateway；`/v1/models` 把 Science 兼容 ID 的标题显示为真实 provider/model。若页面仍只有 Opus/Sonnet/Haiku fallback 并提示 `No credentials`，先运行菜单 `16` 更新 runtime，再用对应 `test-*`、`status` 和 gateway 日志核验身份与 route；不要通过登录 Claude 账号或复制 provider 凭据来绕开本地身份失败。发行包版本只用于识别 ZIP 和诊断，不参与 Start/Stop/Status 等命令放行；Windows 入口始终调用当前 WSL 用户已经部署的 `fkctl`，而 `7–10`/`science` 会要求 `science-isolated-local-identity` capability，防止新入口误调旧 runtime。
 
 ### 6.3 切换 provider
 
@@ -636,9 +671,85 @@ FinalKit 不自动修改 Claude Code MCP 配置，启用必须由用户显式决
 
 它只终止使用精确隔离 profile 的 Chrome 进程，并保留该 profile 数据。
 
-## 9. Claude Science 与 Windows Codex 协作
+## 9. 独立 Windows Claude 应用与四种 provider
 
-### 9.1 创建唯一 handoff
+这一套只服务官方 Windows Claude 应用，不是 WSL Claude Science 的启动入口。它的唯一状态根是：
+
+```text
+%LOCALAPPDATA%\ScienceCodexFinalKit\WindowsClaude
+```
+
+固定监听为 `127.0.0.1:18987`；四个 Claude 3P profile 也只指向这个 Windows 端口。控制器不调用 `wsl.exe`、不读取 Linux home、不使用 WSL 的 `9876` gateway，也不改变 WSL Science 的 `8765` daemon。
+
+### 9.1 先建立四个隔离配置槽
+
+```powershell
+.\windows\FinalKit.ps1 -Action windows-claude-init
+.\windows\FinalKit.ps1 -Action windows-claude-status
+```
+
+也可双击 `windows\40-Initialize-Windows-Claude.cmd`。初始化会：
+
+1. 建立 DeepSeek、Kimi、GLM、Codex login 四个 profile；四个 profile 都有三组独立 Model/Reasoning，前三家 key 为空，Codex 预置 Opus → Sol、Sonnet → Terra、Haiku → Luna；
+2. 为每个 profile 生成独立 loopback path 与 Claude client token；
+3. 将 profile 登记到 `%LOCALAPPDATA%\Claude-3p\configLibrary`；
+4. 继续保持 `deploymentMode=1p`；
+5. 不创建 API key、不发起 Codex 登录、不启动 gateway、不打开 Claude。
+
+因此刚初始化时，未登录 Windows Codex 的机器是 `Configured profiles: 0/4`；已有有效 ChatGPT Codex 登录的机器可显示 Codex 为 `configured=True` 和 `Configured profiles: 1/4`。两种情况下都必须保持 `Claude profile: official-or-unconfigured`、`Gateway running: false`，因为初始化不会激活 3P profile。
+
+### 9.2 以后由你配置 Windows provider
+
+```powershell
+.\windows\FinalKit.ps1 -Action windows-claude-configure -RemainingArgs deepseek
+.\windows\FinalKit.ps1 -Action windows-claude-configure -RemainingArgs kimi
+.\windows\FinalKit.ps1 -Action windows-claude-configure -RemainingArgs glm
+.\windows\FinalKit.ps1 -Action windows-claude-configure -RemainingArgs codex
+```
+
+DeepSeek/Kimi/GLM 依次配置 Opus、Sonnet、Haiku 的 Model/Reasoning，再输入隐藏 API key。上游 URL 固定在包内官方 HTTPS allowlist，不作为日常冗长提示。三家的 key 使用 Windows DPAPI `CurrentUser` 加密到 `secrets\<mode>.dpapi`；schema 3 的 `profiles.json` 只保存 endpoint、六个短路由字段和随机本机能力值。不要把 API key 写进 `-RemainingArgs`、`.cmd`、环境变量或 Claude JSON。
+
+Codex 不提示 API key。先在普通 Windows PowerShell 中完成一次官方登录并核验：
+
+```powershell
+codex login
+codex login status
+```
+
+随后运行 `windows-claude-configure ... codex`，控制器会要求状态为 `Logged in using ChatGPT`，从 `%CODEX_HOME%\auth.json`（默认 `%USERPROFILE%\.codex\auth.json`）读取官方 `tokens` schema，并从同一 Windows Codex home 的 `models_cache.json` 与 `config.toml` 显示可用模型和建议值。当前已有有效登录时不会再次弹浏览器；配置会逐档显示该模型缓存中的 Reasoning 强度、默认值和说明，再分别保存。默认映射是 Opus → `gpt-5.6-sol`、Sonnet → `gpt-5.6-terra`、Haiku → `gpt-5.6-luna`；本机已知模型不接受目录未声明的强度，`ultra` 只有在所选模型明确支持时才出现。四个 provider 的 Claude alias 都按角色成对取得 Model/Reasoning；三家直连使用各自 Anthropic-compatible Messages endpoint，Codex 走 `https://chatgpt.com/backend-api/codex/responses` 并由 Windows gateway 完成 Messages → Responses、工具调用和 SSE 转换。Windows auth 与 WSL `~/.finalkit-client/.codex/auth.json` 平时是两个独立 owner；只有上节的显式一次性入口会用当时的 Windows bytes 初始化 WSL，Windows Claude 控制器自身仍不调用 WSL。
+
+### 9.3 启动、状态和停止
+
+```powershell
+# 选择一个已配置的 Windows profile
+.\windows\FinalKit.ps1 -Action windows-claude -RemainingArgs deepseek
+
+# Claude 已经打开时，显式重启以读取新 profile
+.\windows\FinalKit.ps1 -Action windows-claude -RemainingArgs deepseek -Force
+
+.\windows\FinalKit.ps1 -Action windows-claude-status
+.\windows\FinalKit.ps1 -Action windows-claude-stop
+```
+
+未配置 profile 会在启动 Python 或改 `deploymentMode` 前失败，Claude 保持 `1p`。启动成功后才切到 `3p` 并写入选中 profile；停止命令只结束通过 instance/PID/命令行/health 四重核验的 Windows gateway。若 18987 被未知进程占用，启动失败并要求先识别占用者，绝不强占或 kill。
+
+相同操作也可从主菜单 `23` 的子菜单或 `windows\40–51` 快捷脚本完成。
+
+### 9.4 恢复 Windows Claude 官方模式
+
+```powershell
+.\windows\FinalKit.ps1 -Action windows-claude-official
+```
+
+它只停止 Windows gateway、把 Windows Claude 恢复为 `1p`、删除 FinalKit 自己登记的四条 3P profile；不会检查或操作 WSL。三家 DPAPI API 设置与 Windows Codex 登录绑定保留，日后可直接再次启动。执行前会为真实存在的 Claude 配置建立可恢复备份：
+
+```text
+%LOCALAPPDATA%\ScienceCodexFinalKit\Backups\ClaudeDesktop
+```
+
+## 10. Claude Science 与 Windows Codex 协作
+
+### 10.1 创建唯一 handoff
 
 ```powershell
 .\windows\FinalKit.ps1 `
@@ -656,7 +767,7 @@ FinalKit 不自动修改 Claude Code MCP 配置，启用必须由用户显式决
 
 `init-project` 还会打印 Claude Science 审阅 skill 源文件和便携 ZIP 的精确路径，但不会替你修改 Claude Science 的个人 skill 状态。
 
-### 9.2 在本地 Claude Science 发布独立审阅 skill
+### 10.2 在本地 Claude Science 发布独立审阅 skill
 
 只需在首次使用或 FinalKit 更新该 skill 后操作一次。你继续控制 Windows 浏览器，并在 Claude Science 当前对话中发送：
 
@@ -682,7 +793,7 @@ claude-science-skills\reviewing-codex-science\SKILL.md
 
 同目录的 `reviewing-codex-science.zip` 是便携备份；仅当某个 Claude surface 确实提供标准自定义 Skills 上传 UI 时才使用。Claude.ai 的标准上传说明见[Use skills in Claude](https://support.claude.com/en/articles/12512180-use-skills-in-claude)，但不能把该界面假定为本地 Claude Science 的安装入口。FinalKit 不直接编辑 Claude Science 的数据库、会话、cookie 或账号设置。
 
-### 9.3 由 Windows Codex 准备待审对象
+### 10.3 由 Windows Codex 准备待审对象
 
 至少填写：
 
@@ -697,7 +808,7 @@ claude-science-skills\reviewing-codex-science\SKILL.md
 
 禁止写 API key、token、cookie、密码、私钥或敏感数据。
 
-### 9.4 让 Claude Science 独立审阅
+### 10.4 让 Claude Science 独立审阅
 
 在 Claude Science 对话中发送：
 
@@ -713,7 +824,7 @@ Claude Science 应返回 `critical / major / minor / uncertain` 发现、精确�
 
 Claude Science 是工作台而不是固定模型。若它使用 Codex backend，本轮是 `separate_context_only`，不能称为跨模型独立审阅；切到不同 provider/model family 后才标记 `different_model_provider`。看不到实际身份时标记 `unknown`，不要猜。
 
-### 9.5 Windows Codex 核验和修复
+### 10.5 Windows Codex 核验和修复
 
 ```text
 Windows Codex 实施并直接验证
@@ -725,7 +836,7 @@ Windows Codex 实施并直接验证
 
 Claude Science 的 finding 是审阅证据，不是自动裁决。不要因为两个 Agent 一致就把结论当真，也不要因为 finding 与实现叙述冲突就直接驳回。
 
-### 9.6 反向：Windows Codex 只读复核 Claude Science 工作
+### 10.6 反向：Windows Codex 只读复核 Claude Science 工作
 
 ```powershell
 .\windows\FinalKit.ps1 `
@@ -745,18 +856,18 @@ Claude Science/Claude Code 执行
 
 不要让两个 Agent 同时无边界写同一项目。
 
-## 10. 故障处理
+## 11. 故障处理
 
 按从低风险到高风险的顺序处理。
 
-### 10.1 先查看状态
+### 11.1 先查看状态
 
 ```powershell
 .\windows\FinalKit.ps1 -Action status
 .\windows\FinalKit.ps1 -Action doctor
 ```
 
-### 10.2 查看日志
+### 11.2 查看日志
 
 先进入当前发行版：
 
@@ -773,7 +884,7 @@ fkctl logs gateway
 fkctl logs science
 ```
 
-### 10.3 常见情况
+### 11.3 常见情况
 
 | 症状 | 优先处理 |
 |---|---|
@@ -782,11 +893,18 @@ fkctl logs science
 | API 返回 model not found | 查看 provider 当前模型可用性；不要修改上游 URL |
 | gateway stopped | 运行对应启动命令 |
 | gateway identity mismatch | 先 `-Action stop`，再启动；不要手工 kill 未知进程 |
-| `FINALKIT_SCIENCE_CONTROL_UNAVAILABLE`、Status 显示 `control unavailable`，或 owner state 为 `D` | FinalKit 把 Science cwd/PWD/HOME 固定到 WSL ext4、用纯 Linux PATH 启动，并对一次瞬时 socket 失败做短暂重试；旧 daemon 或持续 Linux `D` 状态仍须先用 `wsl.exe --list --verbose` 确认本包选中的发行版并关闭其中其他任务，再从 Windows 执行 `wsl.exe --terminate Ubuntu-24.04`（名称按实际替换），运行菜单 `16 Update FinalKit runtime`。terminate 不注销发行版、不删除文件、不清 API/Codex 认证；若 runtime 文件本身缺失才用菜单 `2`。菜单 `19–22` 可用于不依赖 Science 的 Claude Code，但持续失联的已运行 Science 仍会阻止安全切换，避免误杀未知进程 |
-| Science 很快 sign out，日志出现 `invalid_grant` 或 `treating as logged-out` | 旧 FinalKit/HGSX 风格虚拟 OAuth 与当前 Science 不兼容。运行菜单 `16`；3.1.4 只移除能完整识别的旧 FinalKit Fernet/v2 虚拟身份，未知或真实凭据原样保留。随后用菜单 `7–10` 打开 Science，并用 Science 自己支持的 Claude 账号登录；不能用 DeepSeek API key 或 ChatGPT/Codex OAuth 替代 |
-| Science `/api/models` 或页面提示 `No credentials`，只显示 Opus/Sonnet/Haiku fallback | Science 未登录；这不证明 provider gateway 失败。先运行对应 `test-*` 核验后端，再在 Science 页面完成其官方登录；临时不使用 Science 时可走菜单 `19–22` 的 Claude Code |
-| Science 页面没有打开 | 运行 `status`，再运行 `fkctl url` 获取新一次性 URL |
+| `FINALKIT_SCIENCE_CONTROL_UNAVAILABLE`、Status 显示 `control unavailable`，或 owner state 为 `D` | 新启动时，同一 PID 且 argv/HOME/data-dir/lock 全部核验通过的 Science 0.1.27 owner 可在最多 45 秒的 readiness 窗口内完成初始 ext4 数据库 I/O；这不会让稳定态检查放宽。若 45 秒后仍为 `D`，或既有 daemon 的 `status/doctor/stop` 观察到持续 `D`，FinalKit 仍 fail-closed 且不发信号。先用 `wsl.exe --list --verbose` 确认目标发行版并关闭其中其他任务，再从 Windows 精确执行 `wsl.exe --terminate Ubuntu-24.04`（名称按实际替换），然后运行菜单 `16 Update FinalKit runtime`。terminate 不注销发行版、不删除文件、不清 API/Codex 认证；若 runtime 本身缺失才用菜单 `2`，不要 Clear |
+| Science 很快 sign out，日志出现 `invalid_grant` 或 `treating as logged-out` | 旧 FinalKit/HGSX 风格 refresh token 被 Science 送往官方 refresh endpoint。运行菜单 `16`；3.2.1 只迁移能完整识别的旧 FinalKit Fernet/v2 身份，未知或真实凭据原样保留并阻断自动覆盖，然后创建空 refresh token、长期本地 access token 与固定 user/org 的 `science-local-v2` 身份。重新用菜单 `7–10` 打开，不需要 Claude 登录 |
+| Science `/api/models` 或页面提示 `No credentials`，只显示 Opus/Sonnet/Haiku fallback | 本地身份、gateway 身份端点或已部署 runtime 未闭合；先运行菜单 `16`，再运行 `smoke` 和对应 `test-*`。`smoke` 会同时校验本地 token、user/org、provider gateway、Science endpoint 与 data-dir 身份；未知或真实 Science 凭据不会被自动替换 |
+| 本地页面显示 `Sign in` | 这是 Claude Science daemon 的一次性 nonce/cookie 会话门，不是 Claude.ai 账号登录。仅接受地址栏为 `http://127.0.0.1:<本机端口>` 或 `localhost` 的页面；点击一次进入工作台。若确认后仍回到同一页，运行菜单 `16`，再看 `status`、`doctor` 和 Science 日志 |
+| Science 页面没有打开 | 运行 `status`，再运行 `fkctl url` 获取新的一次性本机 URL；不要复用或转发旧 nonce |
 | 端口被占用 | 查明占用者；FinalKit 不会强占第三方进程 |
+| Windows Claude 显示 `Configured profiles: 0/4` | 三家 API 槽仍为空，且 Windows Codex 登录或模型路由未闭合。运行 `codex login status`；若已显示 `Logged in using ChatGPT`，再运行 Codex 配置并直接回车接受本机模型默认值。不要填写另一份 OpenAI API key |
+| 配置仍提示 `Default/Opus/Sonnet model ID`，或 Sonnet 与 Opus 被迫相同 | 仍在使用旧 schema/controller。更新 FinalKit 后重新配置；正常界面只依次出现 `Opus Model/Reasoning`、`Sonnet Model/Reasoning`、`Haiku Model/Reasoning`。Codex 还会先列出本机缓存模型及逐模型 Reasoning 能力 |
+| Windows Claude 启动报 `unconfigured` | DeepSeek/Kimi/GLM 表示缺少 DPAPI key 或任一角色的 Model/Reasoning；Codex 表示 Windows ChatGPT login 或任一角色路由缺失/与当前能力缓存冲突。它不会退回 WSL，也不会在失败时切换 Claude `1p` 状态 |
+| Windows Claude Codex 显示 `login-missing` | 在 Windows 运行 `codex login` 与 `codex login status`；不要复制 WSL auth.json，也不要给 Windows Claude 另填 OpenAI API key |
+| Windows Claude 18987 被占用 | 用 `Get-NetTCPConnection -LocalPort 18987 -State Listen` 查明 PID；不要结束未知进程。Windows owner 不会改用 WSL 9876 |
+| Windows Claude 已切 profile 但界面未变 | 完全退出 Claude 后重开，或在明确允许结束当前 Claude 窗口时用 `windows-claude ... -Force` |
 | 浏览器 `Status: stopped` | 重新运行 `browser-start` |
 | WSL 无法访问浏览器 127.0.0.1 | 检查 WSL mirrored networking；FinalKit 不自动修改 `.wslconfig` |
 | MCP 找不到 `node` | 使用 `~/.local/bin/chrome-devtools-mcp-finalkit`，不要直接运行 npm shim |
@@ -796,11 +914,11 @@ fkctl logs science
 | 首次 Build 显示 `403`、`请求的操作需要提升` | 允许当前发行包的 UAC 系统准备；若提示重启，重启后以同一个普通 Windows 用户再运行 Build，不要 Clear |
 | Store 路径无法下载 Ubuntu | 当前发行包自动重试 `--web-download`；两条路径均失败时按保留的真实网络/错误码诊断处理 |
 | 旧版 `configure-codex` 显示 device code 403 | 使用当前发行包的默认浏览器 OAuth；只有已启用 device login 时才运行 `configure-codex-device` |
-| Windows Codex 已登录，但 FinalKit 显示 `not configured` | 两者是不同 OS/用户的缓存；在目标 Linux 用户下运行 `configure-codex -LinuxUser <name>`，不要手工复制或打印 auth JSON |
+| Windows Codex 已登录，但 WSL FinalKit 显示 `not configured` | 两者默认是不同 OS/用户的缓存。可在目标 Linux 用户下运行 `configure-codex -LinuxUser <name>` 自主登录；若要从 Windows 同账号起步，运行菜单 `24` 或 `08-One-Time-Migrate-Windows-Codex-Auth-to-WSL.cmd`，不要手工复制或打印 auth JSON |
 | Codex 请求返回意外 `401` | 当前 connector 会在尚未输出回答时用共享缓存强制刷新并且只重试一次；若 refresh chain 没有变化或再次 `401`，运行 `configure-codex` 完成新的浏览器登录 |
 | Codex 登录成功但 backend 超时 | 保留可访问 `chatgpt.com` 的现有代理/VPN，运行 `doctor` 和 `test-codex`；不要把登录直连策略全局化 |
 
-### 10.4 修复安装
+### 11.4 修复安装
 
 只有 `doctor` 表明组件缺失或 installer 未完成时才重复：
 
@@ -810,7 +928,7 @@ fkctl logs science
 
 修复 Build 不应覆盖已有 secret 和用户登录。
 
-### 10.5 最后才考虑 Clear
+### 11.5 最后才考虑 Clear
 
 只有以下条件同时满足时才重新 Clear：
 
@@ -820,9 +938,9 @@ fkctl logs science
 - 已确认目标名称和 BasePath；
 - 接受从 tar 恢复或永久丢弃该发行版。
 
-## 11. 多用户操作
+## 12. 多用户操作
 
-### 11.1 同一 Windows 用户、同一 WSL、多个 Linux 用户
+### 12.1 同一 Windows 用户、同一 WSL、多个 Linux 用户
 
 为新 Linux 用户运行：
 
@@ -840,7 +958,7 @@ fkctl logs science
 
 每个 Linux 用户分别配置 API key 和隔离的 ChatGPT/Codex 浏览器登录。
 
-### 11.2 多个 Windows 用户
+### 12.2 多个 Windows 用户
 
 每个 Windows 用户拥有自己的：
 
@@ -851,7 +969,7 @@ fkctl logs science
 
 不要把一个 Windows 用户的 WSL 注册目录或 Chrome profile 复制给另一个用户。
 
-## 12. 凭证轮换
+## 13. 凭证轮换
 
 当 key 被粘贴到聊天、命令行、截图或非私密文档时，应在供应商控制台撤销并生成新 key，然后重新运行：
 
@@ -871,9 +989,9 @@ ChatGPT/Codex 重新授权：
 
 该命令每次都会发起新的官方浏览器登录，因此既用于首次配置，也用于恢复服务端已撤销或失效、但本地文件仍存在的登录。新登录先在 staging HOME 验证，成功才替换，失败保留旧缓存。不要手工复制、打印或编辑 auth JSON。官方 CLI 与 connector 共用一个文件缓存，并会把轮换后的 refresh chain 原子写回同一文件，所以普通 Build/repair 不应让授权失效。
 
-## 13. 恢复与回滚
+## 14. 恢复与回滚
 
-### 13.1 从 WSL tar 恢复
+### 14.1 从 WSL tar 恢复
 
 先选择一个不存在的新名称和空目录：
 
@@ -897,11 +1015,11 @@ wsl -d Recovered-Ubuntu-24.04 -u root -- cat /etc/os-release
 
 不要覆盖当前运行中的发行版目录。
 
-### 13.2 软件包回滚
+### 14.2 软件包回滚
 
 保留旧版 ZIP 时，可解压到新的并列目录进行只读比较，不要直接在 ZIP 内运行。日常只保留一个明确的解压运行目录，避免从微信临时副本或多个旧目录启动；运行资格由已部署命令与健康检查决定，不由发行号文本决定。
 
-## 14. 日常最短命令
+## 15. 日常最短命令
 
 完成 Build、配置和真实测试后，日常只需：
 
@@ -914,7 +1032,7 @@ cd C:\Tools\ScienceCodexFinalKit   # 或你自己的稳定解压目录
 # 查看状态
 .\windows\FinalKit.ps1 -Action status
 
-# 可选：已有受支持 Claude 登录并启动 Science 后，打开到自动化 Chrome
+# 可选：Science 已由菜单 7–10 启动后，打开到自动化 Chrome
 .\windows\FinalKit.ps1 -Action browser-science
 
 # 网页任务结束
@@ -922,9 +1040,13 @@ cd C:\Tools\ScienceCodexFinalKit   # 或你自己的稳定解压目录
 
 # 当天任务结束
 .\windows\FinalKit.ps1 -Action stop
+
+# 可选：完全独立的 Windows Claude（先配置 Windows provider）
+.\windows\FinalKit.ps1 -Action windows-claude -RemainingArgs deepseek
+.\windows\FinalKit.ps1 -Action windows-claude-status
 ```
 
-## 15. 安装后的最短验收
+## 16. 安装后的最短验收
 
 每位用户在自己的普通 Windows 账号和 Linux home 内完成一次：
 
@@ -932,8 +1054,10 @@ cd C:\Tools\ScienceCodexFinalKit   # 或你自己的稳定解压目录
 2. 只配置自己拥有的一种 provider：DeepSeek、Kimi、GLM 或 ChatGPT Codex；
 3. 运行对应的 `test-deepseek`、`test-kimi`、`test-glm` 或 `test-codex`；
 4. 看到 `BACKEND_OK mode=<provider>` 后，再运行菜单 `7–10` 的同名 Start Science 动作；
-5. 完成 Science 自己支持的 Claude 账号登录，并再次运行 `status`，确认 `Gateway: healthy`、`Claude Science: running`、`Runtime identity: matched`；
+5. 不做 Claude.ai 账号登录；在 `127.0.0.1` 页面接受一次本机会话，再次运行 `status`，确认 `Science identity: FinalKit local-only`、`Gateway: healthy`、`Claude Science: running`、`Runtime identity: matched`；
 6. 只有确实需要页面自动化时才运行菜单 `11` / `browser-science` 和 `browser-mcp-info`；
 7. 需要独立 CLI 时可用菜单 `19–22`，它复用同一后端配置但不启动 Science。
 
-API key 只能在配置命令的隐藏提示中输入，不要发到聊天、截图、`.cmd`、README 或项目文件。已经公开过的 key 应在供应商控制台轮换。
+Windows Claude 是另一套可选验收：先运行 `windows-claude-init`，确认 `0/4`、`1p`、gateway stopped；以后自行配置一个 Windows provider，再启动并确认 `127.0.0.1:18987` 的 owner identity。Codex 槽应额外显示 `auth=windows-codex-login`，且 runtime JSON 只有 auth 文件路径、没有 token。不要用 Windows Claude 验收代替 WSL Science，也不要把 WSL API/OAuth 手工复制到 Windows；可选迁移方向只允许由明确入口执行 Windows → WSL 一次性导入。
+
+DeepSeek/Kimi/GLM API key 只能在配置命令的隐藏提示中输入，不要发到聊天、截图、`.cmd`、README 或项目文件。Windows Codex token 只由官方 CLI auth 文件持有，不要打印、复制或手工编辑。已经公开过的 key/token 应在对应供应商或账号侧轮换/重新登录。

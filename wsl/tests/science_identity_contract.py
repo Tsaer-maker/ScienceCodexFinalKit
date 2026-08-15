@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline contract for FinalKit's restart-stable Claude Science identity."""
+"""Offline contract for FinalKit's restart-stable local Science identity."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def legacy_identity(module, data_dir: Path, key: str) -> None:
     journal.chmod(0o600)
 
 
-def v2_identity(module, data_dir: Path, key: str) -> None:
+def legacy_v2_identity(module, data_dir: Path, key: str) -> None:
     token_dir = data_dir / ".oauth-tokens"
     token_dir.mkdir(mode=0o700)
     account = str(uuid.uuid4())
@@ -103,10 +103,17 @@ def verify(helper_path: Path) -> None:
         created_dir.mkdir(mode=0o700)
         write_keys(module, created_dir)
         created = module.ensure_identity(created_dir)
-        assert created["action"] == "reused" and created["schema"] == "science-login-required"
-        assert created["authenticated"] is False
+        assert created["action"] == "created" and created["schema"] == "science-local-v2"
+        assert created["authenticated"] is True and created["refresh_disabled"] is True
+        token_file = created_dir / ".oauth-tokens" / f"{module.LOCAL_ACCOUNT_UUID}.enc"
+        active_file = created_dir / "active-org.json"
+        before_token = token_file.read_bytes()
+        before_active = active_file.read_bytes()
         reused = module.ensure_identity(created_dir)
         assert reused["action"] == "reused"
+        assert reused["schema"] == "science-local-v2"
+        assert token_file.read_bytes() == before_token
+        assert active_file.read_bytes() == before_active
 
         legacy_dir = root / "legacy"
         legacy_dir.mkdir(mode=0o700)
@@ -114,24 +121,21 @@ def verify(helper_path: Path) -> None:
         legacy_identity(module, legacy_dir, keys["OAUTH_ENCRYPTION_KEY"])
         legacy_status = module.inspect_identity(legacy_dir)
         assert legacy_status["schema"] == "science-local-legacy"
-        assert legacy_status["removal_required"] is True
+        assert legacy_status["migration_required"] is True
         migrated = module.ensure_identity(legacy_dir)
-        assert migrated["action"] == "removed-science-local-legacy"
-        assert not (legacy_dir / ".oauth-tokens").exists()
-        assert module.inspect_identity(legacy_dir)["schema"] == "science-login-required"
+        assert migrated["action"] == "migrated-science-local-legacy"
+        assert module.inspect_identity(legacy_dir)["schema"] == "science-local-v2"
 
         v2_dir = root / "v2"
         v2_dir.mkdir(mode=0o700)
         keys = write_keys(module, v2_dir)
-        v2_identity(module, v2_dir, keys["OAUTH_ENCRYPTION_KEY"])
+        legacy_v2_identity(module, v2_dir, keys["OAUTH_ENCRYPTION_KEY"])
         v2_status = module.inspect_identity(v2_dir)
-        assert v2_status["schema"] == "science-local-v2"
-        assert v2_status["removal_required"] is True
+        assert v2_status["schema"] == "science-local-v2-legacy"
+        assert v2_status["migration_required"] is True
         migrated = module.ensure_identity(v2_dir)
-        assert migrated["action"] == "removed-science-local-v2"
-        assert not (v2_dir / ".oauth-tokens").exists()
-        assert not (v2_dir / "active-org.json").exists()
-        assert module.inspect_identity(v2_dir)["schema"] == "science-login-required"
+        assert migrated["action"] == "migrated-science-local-v2-legacy"
+        assert module.inspect_identity(v2_dir)["schema"] == "science-local-v2"
 
         unknown_dir = root / "unknown"
         unknown_dir.mkdir(mode=0o700)
@@ -149,8 +153,8 @@ def verify(helper_path: Path) -> None:
         assert not (unknown_dir / "active-org.json").exists()
 
     print(
-        "SCIENCE_IDENTITY_CONTRACT_OK empty=login-required reuse=yes "
-        "legacy=removed v2=removed unknown=preserved"
+        "SCIENCE_IDENTITY_CONTRACT_OK empty=created reuse=byte-stable "
+        "legacy=migrated v2=migrated unknown=preserved"
     )
 
 

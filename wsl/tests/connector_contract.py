@@ -25,7 +25,11 @@ ALIASES = {
     "claude-sonnet-4-5": "gpt-5.6-terra",
     "claude-haiku-4-5-20251001": "gpt-5.6-luna",
 }
-EFFORT = "max"
+REASONING = {
+    "claude-opus-4-8": "max",
+    "claude-sonnet-4-5": "high",
+    "claude-haiku-4-5-20251001": "low",
+}
 
 
 class FakeResponse:
@@ -88,7 +92,12 @@ async def verify(proxy_path: Path) -> None:
             "default_backend": "openai",
             "codex_backend_url": "https://chatgpt.com/backend-api/codex",
             "codex_model": ALIASES["claude-opus-4-8"],
-            "codex_reasoning_effort": EFFORT,
+            "codex_reasoning": "max",
+            "codex_reasoning_map": {
+                "claude-opus": REASONING["claude-opus-4-8"],
+                "claude-sonnet": REASONING["claude-sonnet-4-5"],
+                "claude-haiku": REASONING["claude-haiku-4-5-20251001"],
+            },
             "codex_model_map": {
                 "claude-opus": ALIASES["claude-opus-4-8"],
                 "claude-sonnet": ALIASES["claude-sonnet-4-5"],
@@ -102,6 +111,14 @@ async def verify(proxy_path: Path) -> None:
         connector = load_connector(proxy_path, config_dir)
         connector.codex_auth_store.authorization_header = lambda: "Bearer contract-test"
         connector.codex_auth_store.account_id = lambda: "contract-account"
+
+        assert connector.FAKE_ACCOUNT_UUID == "00000000-0000-4000-8000-000000000001"
+        assert connector.FAKE_ORG_UUID == "00000000-0000-4000-8000-000000000002"
+        assert connector.FAKE_ACCESS_TOKEN == "sk-ant-finalkit-local-session"
+        token_response = connector.fake_token_response()
+        assert token_response["refresh_token"] == ""
+        assert token_response["expires_at"] == "2099-01-01T00:00:00.000Z"
+        assert connector.fake_user_response()["email"] == "virtual@localhost.invalid"
         connector.log_request = lambda *args, **kwargs: None
         client = CaptureClient()
         connector.get_client = lambda: client
@@ -112,7 +129,7 @@ async def verify(proxy_path: Path) -> None:
             {
                 "id": alias,
                 "type": "model",
-                "display_name": f"ChatGPT Codex | {model} | {EFFORT}",
+                "display_name": f"ChatGPT Codex | {model} | reasoning={REASONING[alias]}",
             }
             for alias, model in ALIASES.items()
         ]
@@ -123,8 +140,9 @@ async def verify(proxy_path: Path) -> None:
             backend = connector.config.resolve_backend(alias)
             if backend["model"] != expected_model:
                 raise AssertionError(f"{alias} resolved to {backend['model']!r}")
-            if backend["reasoning_effort"] != EFFORT:
-                raise AssertionError(f"{alias} effort is {backend['reasoning_effort']!r}")
+            expected_reasoning = REASONING[alias]
+            if backend["reasoning"] != expected_reasoning:
+                raise AssertionError(f"{alias} reasoning is {backend['reasoning']!r}")
             before = len(client.requests)
             response = await connector._handle_codex_messages(
                 {
@@ -142,8 +160,8 @@ async def verify(proxy_path: Path) -> None:
             outbound = client.requests[-1]
             if outbound["json"].get("model") != expected_model:
                 raise AssertionError(f"{alias} outbound model drifted: {outbound['json']!r}")
-            if outbound["json"].get("reasoning") != {"effort": EFFORT}:
-                raise AssertionError(f"{alias} outbound effort drifted: {outbound['json']!r}")
+            if outbound["json"].get("reasoning") != {"effort": expected_reasoning}:
+                raise AssertionError(f"{alias} outbound reasoning drifted: {outbound['json']!r}")
 
         retry_client = CaptureClient([502, 200])
         connector.get_client = lambda: retry_client
@@ -173,7 +191,7 @@ def main() -> int:
         print(f"connector is missing: {proxy_path}", file=sys.stderr)
         return 2
     asyncio.run(verify(proxy_path))
-    print("CONNECTOR_CONTRACT_OK catalog=3 routes=sol,terra,luna effort=max retry502=once network=disabled")
+    print("CONNECTOR_CONTRACT_OK catalog=3 routes=sol,terra,luna reasoning=max,high,low retry502=once network=disabled")
     return 0
 
 

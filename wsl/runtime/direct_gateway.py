@@ -26,8 +26,9 @@ from typing import Any
 
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 READ_CHUNK_BYTES = 64 * 1024
-FAKE_ACCOUNT_ID = "finalkit-byok-user"
-FAKE_ORG_ID = "finalkit-byok-org"
+FAKE_ACCOUNT_ID = "00000000-0000-4000-8000-000000000001"
+FAKE_ORG_ID = "00000000-0000-4000-8000-000000000002"
+FAKE_ACCESS_TOKEN = "sk-ant-finalkit-local-session"
 PROVIDERS = {
     "deepseek": {
         "label": "DeepSeek",
@@ -44,6 +45,12 @@ PROVIDERS = {
         "upstream": "https://open.bigmodel.cn/api/anthropic",
         "auth": "x-api-key",
     },
+}
+ROLES = ("opus", "sonnet", "haiku")
+PROVIDER_REASONING = {
+    "deepseek": {"auto", "none", "high", "max"},
+    "kimi": {"auto", "none", "low", "high", "max"},
+    "glm": {"auto", "none", "high", "max"},
 }
 
 
@@ -70,11 +77,12 @@ def load_runtime(config_fd: int, key_fd: int) -> tuple[dict[str, Any], str]:
         "path_secret",
         "provider",
         "upstream",
-        "model_default",
-        "model_fast",
         "instance_id",
         "profile_id",
     }
+    for role in ROLES:
+        required.add(f"model_{role}")
+        required.add(f"reasoning_{role}")
     missing = sorted(required - set(config))
     if missing:
         raise ValueError(f"runtime config is missing: {', '.join(missing)}")
@@ -107,6 +115,16 @@ def load_runtime(config_fd: int, key_fd: int) -> tuple[dict[str, Any], str]:
         raise ValueError(f"upstream does not match the official {expected['label']} Anthropic endpoint")
     config["provider_label"] = expected["label"]
     config["auth_style"] = expected["auth"]
+    for role in ROLES:
+        model = str(config[f"model_{role}"]).strip()
+        if not model or "\n" in model or "\r" in model or len(model) > 200:
+            raise ValueError(f"{role} model is empty or malformed")
+        reasoning = str(config[f"reasoning_{role}"]).strip().lower()
+        if reasoning not in PROVIDER_REASONING[provider]:
+            choices = ", ".join(sorted(PROVIDER_REASONING[provider]))
+            raise ValueError(f"{role} reasoning must be one of: {choices}")
+        config[f"model_{role}"] = model
+        config[f"reasoning_{role}"] = reasoning
 
     key = key_raw.decode("utf-8").strip()
     if not key or "\n" in key or "\r" in key:
@@ -125,12 +143,12 @@ def fake_org() -> dict[str, Any]:
     return {
         "id": FAKE_ORG_ID,
         "uuid": FAKE_ORG_ID,
-        "name": "FinalKit BYOK",
+        "name": "FinalKit Local Gateway",
         "type": "organization",
         "status": "active",
         "default_role": "admin",
-        "subscription": {"type": "api", "status": "active"},
-        "rate_limit_tier": "api",
+        "subscription": {"type": "max", "status": "active"},
+        "rate_limit_tier": None,
         "billing_type": "api",
     }
 
@@ -140,18 +158,74 @@ def fake_user() -> dict[str, Any]:
         "id": FAKE_ACCOUNT_ID,
         "uuid": FAKE_ACCOUNT_ID,
         "sub": FAKE_ACCOUNT_ID,
-        "email": "byok@localhost",
+        "email": "virtual@localhost.invalid",
         "email_verified": True,
-        "name": "FinalKit BYOK User",
+        "name": "FinalKit Local User",
         "organization": fake_org(),
         "organization_uuid": FAKE_ORG_ID,
         "org_uuid": FAKE_ORG_ID,
-        "subscription_type": "api",
-        "rate_limit_tier": "api",
-        "seat_tier": "api",
+        "subscription_type": "max",
+        "rate_limit_tier": None,
+        "seat_tier": None,
         "billing_type": "api",
         "has_extra_usage_enabled": True,
     }
+
+
+def role_from_alias(requested: Any) -> str:
+    alias = str(requested or "").lower()
+    if "haiku" in alias:
+        return "haiku"
+    if "opus" in alias:
+        return "opus"
+    return "sonnet"
+
+
+def route_for(config: dict[str, Any], requested: Any) -> tuple[str, str, str]:
+    role = role_from_alias(requested)
+    return role, str(config[f"model_{role}"]), str(config[f"reasoning_{role}"])
+
+
+def apply_provider_reasoning(
+    body: dict[str, Any], provider: str, reasoning: str
+) -> dict[str, Any]:
+    """Apply one profile-owned reasoning choice without discarding unrelated fields."""
+
+    if reasoning == "auto":
+        return body
+
+    normalized = dict(body)
+    if reasoning == "none":
+        normalized["thinking"] = {"type": "disabled"}
+        normalized.pop("reasoning_effort", None)
+        output_config = normalized.get("output_config")
+        if isinstance(output_config, dict) and "effort" in output_config:
+            output_config = dict(output_config)
+            output_config.pop("effort", None)
+            if output_config:
+                normalized["output_config"] = output_config
+            else:
+                normalized.pop("output_config", None)
+        return normalized
+
+    normalized["thinking"] = {"type": "enabled"}
+    if provider == "deepseek":
+        output_config = normalized.get("output_config")
+        output_config = dict(output_config) if isinstance(output_config, dict) else {}
+        output_config["effort"] = reasoning
+        normalized["output_config"] = output_config
+        normalized.pop("reasoning_effort", None)
+    else:
+        normalized["reasoning_effort"] = reasoning
+        output_config = normalized.get("output_config")
+        if isinstance(output_config, dict) and "effort" in output_config:
+            output_config = dict(output_config)
+            output_config.pop("effort", None)
+            if output_config:
+                normalized["output_config"] = output_config
+            else:
+                normalized.pop("output_config", None)
+    return normalized
 
 
 class GatewayServer(ThreadingHTTPServer):
@@ -230,6 +304,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/health":
+            routes = {
+                role: {
+                    "model": self.cfg[f"model_{role}"],
+                    "reasoning": self.cfg[f"reasoning_{role}"],
+                }
+                for role in ROLES
+            }
             self.send_json(
                 200,
                 {
@@ -238,44 +319,66 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "finalkit_backend": self.cfg["provider"],
                     "profile_id": self.cfg["profile_id"],
                     "upstream_host": urllib.parse.urlsplit(self.cfg["upstream"]).hostname,
-                    "model_default": self.cfg["model_default"],
-                    "model_fast": self.cfg["model_fast"],
+                    "routes": routes,
                     "offline_smoke": bool(self.cfg.get("offline_smoke", False)),
                 },
             )
             return
 
-        if path.startswith("/v1/oauth/"):
+        if path.startswith("/api/oauth/") and any(
+            name in path.lower() for name in ("profile", "account", "userinfo", "user", "me")
+        ):
+            self.send_json(200, fake_user())
+            return
+
+        if path.startswith("/api/oauth/") and any(
+            name in path.lower() for name in ("organization", "/org", "usage")
+        ):
+            org = fake_org()
+            self.send_json(
+                200,
+                {
+                    **org,
+                    "data": [org],
+                    "organizations": [org],
+                    "has_more": False,
+                    "first_id": org["id"],
+                    "last_id": org["id"],
+                },
+            )
+            return
+
+        if path.startswith("/v1/oauth/") or path.startswith("/api/oauth/"):
             self.send_json(
                 200,
                 {
                     "token_type": "bearer",
-                    "access_token": "finalkit-local-token",
-                    "refresh_token": "finalkit-local-refresh",
+                    "access_token": FAKE_ACCESS_TOKEN,
+                    "refresh_token": "",
                     "expires_in": 2_147_483_647,
+                    "expires_at": "2099-01-01T00:00:00.000Z",
                     "scope": "openid profile email",
                 },
             )
             return
 
         if path == "/v1/models":
-            models = [
-                {
-                    "id": "claude-opus-4-8",
-                    "type": "model",
-                    "display_name": f"{self.cfg['provider_label']} via {self.cfg['model_default']}",
-                },
-                {
-                    "id": "claude-sonnet-4-5",
-                    "type": "model",
-                    "display_name": f"{self.cfg['provider_label']} via {self.cfg['model_default']}",
-                },
-                {
-                    "id": "claude-haiku-4-5-20251001",
-                    "type": "model",
-                    "display_name": f"{self.cfg['provider_label']} via {self.cfg['model_fast']}",
-                },
-            ]
+            models = []
+            for role, alias in (
+                ("opus", "claude-opus-4-8"),
+                ("sonnet", "claude-sonnet-4-5"),
+                ("haiku", "claude-haiku-4-5-20251001"),
+            ):
+                models.append(
+                    {
+                        "id": alias,
+                        "type": "model",
+                        "display_name": (
+                            f"{self.cfg['provider_label']} | {self.cfg[f'model_{role}']} | "
+                            f"reasoning={self.cfg[f'reasoning_{role}']}"
+                        ),
+                    }
+                )
             self.send_json(
                 200,
                 {
@@ -287,15 +390,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if path in {"/v1/userinfo", "/v1/me", "/v1/user", "/v1/profile", "/v1/account"}:
+        if path in {
+            "/v1/userinfo", "/v1/me", "/v1/user", "/v1/profile", "/v1/account",
+            "/api/userinfo", "/api/me", "/api/user", "/api/profile", "/api/account",
+        } or path.startswith("/api/auth/"):
             self.send_json(200, fake_user())
             return
 
-        if path in {"/v1/organization"} or path.startswith("/v1/organizations/"):
+        if path in {"/v1/organization", "/api/organization"} or path.startswith(
+            ("/v1/organizations/", "/api/organizations/")
+        ):
             self.send_json(200, fake_org())
             return
 
-        if path == "/v1/organizations":
+        if path in {"/v1/organizations", "/api/organizations"}:
             org = fake_org()
             self.send_json(
                 200,
@@ -321,14 +429,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.reject(404, "not found")
             return
 
-        if path.startswith("/v1/oauth/"):
+        if path.startswith("/v1/oauth/") or path.startswith("/api/oauth/"):
             self.send_json(
                 200,
                 {
                     "token_type": "bearer",
-                    "access_token": "finalkit-local-token",
-                    "refresh_token": "finalkit-local-refresh",
+                    "access_token": FAKE_ACCESS_TOKEN,
+                    "refresh_token": "",
                     "expires_in": 2_147_483_647,
+                    "expires_at": "2099-01-01T00:00:00.000Z",
                     "scope": "openid profile email",
                 },
             )
@@ -366,11 +475,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.reject(400, "request body must be a JSON object")
             return
 
-        if "model" in body:
-            requested = str(body.get("model", ""))
-            body["model"] = (
-                self.cfg["model_fast"] if "haiku" in requested.lower() else self.cfg["model_default"]
-            )
+        requested = str(body.get("model", "claude-sonnet-4-5"))
+        _role, model, reasoning = route_for(self.cfg, requested)
+        body["model"] = model
+        body = apply_provider_reasoning(body, str(self.cfg["provider"]), reasoning)
         encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(encoded) > MAX_REQUEST_BYTES:
             self.reject(413, "normalized request exceeds the 64 MiB limit")

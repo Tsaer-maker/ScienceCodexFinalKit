@@ -17,13 +17,18 @@ PACKAGE_VERSION="$(tr -d '\r\n' <"$SCRIPT_DIR/../VERSION")"
 }
 BRIDGE_REPO="https://github.com/haoyuan-sjtu/claude-science-codex-connector.git"
 BRIDGE_REF="${BRIDGE_REF:-30b26d7c6f097b186bbd228e93a427a731399960}"
-# Exact proxy.py files produced by the managed 3.0.3 through 3.0.7 patches at
-# BRIDGE_REF. These hashes distinguish an upgradeable FinalKit owner from
-# unknown local edits; no unrecognized connector file is overwritten.
+# Exact proxy.py files produced by prior managed FinalKit patches at BRIDGE_REF.
+# These hashes distinguish an upgradeable FinalKit owner from unknown local
+# edits; no unrecognized connector file is overwritten.
 LEGACY_BRIDGE_PROXY_SHA256="b2808deb29d5fa8d7a0f78e8134f0c7b3f59ba6a29cc78cf42bd79bc2bc957e7"
 LEGACY_BRIDGE_PROXY_SHA256_304="b986db81f5f30ae1e8083da9f78681c8beafdba1fd439b29ce8fb3f640b7bd7f"
 LEGACY_BRIDGE_PROXY_SHA256_306="d405d6a675f4844880aeec182cef6ed7bf424d5b13621f1aa3e12cae3c9d908d"
 LEGACY_BRIDGE_PROXY_SHA256_307="4bd365339455b4a44338fe723b646259455a8f260e8aa98b14cc209a52d0a378"
+MANAGED_BRIDGE_PROXY_SHA256_320="9e31942216c5980486b6b6aa97781b42951e9b51c33496339c12d5e163a64b42"
+# 3.3.0 briefly added a Windows Desktop route to this same pinned connector.
+# Admit that exact managed file only as a one-way recovery source so 3.2.2 can
+# restore the isolated WSL owner; unknown connector edits still fail closed.
+RECOVERY_BRIDGE_PROXY_SHA256_330="0b0f071a7c33fe9a00faeb11d73d9f1c986f6d0c57b353addb1f98e37d86e620"
 NODE_VERSION="${NODE_VERSION:-v24.19.0}"
 CHROME_MCP_VERSION="${CHROME_MCP_VERSION:-1.2.0}"
 
@@ -34,6 +39,15 @@ die() {
 
 note() {
   printf '%s\n' "$*" >&2
+}
+
+is_managed_bridge_proxy() {
+  case "${1:-}" in
+    "$LEGACY_BRIDGE_PROXY_SHA256"|"$LEGACY_BRIDGE_PROXY_SHA256_304"|\
+    "$LEGACY_BRIDGE_PROXY_SHA256_306"|"$LEGACY_BRIDGE_PROXY_SHA256_307"|\
+    "$MANAGED_BRIDGE_PROXY_SHA256_320"|"$RECOVERY_BRIDGE_PROXY_SHA256_330") return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 without_proxy() {
@@ -176,11 +190,7 @@ ensure_bridge_checkout() {
     if ! git -C "$bridge_dir" apply --check "$SCRIPT_DIR/connector-security.patch" >/dev/null 2>&1; then
       changed="$(git -C "$bridge_dir" diff --name-only)"
       proxy_sha="$(sha256sum "$bridge_dir/proxy.py" | awk '{print $1}')"
-      if [[ "$changed" == "proxy.py" ]] && \
-         [[ "$proxy_sha" == "$LEGACY_BRIDGE_PROXY_SHA256" || \
-            "$proxy_sha" == "$LEGACY_BRIDGE_PROXY_SHA256_304" || \
-            "$proxy_sha" == "$LEGACY_BRIDGE_PROXY_SHA256_306" || \
-            "$proxy_sha" == "$LEGACY_BRIDGE_PROXY_SHA256_307" ]]; then
+      if [[ "$changed" == "proxy.py" ]] && is_managed_bridge_proxy "$proxy_sha"; then
         note "Upgrading the verified previous FinalKit connector owner to $PACKAGE_VERSION..."
         git -C "$bridge_dir" restore --source=HEAD --worktree -- proxy.py
       else
@@ -261,13 +271,14 @@ install_user() {
   [[ "$EUID" -ne 0 ]] || die "--user/--runtime must run as the ordinary WSL user"
   verify_ubuntu
 
-  local real_home root bridge_dir science_bin claude_bin codex_bin science_home legacy_science_home
+  local real_home root bridge_dir science_bin claude_bin codex_bin client_home science_home legacy_science_home
   real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
   [[ -n "$real_home" && "$real_home" != "/root" ]] || die "Could not resolve an ordinary-user home"
   export HOME="$real_home"
   export PATH="$real_home/.local/bin:$PATH"
   root="${FINALKIT_ROOT:-$real_home/.local/share/science-codex-finalkit}"
   bridge_dir="$root/bridge"
+  client_home="$real_home/.finalkit-client"
   science_home="$real_home/.science-finalkit"
   legacy_science_home="$root/science-home"
   science_bin="$real_home/.local/bin/claude-science"
@@ -282,7 +293,7 @@ install_user() {
     note "Migrating the draft Science profile to the short AF_UNIX-safe path..."
     mv -- "$legacy_science_home" "$science_home"
   fi
-  install -d -m 700 "$science_home"
+  install -d -m 700 "$client_home" "$science_home"
 
   if [[ "$install_mode" == "full" && ( ! -x "$science_bin" || "${FINALKIT_UPGRADE_TOOLS:-0}" == "1" ) ]]; then
     note "Installing official Claude Science..."
@@ -301,6 +312,13 @@ install_user() {
     download_and_run "https://chatgpt.com/codex/install.sh" "Codex CLI" "codex"
   fi
   [[ -x "$codex_bin" ]] || die "Codex CLI was not installed at $codex_bin"
+
+  if [[ -f "$science_home/.codex/auth.json" && ! -e "$client_home/.codex/auth.json" ]]; then
+    note "Migrating the FinalKit-owned Codex auth cache out of the Science data HOME..."
+    install -d -m 700 "$client_home/.codex"
+    mv -- "$science_home/.codex/auth.json" "$client_home/.codex/auth.json"
+    chmod 600 "$client_home/.codex/auth.json"
+  fi
 
   if [[ "$install_mode" == "full" ]]; then
     note "Installing pinned Node.js LTS and optional Chrome DevTools MCP bridge..."
@@ -343,6 +361,9 @@ install_user() {
   note "Verifying the offline Codex route and model-catalog contract..."
   "$bridge_dir/.venv/bin/python" \
     "$SCRIPT_DIR/tests/connector_contract.py" "$bridge_dir/proxy.py"
+  note "Verifying direct provider Model/Reasoning request mapping..."
+  python3 "$SCRIPT_DIR/tests/direct_gateway_contract.py" \
+    "$SCRIPT_DIR/runtime/direct_gateway.py"
   note "Verifying the offline Claude Science ownership/control contract..."
   python3 "$SCRIPT_DIR/tests/runtime_control_contract.py" \
     "$SCRIPT_DIR/runtime/switch_manager.py"
@@ -394,15 +415,18 @@ install_user() {
 update_runtime() {
   [[ "$EUID" -ne 0 ]] || die "--runtime must run as the ordinary WSL user"
   verify_ubuntu
-  local real_home root backup target label
+  local real_home root target label
   local runtime_update_success=0
-  local -a targets
   real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
   root="${FINALKIT_ROOT:-$real_home/.local/share/science-codex-finalkit}"
   [[ -x "$real_home/.local/bin/fkctl" && -d "$root/bridge/.git" ]] || \
     die "FinalKit is not installed for this Linux user; use the full Build"
-  backup="$(mktemp -d /tmp/finalkit-runtime-update.XXXXXX)"
-  targets=(
+  # These two rollback values deliberately outlive this function's local
+  # scope. Bash runs an EXIT trap after unwinding function locals when an
+  # entrypoint command fails under `set -e`; keeping them local made that
+  # final rollback attempt hit an unbound variable after restoring the files.
+  FINALKIT_RUNTIME_UPDATE_BACKUP="$(mktemp -d /tmp/finalkit-runtime-update.XXXXXX)"
+  FINALKIT_RUNTIME_UPDATE_TARGETS=(
     "$root/runtime/direct_gateway.py"
     "$root/runtime/science_identity.py"
     "$root/runtime/switch_manager.py"
@@ -414,27 +438,29 @@ update_runtime() {
     "$root/versions.txt"
     "$real_home/.local/bin/fkctl"
     "$real_home/.local/bin/chrome-devtools-mcp-finalkit"
+    "$real_home/.science-finalkit/.codex/auth.json"
+    "$real_home/.finalkit-client/.codex/auth.json"
   )
-  mkdir -p "$backup/files"
-  for target in "${targets[@]}"; do
+  mkdir -p "$FINALKIT_RUNTIME_UPDATE_BACKUP/files"
+  for target in "${FINALKIT_RUNTIME_UPDATE_TARGETS[@]}"; do
     label="$(printf '%s' "$target" | sha256sum | awk '{print $1}')"
-    printf '%s\n' "$target" >"$backup/$label.path"
+    printf '%s\n' "$target" >"$FINALKIT_RUNTIME_UPDATE_BACKUP/$label.path"
     if [[ -e "$target" ]]; then
-      cp -a -- "$target" "$backup/files/$label"
-      : >"$backup/$label.present"
+      cp -a -- "$target" "$FINALKIT_RUNTIME_UPDATE_BACKUP/files/$label"
+      : >"$FINALKIT_RUNTIME_UPDATE_BACKUP/$label.present"
     fi
   done
   rollback_runtime_update() {
     local rollback_target rollback_label
-    for rollback_target in "${targets[@]}"; do
+    for rollback_target in "${FINALKIT_RUNTIME_UPDATE_TARGETS[@]}"; do
       rollback_label="$(printf '%s' "$rollback_target" | sha256sum | awk '{print $1}')"
       rm -f -- "$rollback_target"
-      if [[ -f "$backup/$rollback_label.present" ]]; then
+      if [[ -f "$FINALKIT_RUNTIME_UPDATE_BACKUP/$rollback_label.present" ]]; then
         install -d -m 700 "$(dirname "$rollback_target")"
-        cp -a -- "$backup/files/$rollback_label" "$rollback_target"
+        cp -a -- "$FINALKIT_RUNTIME_UPDATE_BACKUP/files/$rollback_label" "$rollback_target"
       fi
     done
-    rm -rf -- "$backup"
+    rm -rf -- "$FINALKIT_RUNTIME_UPDATE_BACKUP"
   }
   runtime_update_success=0
   trap 'rc=$?; if [[ "${runtime_update_success:-0}" != "1" ]]; then note "Runtime update failed; restoring the previous managed files. The prior runtime may need to be started again."; rollback_runtime_update; fi; exit "$rc"' EXIT
@@ -442,7 +468,8 @@ update_runtime() {
   install_user runtime
   runtime_update_success=1
   trap - EXIT INT TERM
-  rm -rf -- "$backup"
+  rm -rf -- "$FINALKIT_RUNTIME_UPDATE_BACKUP"
+  unset FINALKIT_RUNTIME_UPDATE_BACKUP FINALKIT_RUNTIME_UPDATE_TARGETS
 }
 
 update_tools() {
@@ -458,7 +485,7 @@ update_tools() {
   science_bin="$real_home/.local/bin/claude-science"
   claude_bin="$real_home/.local/bin/claude"
   codex_bin="$real_home/.local/bin/codex"
-  auth_file="$real_home/.science-finalkit/.codex/auth.json"
+  auth_file="$real_home/.finalkit-client/.codex/auth.json"
   [[ -x "$real_home/.local/bin/fkctl" && -f "$root/bridge.commit" ]] || \
     die "FinalKit is not installed for this Linux user; use the full Build"
   auth_before=""

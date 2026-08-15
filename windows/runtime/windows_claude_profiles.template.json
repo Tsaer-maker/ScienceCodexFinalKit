@@ -1,0 +1,59 @@
+{
+  "schema_version": 3,
+  "host": "127.0.0.1",
+  "port": 18987,
+  "profiles": {
+    "deepseek": {
+      "profile_id": "c20f9d40-9b8e-5bc3-a3b1-1b326edd8a63",
+      "name": "FinalKit Windows DeepSeek API",
+      "protocol": "anthropic-messages",
+      "upstream": "https://api.deepseek.com/anthropic",
+      "auth_style": "x-api-key",
+      "model_opus": "deepseek-v4-pro",
+      "reasoning_opus": "auto",
+      "model_sonnet": "deepseek-v4-pro",
+      "reasoning_sonnet": "auto",
+      "model_haiku": "deepseek-v4-flash",
+      "reasoning_haiku": "auto"
+    },
+    "kimi": {
+      "profile_id": "73af0626-0caa-56fb-87f3-e87eb120235e",
+      "name": "FinalKit Windows Kimi API",
+      "protocol": "anthropic-messages",
+      "upstream": "https://api.moonshot.ai/anthropic",
+      "auth_style": "bearer",
+      "model_opus": "kimi-k3[1m]",
+      "reasoning_opus": "auto",
+      "model_sonnet": "kimi-k3[1m]",
+      "reasoning_sonnet": "auto",
+      "model_haiku": "kimi-k2.6",
+      "reasoning_haiku": "auto"
+    },
+    "glm": {
+      "profile_id": "84e1ab3e-593c-5fc9-a078-5757f400fba7",
+      "name": "FinalKit Windows GLM API",
+      "protocol": "anthropic-messages",
+      "upstream": "https://open.bigmodel.cn/api/anthropic",
+      "auth_style": "x-api-key",
+      "model_opus": "glm-5.2",
+      "reasoning_opus": "auto",
+      "model_sonnet": "glm-5.2",
+      "reasoning_sonnet": "auto",
+      "model_haiku": "glm-4.7-flash",
+      "reasoning_haiku": "auto"
+    },
+    "codex": {
+      "profile_id": "642becc7-c4ca-52ec-8c7d-7e66a1c56023",
+      "name": "FinalKit Windows Codex Login",
+      "protocol": "openai-responses",
+      "upstream": "https://chatgpt.com/backend-api/codex",
+      "auth_style": "codex-cli",
+      "model_opus": "gpt-5.6-sol",
+      "model_sonnet": "gpt-5.6-terra",
+      "model_haiku": "gpt-5.6-luna",
+      "reasoning_opus": "max",
+      "reasoning_sonnet": "max",
+      "reasoning_haiku": "max"
+    }
+  }
+}

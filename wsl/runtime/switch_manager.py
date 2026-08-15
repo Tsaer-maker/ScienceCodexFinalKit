@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import getpass
+import http.cookiejar
 import json
 import os
 import re
@@ -25,6 +26,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,8 +36,12 @@ from typing import Any
 DEFAULT_ROOT = Path.home() / ".local" / "share" / "science-codex-finalkit"
 DEFAULT_GATEWAY_PORT = 9876
 DEFAULT_SCIENCE_PORT = 8765
+SCIENCE_START_READY_SECONDS = 45.0
 NO_PROXY_LOOPBACK = "127.0.0.1,localhost,::1"
 LINUX_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+SCIENCE_LOCAL_ACCOUNT_UUID = "00000000-0000-4000-8000-000000000001"
+SCIENCE_LOCAL_ORG_UUID = "00000000-0000-4000-8000-000000000002"
+SCIENCE_LOCAL_SESSION_TOKEN = "sk-ant-finalkit-local-session"
 API_PROVIDERS = {
     "deepseek": {
         "label": "DeepSeek",
@@ -70,8 +76,19 @@ API_PROVIDERS = {
 }
 VALID_MODES = set(API_PROVIDERS) | {"codex"}
 CODEX_FILE_AUTH_ARGS = ("-c", 'cli_auth_credentials_store="file"')
-CODEX_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
-MODEL_ROUTE_SCHEMA_VERSION = 1
+CODEX_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max", "ultra"}
+CLAUDE_ROUTE_ROLES = ("opus", "sonnet", "haiku")
+PROVIDER_REASONING_EFFORTS = {
+    # ``auto`` preserves the upstream default; ``none`` explicitly disables
+    # thinking. The remaining values are the distinct provider-level controls
+    # documented for each Anthropic-compatible endpoint.
+    "deepseek": ("auto", "none", "high", "max"),
+    "kimi": ("auto", "none", "low", "high", "max"),
+    "glm": ("auto", "none", "high", "max"),
+}
+GENERIC_REASONING_EFFORTS = {"auto", "none", "low", "medium", "high", "xhigh", "max", "ultra"}
+MAX_CODEX_AUTH_BYTES = 1024 * 1024
+MODEL_ROUTE_SCHEMA_VERSION = 2
 MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]@+=-]{0,199}$")
 RUNTIME_CAPABILITIES = (
     "browser-codex-oauth",
@@ -82,12 +99,16 @@ RUNTIME_CAPABILITIES = (
     "effective-route-output",
     "model-route-update",
     "persistent-model-routes",
+    "per-role-provider-routes",
+    "per-role-reasoning",
     "provider-model-discovery",
     "runtime-update-v1",
     "science-linux-only-runtime",
     "native-provider-client",
-    "science-official-auth-boundary",
+    "science-isolated-local-identity",
+    "science-local-session-admission",
     "shared-official-codex-auth",
+    "stdin-codex-auth-import",
 )
 
 
@@ -104,13 +125,16 @@ class Paths:
         self.bridge_python = self.bridge / ".venv" / "bin" / "python"
         self.bridge_config = self.bridge / "config.json"
         self.model_routes = self.config / "model-routes.json"
+        # Provider clients and official Codex OAuth live outside Science's
+        # data HOME. The connector reads this one official cache directly.
+        self.client_home = Path.home() / ".finalkit-client"
         # Claude Science creates nested AF_UNIX sockets.  Keep this path short
         # enough for Linux's 108-byte sun_path limit while retaining isolation.
         self.science_home = Path.home() / ".science-finalkit"
         # The official Linux Codex CLI owns the only ChatGPT credential cache.
         # The connector reads and refreshes this same file instead of keeping a
         # second refresh-token chain that can drift or invalidate the first.
-        self.codex_auth = self.science_home / ".codex" / "auth.json"
+        self.codex_auth = self.client_home / ".codex" / "auth.json"
         self.data_dir = self.science_home / ".claude-science"
         self.run = self.root / "run"
         self.logs = self.root / "logs"
@@ -138,6 +162,7 @@ class Paths:
             self.root,
             self.runtime,
             self.config,
+            self.client_home,
             self.science_home,
             self.run,
             self.logs,
@@ -153,6 +178,23 @@ def atomic_write(path: Path, value: str, mode: int = 0o600) -> None:
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def atomic_write_bytes(path: Path, value: bytes | bytearray, mode: int = 0o600) -> None:
+    """Atomically replace one private file without changing its exact bytes."""
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
             handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
@@ -477,20 +519,26 @@ class RuntimeManager:
 
     @staticmethod
     def default_model_routes() -> dict[str, Any]:
+        providers: dict[str, dict[str, str]] = {}
+        for name, provider in API_PROVIDERS.items():
+            providers[name] = {
+                "model_opus": str(provider["default_model"]),
+                "reasoning_opus": "auto",
+                "model_sonnet": str(provider["default_model"]),
+                "reasoning_sonnet": "auto",
+                "model_haiku": str(provider["fast_model"]),
+                "reasoning_haiku": "auto",
+            }
         return {
             "schema_version": MODEL_ROUTE_SCHEMA_VERSION,
-            "providers": {
-                name: {
-                    "main": str(provider["default_model"]),
-                    "fast": str(provider["fast_model"]),
-                }
-                for name, provider in API_PROVIDERS.items()
-            },
+            "providers": providers,
             "codex": {
-                "opus": "gpt-5.6-sol",
-                "sonnet": "gpt-5.6-terra",
-                "haiku": "gpt-5.6-luna",
-                "reasoning_effort": "max",
+                "model_opus": "gpt-5.6-sol",
+                "reasoning_opus": "max",
+                "model_sonnet": "gpt-5.6-terra",
+                "reasoning_sonnet": "max",
+                "model_haiku": "gpt-5.6-luna",
+                "reasoning_haiku": "max",
             },
         }
 
@@ -504,6 +552,99 @@ class RuntimeManager:
                 f"{label} must be a 1-200 character model ID containing only letters, digits, . _ : / [ ] @ + = or -"
             )
         return model
+
+    @staticmethod
+    def validate_reasoning_effort(value: Any, label: str, allowed: set[str]) -> str:
+        if not isinstance(value, str):
+            raise FinalKitError(f"{label} must be a string")
+        effort = value.strip().lower()
+        if effort not in allowed:
+            raise FinalKitError(f"{label} must be one of: {', '.join(sorted(allowed))}")
+        return effort
+
+    def normalize_role_route(
+        self,
+        route: Any,
+        label: str,
+        allowed_efforts: set[str],
+    ) -> dict[str, str]:
+        if not isinstance(route, dict):
+            raise FinalKitError(f"model route for {label} must be an object")
+        normalized: dict[str, str] = {}
+        for role in CLAUDE_ROUTE_ROLES:
+            normalized[f"model_{role}"] = self.validate_model_id(
+                route.get(f"model_{role}"), f"{label} {role} model"
+            )
+            normalized[f"reasoning_{role}"] = self.validate_reasoning_effort(
+                route.get(f"reasoning_{role}"),
+                f"{label} {role} reasoning",
+                allowed_efforts,
+            )
+        return normalized
+
+    def migrate_model_routes_payload(self, payload: Any) -> dict[str, Any]:
+        """Migrate the former main/fast/shared-effort shape without losing choices."""
+
+        if not isinstance(payload, dict):
+            raise FinalKitError("model route config must be a JSON object")
+        schema = payload.get("schema_version")
+        if schema == MODEL_ROUTE_SCHEMA_VERSION:
+            # An early 3.2.3 preview used the longer reasoning_effort_* names.
+            # Accept it once and rewrite to the compact model/reasoning schema.
+            compact = json.loads(json.dumps(payload))
+            route_objects = []
+            providers = compact.get("providers")
+            if isinstance(providers, dict):
+                route_objects.extend(route for route in providers.values() if isinstance(route, dict))
+            if isinstance(compact.get("codex"), dict):
+                route_objects.append(compact["codex"])
+            for route in route_objects:
+                for role in CLAUDE_ROUTE_ROLES:
+                    model_name = f"model_{role}"
+                    if model_name not in route and role in route:
+                        route[model_name] = route[role]
+                    route.pop(role, None)
+                    long_name = f"reasoning_effort_{role}"
+                    short_name = f"reasoning_{role}"
+                    if short_name not in route and long_name in route:
+                        route[short_name] = route[long_name]
+                    route.pop(long_name, None)
+            return self.validate_model_routes(compact)
+        if schema != 1:
+            raise FinalKitError(
+                f"model route schema must be 1 or {MODEL_ROUTE_SCHEMA_VERSION}; found {schema!r}"
+            )
+        providers = payload.get("providers")
+        codex = payload.get("codex")
+        if not isinstance(providers, dict) or not isinstance(codex, dict):
+            raise FinalKitError("model route config requires providers and codex objects")
+        migrated = self.default_model_routes()
+        for name, old_route in providers.items():
+            if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name):
+                raise FinalKitError(f"invalid provider route name: {name!r}")
+            if not isinstance(old_route, dict):
+                raise FinalKitError(f"model route for {name} must be an object")
+            main = old_route.get("main")
+            fast = old_route.get("fast")
+            shared_effort = old_route.get("reasoning_effort", "auto")
+            migrated["providers"][name] = {
+                "model_opus": main,
+                "reasoning_opus": shared_effort,
+                "model_sonnet": main,
+                "reasoning_sonnet": shared_effort,
+                "model_haiku": fast,
+                "reasoning_haiku": shared_effort,
+            }
+        shared_codex_effort = codex.get("reasoning_effort", "max")
+        migrated["codex"] = {
+            "model_opus": codex.get("opus"),
+            "reasoning_opus": shared_codex_effort,
+            "model_sonnet": codex.get("sonnet"),
+            "reasoning_sonnet": shared_codex_effort,
+            "model_haiku": codex.get("haiku"),
+            "reasoning_haiku": shared_codex_effort,
+        }
+        return self.validate_model_routes(migrated)
 
     def validate_model_routes(self, payload: Any) -> dict[str, Any]:
         if not isinstance(payload, dict):
@@ -523,26 +664,13 @@ class RuntimeManager:
         for name, route in providers.items():
             if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name):
                 raise FinalKitError(f"invalid provider route name: {name!r}")
-            if not isinstance(route, dict):
-                raise FinalKitError(f"model route for {name} must be an object")
-            normalized["providers"][name] = {
-                "main": self.validate_model_id(route.get("main"), f"{name} main model"),
-                "fast": self.validate_model_id(route.get("fast"), f"{name} fast model"),
-            }
-        effort_value = codex.get("reasoning_effort")
-        if not isinstance(effort_value, str):
-            raise FinalKitError("Codex reasoning effort must be a string")
-        normalized["codex"] = {
-            "opus": self.validate_model_id(codex.get("opus"), "Codex Opus-tier model"),
-            "sonnet": self.validate_model_id(codex.get("sonnet"), "Codex Sonnet-tier model"),
-            "haiku": self.validate_model_id(codex.get("haiku"), "Codex Haiku-tier model"),
-            "reasoning_effort": effort_value.strip().lower(),
-        }
-        if normalized["codex"]["reasoning_effort"] not in CODEX_REASONING_EFFORTS:
-            raise FinalKitError(
-                "Codex reasoning effort must be one of: "
-                + ", ".join(sorted(CODEX_REASONING_EFFORTS))
+            allowed = set(PROVIDER_REASONING_EFFORTS.get(name, tuple(GENERIC_REASONING_EFFORTS)))
+            normalized["providers"][name] = self.normalize_role_route(
+                route, name, allowed
             )
+        normalized["codex"] = self.normalize_role_route(
+            codex, "Codex", set(CODEX_REASONING_EFFORTS)
+        )
         return normalized
 
     def legacy_model_routes(self) -> dict[str, Any]:
@@ -574,45 +702,57 @@ class RuntimeManager:
                 if any(family_values.values()):
                     for tier, value in family_values.items():
                         if value:
-                            routes["codex"][tier] = str(value)
+                            routes["codex"][f"model_{tier}"] = str(value)
                 elif exact_values != known_broken_defaults:
                     for tier, value in exact_values.items():
                         if value:
-                            routes["codex"][tier] = str(value)
+                            routes["codex"][f"model_{tier}"] = str(value)
             legacy_primary = legacy.get("codex_model")
             if (
                 isinstance(legacy_primary, str)
                 and legacy_primary
                 and legacy_primary != "gpt-5.6-sol"
             ):
-                routes["codex"]["opus"] = legacy_primary
+                routes["codex"]["model_opus"] = legacy_primary
             effort = legacy.get("codex_reasoning_effort")
             if isinstance(effort, str) and effort.strip().lower() in CODEX_REASONING_EFFORTS:
-                routes["codex"]["reasoning_effort"] = effort.strip().lower()
+                for role in CLAUDE_ROUTE_ROLES:
+                    routes["codex"][f"reasoning_{role}"] = effort.strip().lower()
         # Environment values are a one-time migration source.  Once the file
         # exists, subsequent package updates never overwrite the user's routes.
         for name, provider in API_PROVIDERS.items():
             prefix = str(provider["env_prefix"])
-            routes["providers"][name]["main"] = os.environ.get(
-                f"{prefix}_MODEL", routes["providers"][name]["main"]
-            )
-            routes["providers"][name]["fast"] = os.environ.get(
-                f"{prefix}_FAST_MODEL", routes["providers"][name]["fast"]
-            )
-        routes["codex"]["opus"] = os.environ.get(
+            legacy_main = os.environ.get(f"{prefix}_MODEL")
+            legacy_fast = os.environ.get(f"{prefix}_FAST_MODEL")
+            legacy_effort = os.environ.get(f"{prefix}_REASONING_EFFORT")
+            for role in CLAUDE_ROUTE_ROLES:
+                model_fallback = legacy_fast if role == "haiku" else legacy_main
+                routes["providers"][name][f"model_{role}"] = os.environ.get(
+                    f"{prefix}_{role.upper()}_MODEL",
+                    model_fallback or routes["providers"][name][f"model_{role}"],
+                )
+                routes["providers"][name][f"reasoning_{role}"] = os.environ.get(
+                    f"{prefix}_{role.upper()}_REASONING_EFFORT",
+                    legacy_effort
+                    or routes["providers"][name][f"reasoning_{role}"],
+                )
+        routes["codex"]["model_opus"] = os.environ.get(
             "FINALKIT_CODEX_OPUS_MODEL",
-            os.environ.get("FINALKIT_CODEX_MODEL", routes["codex"]["opus"]),
+            os.environ.get("FINALKIT_CODEX_MODEL", routes["codex"]["model_opus"]),
         )
-        routes["codex"]["sonnet"] = os.environ.get(
-            "FINALKIT_CODEX_SONNET_MODEL", routes["codex"]["sonnet"]
+        routes["codex"]["model_sonnet"] = os.environ.get(
+            "FINALKIT_CODEX_SONNET_MODEL", routes["codex"]["model_sonnet"]
         )
-        routes["codex"]["haiku"] = os.environ.get(
+        routes["codex"]["model_haiku"] = os.environ.get(
             "FINALKIT_CODEX_HAIKU_MODEL",
-            os.environ.get("FINALKIT_CODEX_FAST_MODEL", routes["codex"]["haiku"]),
+            os.environ.get("FINALKIT_CODEX_FAST_MODEL", routes["codex"]["model_haiku"]),
         )
-        routes["codex"]["reasoning_effort"] = os.environ.get(
-            "FINALKIT_CODEX_REASONING_EFFORT", routes["codex"]["reasoning_effort"]
-        )
+        shared_codex_effort = os.environ.get("FINALKIT_CODEX_REASONING_EFFORT")
+        for role in CLAUDE_ROUTE_ROLES:
+            routes["codex"][f"reasoning_{role}"] = os.environ.get(
+                f"FINALKIT_CODEX_{role.upper()}_REASONING_EFFORT",
+                shared_codex_effort or routes["codex"][f"reasoning_{role}"],
+            )
         return self.validate_model_routes(routes)
 
     def ensure_model_routes(self) -> dict[str, Any]:
@@ -627,7 +767,7 @@ class RuntimeManager:
             return payload
         except (json.JSONDecodeError, OSError) as exc:
             raise FinalKitError(f"model route config is unreadable: {self.p.model_routes}") from exc
-        normalized = self.validate_model_routes(payload)
+        normalized = self.migrate_model_routes_payload(payload)
         if normalized != payload:
             atomic_write(
                 self.p.model_routes,
@@ -647,7 +787,7 @@ class RuntimeManager:
             return self.default_model_routes()
         except (json.JSONDecodeError, OSError) as exc:
             raise FinalKitError(f"model route config is unreadable: {self.p.model_routes}") from exc
-        return self.validate_model_routes(payload)
+        return self.migrate_model_routes_payload(payload)
 
     def fetch_provider_model_payload(self, provider: str, api_key: str) -> Any:
         """Read one fixed official catalog endpoint without generating tokens.
@@ -729,14 +869,164 @@ class RuntimeManager:
             .isoformat()
             .replace("+00:00", "Z"),
             "current": current,
-            "current_main_available": current["main"] in discovered,
-            "current_fast_available": current["fast"] in discovered,
+            "current_availability": {
+                role: current[f"model_{role}"] in discovered for role in CLAUDE_ROUTE_ROLES
+            },
             "models": shown,
             "total_models": len(all_models),
             "truncated": len(all_models) > len(shown),
             "writes_performed": False,
             "generation_request_performed": False,
         }
+
+    def codex_local_model_catalog(self) -> list[dict[str, Any]]:
+        """Read model/reasoning capabilities owned by this Linux Codex CLI."""
+
+        cache_path = self.p.codex_auth.parent / "models_cache.json"
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeError):
+            return []
+        raw_models = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(raw_models, list):
+            return []
+        catalog: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in raw_models:
+            if not isinstance(item, dict) or str(item.get("visibility", "")) == "hide":
+                continue
+            try:
+                slug = self.validate_model_id(item.get("slug"), "Codex cache model")
+            except FinalKitError:
+                continue
+            if slug in seen:
+                continue
+            seen.add(slug)
+            levels: list[dict[str, str]] = []
+            level_names: set[str] = set()
+            raw_levels = item.get("supported_reasoning_levels")
+            if isinstance(raw_levels, list):
+                for raw_level in raw_levels:
+                    if isinstance(raw_level, str):
+                        effort = raw_level
+                        description = ""
+                    elif isinstance(raw_level, dict):
+                        effort = str(raw_level.get("effort") or "")
+                        description = re.sub(r"[\r\n]+", " ", str(raw_level.get("description") or "")).strip()
+                    else:
+                        continue
+                    effort = effort.strip().lower()
+                    if effort not in CODEX_REASONING_EFFORTS or effort in level_names:
+                        continue
+                    level_names.add(effort)
+                    levels.append({"reasoning": effort, "description": description[:500]})
+            default_reasoning = str(item.get("default_reasoning_level") or "").strip().lower()
+            if default_reasoning not in level_names:
+                default_reasoning = levels[0]["reasoning"] if levels else ""
+            catalog.append(
+                {
+                    "model": slug,
+                    "reasoning": levels,
+                    "default_reasoning": default_reasoning,
+                }
+            )
+        return catalog
+
+    @staticmethod
+    def _catalog_entry(catalog: list[dict[str, Any]], model: str) -> dict[str, Any] | None:
+        return next((entry for entry in catalog if entry.get("model") == model), None)
+
+    @staticmethod
+    def _prompt_compact(label: str, seed: str) -> str:
+        value = input(f"{label} [{seed}]: ").strip()
+        return value or seed
+
+    def configure_model_routes_interactive(self, provider: str) -> dict[str, Any]:
+        """Prompt for three independent Model/Reasoning pairs using compact labels."""
+
+        if provider not in VALID_MODES:
+            raise FinalKitError("provider must be deepseek, kimi, glm, or codex")
+        routes = self.model_routes_read_only()
+        target = routes["codex"] if provider == "codex" else routes["providers"][provider]
+        available: list[str] = []
+        codex_catalog: list[dict[str, Any]] = []
+        if provider == "codex":
+            codex_catalog = self.codex_local_model_catalog()
+            available = [str(entry["model"]) for entry in codex_catalog]
+            if available:
+                print("Models: " + ", ".join(available))
+                for entry in codex_catalog:
+                    choices = ", ".join(
+                        str(level["reasoning"]) for level in entry.get("reasoning", [])
+                    ) or "cache did not declare"
+                    print(f"  {entry['model']}: Reasoning={choices}")
+            else:
+                print("Models: local Codex cache unavailable; packaged routes remain editable.")
+        else:
+            try:
+                discovery = self.discover_provider_models(provider, limit=500)
+                available = [str(value) for value in discovery["models"]]
+                print("Models: " + ", ".join(available))
+            except FinalKitError as exc:
+                print(f"Models: official catalog unavailable ({exc}); current/package values remain editable.")
+            print("Reasoning: " + ", ".join(PROVIDER_REASONING_EFFORTS[provider]))
+
+        selected_models: dict[str, str] = {}
+        selected_reasoning: dict[str, str] = {}
+        print("Configure each Claude tier (only Model and Reasoning are stored):")
+        for role in CLAUDE_ROUTE_ROLES:
+            role_label = role.title()
+            model = self._prompt_compact(
+                f"{role_label} Model", str(target[f"model_{role}"])
+            )
+            model = self.validate_model_id(model, f"{role_label} Model")
+            if available and model not in available:
+                raise FinalKitError(
+                    f"{role_label} Model {model!r} is not in the current account catalog"
+                )
+            selected_models[role] = model
+
+            current_reasoning = str(target[f"reasoning_{role}"])
+            if provider == "codex":
+                entry = self._catalog_entry(codex_catalog, model)
+                supported = {
+                    str(level.get("reasoning")) for level in entry.get("reasoning", [])
+                } if entry else set()
+                seed = current_reasoning
+                if supported and seed not in supported:
+                    default_value = str(entry.get("default_reasoning") or "")
+                    seed = default_value if default_value in supported else sorted(supported)[0]
+                if supported:
+                    print(f"{role_label} Reasoning: " + ", ".join(sorted(supported)))
+                reasoning = self._prompt_compact(f"{role_label} Reasoning", seed)
+                reasoning = self.validate_reasoning_effort(
+                    reasoning, f"{role_label} Reasoning", set(CODEX_REASONING_EFFORTS)
+                )
+                if supported and reasoning not in supported:
+                    raise FinalKitError(
+                        f"{role_label} Model {model} does not support Reasoning={reasoning}; "
+                        f"choose: {', '.join(sorted(supported))}"
+                    )
+            else:
+                reasoning = self._prompt_compact(
+                    f"{role_label} Reasoning", current_reasoning
+                )
+                reasoning = self.validate_reasoning_effort(
+                    reasoning,
+                    f"{role_label} Reasoning",
+                    set(PROVIDER_REASONING_EFFORTS[provider]),
+                )
+            selected_reasoning[role] = reasoning
+
+        return self.update_model_routes(
+            provider,
+            opus=selected_models["opus"],
+            sonnet=selected_models["sonnet"],
+            haiku=selected_models["haiku"],
+            effort_opus=selected_reasoning["opus"],
+            effort_sonnet=selected_reasoning["sonnet"],
+            effort_haiku=selected_reasoning["haiku"],
+        )
 
     def update_model_routes(
         self,
@@ -748,6 +1038,9 @@ class RuntimeManager:
         sonnet: str | None = None,
         haiku: str | None = None,
         effort: str | None = None,
+        effort_opus: str | None = None,
+        effort_sonnet: str | None = None,
+        effort_haiku: str | None = None,
         dry_run: bool = False,
         restart: bool = False,
     ) -> dict[str, Any]:
@@ -755,36 +1048,55 @@ class RuntimeManager:
             raise FinalKitError("provider must be deepseek, kimi, glm, or codex")
         routes = self.model_routes()
         before = json.loads(json.dumps(routes))
+        # Keep --main/--fast/--effort as backwards-compatible shorthands while
+        # making every persisted route independent. Explicit role values win
+        # only when they agree with a supplied shorthand.
+        if main is not None:
+            if opus is not None and opus != main:
+                raise FinalKitError("--main conflicts with --opus")
+            if sonnet is not None and sonnet != main:
+                raise FinalKitError("--main conflicts with --sonnet")
+            opus = opus or main
+            sonnet = sonnet or main
+        if fast is not None:
+            if haiku is not None and haiku != fast:
+                raise FinalKitError("--fast conflicts with --haiku")
+            haiku = haiku or fast
+        role_efforts = {
+            "opus": effort_opus,
+            "sonnet": effort_sonnet,
+            "haiku": effort_haiku,
+        }
+        if effort is not None:
+            for role, role_effort in role_efforts.items():
+                if role_effort is not None and role_effort.lower() != effort.lower():
+                    raise FinalKitError(f"--reasoning conflicts with --reasoning-{role}")
+                role_efforts[role] = role_effort or effort
+        values = (opus, sonnet, haiku, *role_efforts.values())
+        if all(value is None for value in values):
+            raise FinalKitError(
+                "provide at least one role Model or Reasoning value"
+            )
         if provider in API_PROVIDERS:
-            if opus is not None or sonnet is not None or haiku is not None or effort is not None:
-                raise FinalKitError("API providers accept only --main and --fast")
-            if main is None and fast is None:
-                raise FinalKitError("provide --main and/or --fast")
             target = routes["providers"][provider]
-            if main is not None:
-                target["main"] = self.validate_model_id(main, f"{provider} main model")
-            if fast is not None:
-                target["fast"] = self.validate_model_id(fast, f"{provider} fast model")
+            allowed_efforts = set(PROVIDER_REASONING_EFFORTS[provider])
+            label = API_PROVIDERS[provider]["label"]
         else:
-            if main is not None or fast is not None:
-                raise FinalKitError("Codex accepts --opus, --sonnet, --haiku and --effort")
-            if all(value is None for value in (opus, sonnet, haiku, effort)):
-                raise FinalKitError("provide at least one of --opus, --sonnet, --haiku or --effort")
             target = routes["codex"]
-            if opus is not None:
-                target["opus"] = self.validate_model_id(opus, "Codex Opus-tier model")
-            if sonnet is not None:
-                target["sonnet"] = self.validate_model_id(sonnet, "Codex Sonnet-tier model")
-            if haiku is not None:
-                target["haiku"] = self.validate_model_id(haiku, "Codex Haiku-tier model")
-            if effort is not None:
-                effort = effort.strip().lower()
-                if effort not in CODEX_REASONING_EFFORTS:
-                    raise FinalKitError(
-                        "Codex reasoning effort must be one of: "
-                        + ", ".join(sorted(CODEX_REASONING_EFFORTS))
-                    )
-                target["reasoning_effort"] = effort
+            allowed_efforts = set(CODEX_REASONING_EFFORTS)
+            label = "Codex"
+        for role, model in (("opus", opus), ("sonnet", sonnet), ("haiku", haiku)):
+            if model is not None:
+                target[f"model_{role}"] = self.validate_model_id(
+                    model, f"{label} {role} model"
+                )
+            role_effort = role_efforts[role]
+            if role_effort is not None:
+                target[f"reasoning_{role}"] = self.validate_reasoning_effort(
+                    role_effort,
+                    f"{label} {role} reasoning",
+                    allowed_efforts,
+                )
         routes = self.validate_model_routes(routes)
         changed = routes != before
         restarted = False
@@ -911,6 +1223,36 @@ class RuntimeManager:
             raise FinalKitError("local endpoint returned non-object JSON")
         return parsed
 
+    def verify_gateway_science_identity(self, endpoint: str) -> None:
+        """Prove that a provider gateway exposes the local Science identity contract."""
+
+        base = endpoint.rstrip("/")
+        user = self.local_json(base + "/v1/userinfo")
+        org = self.local_json(base + "/v1/organization")
+        token = self.local_json(base + "/v1/oauth/session")
+        api_user = self.local_json(base + "/api/oauth/profile")
+        api_orgs = self.local_json(base + "/api/organizations")
+        api_token = self.local_json(base + "/api/oauth/session")
+        checks = (
+            user.get("id") == SCIENCE_LOCAL_ACCOUNT_UUID,
+            user.get("organization_uuid") == SCIENCE_LOCAL_ORG_UUID,
+            user.get("email") == "virtual@localhost.invalid",
+            org.get("id") == SCIENCE_LOCAL_ORG_UUID,
+            token.get("access_token") == SCIENCE_LOCAL_SESSION_TOKEN,
+            token.get("refresh_token") == "",
+            api_user.get("id") == SCIENCE_LOCAL_ACCOUNT_UUID,
+            api_user.get("organization_uuid") == SCIENCE_LOCAL_ORG_UUID,
+            isinstance(api_orgs.get("organizations"), list),
+            any(
+                isinstance(item, dict) and item.get("id") == SCIENCE_LOCAL_ORG_UUID
+                for item in api_orgs.get("organizations", [])
+            ),
+            api_token.get("access_token") == SCIENCE_LOCAL_SESSION_TOKEN,
+            api_token.get("refresh_token") == "",
+        )
+        if not all(checks):
+            raise FinalKitError("gateway local Science identity contract verification failed")
+
     def gateway_health(self, record: dict[str, Any] | None = None) -> dict[str, Any] | None:
         record = record or self.read_gateway_record()
         if not record:
@@ -980,12 +1322,13 @@ class RuntimeManager:
                     "path_secret": path_secret,
                     "provider": mode,
                     "upstream": provider["upstream"],
-                    "model_default": route["main"],
-                    "model_fast": route["fast"],
                     "instance_id": instance,
                     "profile_id": provider["profile_id"],
                     "offline_smoke": key_override is not None,
                 }
+                for role in CLAUDE_ROUTE_ROLES:
+                    config[f"model_{role}"] = route[f"model_{role}"]
+                    config[f"reasoning_{role}"] = route[f"reasoning_{role}"]
                 config_fd = pipe_with(json.dumps(config, separators=(",", ":")).encode("utf-8"))
                 key_fd = pipe_with(api_key.encode("utf-8"))
                 inherited_fds.extend((config_fd, key_fd))
@@ -997,7 +1340,7 @@ class RuntimeManager:
                     "--key-fd",
                     str(key_fd),
                 ]
-                environment = private_child_environment(self.p.science_home)
+                environment = private_child_environment(self.p.client_home)
                 endpoint = f"http://127.0.0.1:{self.gateway_port}/{path_secret}"
                 cwd = self.p.runtime
             else:
@@ -1010,7 +1353,7 @@ class RuntimeManager:
                 inherited_fds.extend((control_fd, instance_fd))
                 command = [str(self.p.bridge_python), str(self.p.bridge / "proxy.py")]
                 environment = codex_network_environment(
-                    self.p.science_home, "https://chatgpt.com/backend-api/codex"
+                    self.p.client_home, "https://chatgpt.com/backend-api/codex"
                 )
                 environment.update(
                     {
@@ -1110,11 +1453,16 @@ class RuntimeManager:
         for name in ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
             environment.pop(name, None)
         environment["ANTHROPIC_BASE_URL"] = endpoint
+        environment["ANTHROPIC_AUTH_TOKEN"] = SCIENCE_LOCAL_SESSION_TOKEN
+        # Science distinguishes an explicitly selected third-party provider
+        # (empty API-key slot + auth token) from a missing credential source.
+        # This empty sentinel is not a provider key and never reaches storage.
+        environment["ANTHROPIC_API_KEY"] = ""
         append_no_proxy(environment)
         return environment
 
     def ensure_science_identity(self, *, check_only: bool = False) -> dict[str, Any]:
-        """Remove only obsolete FinalKit identities and preserve Science-owned auth."""
+        """Create/reuse only FinalKit's identity; never overwrite real credentials."""
 
         result = subprocess.run(
             [
@@ -1143,6 +1491,11 @@ class RuntimeManager:
             raise FinalKitError("Science local identity helper returned invalid JSON") from exc
         if not isinstance(payload, dict) or payload.get("ok") is not True:
             raise FinalKitError("Science local identity helper did not verify its result")
+        if not check_only and payload.get("schema") != "science-local-v2":
+            raise FinalKitError(
+                "the isolated Science profile contains unknown or real credentials; "
+                "FinalKit preserved them and refused to replace them with its local identity"
+            )
         return payload
 
     def science_process_identity(self, pid: int) -> bool:
@@ -1205,6 +1558,26 @@ class RuntimeManager:
                 return False
         return True
 
+    @staticmethod
+    def science_startup_io_pending(status: dict[str, Any]) -> bool:
+        """Recognize only the owned D-state result produced by our status path.
+
+        Claude Science 0.1.27 can spend several seconds in uninterruptible ext4
+        database I/O immediately after ``serve --detached`` returns. That state
+        is safe to wait for only inside the bounded readiness loop and only after
+        the normal PID/argv/HOME/data-dir/lock checks identify this exact owner.
+        Steady-state status, doctor, and stop remain fail-closed.
+        """
+
+        return (
+            status.get("control_error") == "unavailable"
+            and status.get("running") is True
+            and status.get("owned") is True
+            and str(status.get("process_state") or "").upper() == "D"
+            and "owner is blocked in uninterruptible I/O"
+            in str(status.get("detail") or "")
+        )
+
     def _science_status_once(self) -> dict[str, Any]:
         if not self.p.science.is_file():
             return {"running": False}
@@ -1245,17 +1618,17 @@ class RuntimeManager:
                     "Claude Science status PID failed FinalKit owner identity verification",
                     owner or ({"pid": pid, "owned": False, "process_state": process_state(pid) or "unknown"} if pid else None),
                 )
+            if owner and (not owner.get("owned") or int(owner.get("pid", 0) or 0) != pid):
+                return self.science_control_error(
+                    "Claude Science status PID conflicts with the live operon.lock owner",
+                    owner,
+                )
             if self.science_process_persistently_blocked(pid):
                 blocked_owner = owner or {"pid": pid, "owned": True}
                 blocked_owner["process_state"] = "D"
                 return self.science_control_error(
                     "Claude Science owner is blocked in uninterruptible I/O; its page and control socket are not reliable",
                     blocked_owner,
-                )
-            if owner and (not owner.get("owned") or int(owner.get("pid", 0) or 0) != pid):
-                return self.science_control_error(
-                    "Claude Science status PID conflicts with the live operon.lock owner",
-                    owner,
                 )
         elif owner:
             return self.science_control_error(
@@ -1361,18 +1734,19 @@ class RuntimeManager:
         if current.get("running"):
             pid = int(current.get("pid", 0) or 0)
             if process_environment(pid).get("ANTHROPIC_BASE_URL") == endpoint:
+                if ensure_identity:
+                    current["local_session"] = self.verify_science_local_session()
                 return current
             raise FinalKitError("Claude Science is running with a different backend endpoint")
 
         if ensure_identity:
             identity = self.ensure_science_identity()
-            if str(identity.get("action", "")).startswith("removed-"):
-                print("Removed an obsolete FinalKit virtual OAuth identity; sign in to Claude Science with a supported Claude account.")
-            if identity.get("schema") == "science-login-required":
+            if identity.get("action") == "created":
                 print(
-                    "Claude Science account sign-in is required in the web UI. "
-                    "Provider API keys and ChatGPT/Codex login authenticate the local gateway only."
+                    "Created FinalKit's local-only Science identity inside the isolated profile."
                 )
+            elif str(identity.get("action", "")).startswith("migrated-"):
+                print("Migrated an exact legacy FinalKit identity to the current local-only shape.")
         environment = self.science_environment(endpoint)
         with open(self.p.science_boot_log, "a", encoding="utf-8") as log_handle:
             os.chmod(self.p.science_boot_log, 0o600)
@@ -1402,50 +1776,164 @@ class RuntimeManager:
                 f"Claude Science start returned {result.returncode}; see {self.p.science_boot_log}"
             )
 
-        for _ in range(160):
+        ready_deadline = time.monotonic() + SCIENCE_START_READY_SECONDS
+        local_session: dict[str, Any] | None = None
+        while time.monotonic() < ready_deadline:
             current = self.science_status()
             if current.get("control_error"):
+                if self.science_startup_io_pending(current):
+                    time.sleep(0.25)
+                    continue
                 raise FinalKitError(self.science_recovery_message(current))
             if current.get("running") and int(current.get("port", 0) or 0) == self.science_port:
                 pid = int(current.get("pid", 0) or 0)
                 if process_environment(pid).get("ANTHROPIC_BASE_URL") == endpoint:
+                    if ensure_identity:
+                        if local_session is None:
+                            local_session = self.verify_science_local_session(
+                                startup_deadline=ready_deadline
+                            )
+                            # Admission can trigger one final ext4 database
+                            # write. Require another fully owned healthy status
+                            # before declaring startup stable, while retaining
+                            # the same bounded startup-only D-state tolerance.
+                            time.sleep(0.25)
+                            continue
+                        current["local_session"] = local_session
                     return current
             time.sleep(0.25)
         raise FinalKitError(f"Claude Science did not become ready; see {self.p.science_boot_log}")
 
-    def science_url(self) -> str:
+    def science_url(self, *, startup_deadline: float | None = None) -> str:
         environment = science_child_environment(self.p.science_home)
-        result = subprocess.run(
-            [str(self.p.science), "url", "--data-dir", str(self.p.data_dir)],
-            env=environment,
-            cwd=self.p.science_home,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=20,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise FinalKitError(result.stderr.strip() or "could not create a Claude Science login URL")
+        while True:
+            result = subprocess.run(
+                [str(self.p.science), "url", "--data-dir", str(self.p.data_dir)],
+                env=environment,
+                cwd=self.p.science_home,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=20,
+                check=False,
+            )
+            if result.returncode == 0:
+                break
+            detail = result.stderr.strip() or result.stdout.strip()
+            transient = "could not reach daemon control socket" in detail.lower()
+            owner = self.science_lock_process() if transient else None
+            if (
+                startup_deadline is not None
+                and time.monotonic() < startup_deadline
+                and owner
+                and owner.get("owned") is True
+            ):
+                time.sleep(0.25)
+                continue
+            raise FinalKitError(detail or "could not create a Claude Science login URL")
         for line in reversed(result.stdout.splitlines()):
             value = line.strip()
             if value.startswith("http://") or value.startswith("https://"):
                 return value
         raise FinalKitError("Claude Science did not return a login URL")
 
-    def science_endpoint_matches(self, endpoint: str) -> bool:
-        status_value = self.science_status()
+    @staticmethod
+    def science_login_target(login_url: str, expected_port: int) -> tuple[str, str]:
+        parsed = urllib.parse.urlsplit(login_url)
+        try:
+            actual_port = parsed.port
+        except ValueError as exc:
+            raise FinalKitError("Claude Science returned a malformed login URL port") from exc
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "localhost"}
+            or actual_port != expected_port
+        ):
+            raise FinalKitError("Claude Science returned a non-loopback login URL")
+        try:
+            values = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+        except ValueError as exc:
+            raise FinalKitError("Claude Science returned a malformed login URL") from exc
+        nonce = values.get("nonce", [])
+        if len(nonce) != 1 or not nonce[0]:
+            raise FinalKitError("Claude Science login URL did not contain one nonce")
+        return f"http://127.0.0.1:{expected_port}", nonce[0]
+
+    def verify_science_local_session(
+        self, *, startup_deadline: float | None = None
+    ) -> dict[str, Any]:
+        """Exercise Science's loopback nonce gate without touching browser state.
+
+        The initial ``Sign in`` document is the daemon's local CSRF/session
+        boundary, not proof that a Claude.ai account is required.  This probe
+        obtains its own one-time URL, submits the nonce into an in-memory cookie
+        jar, then requires both the authenticated ``/api/me`` surface and the
+        workbench document.  The separate URL returned to Windows remains
+        unused and must still be accepted by the user's browser.
+        """
+
+        login_url = self.science_url(startup_deadline=startup_deadline)
+        origin, nonce = self.science_login_target(login_url, self.science_port)
+        cookies = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(cookies)
+        )
+        form = urllib.parse.urlencode({"nonce": nonce, "dest": "/"}).encode("ascii")
+        request = urllib.request.Request(
+            origin + "/api/auth/nonce",
+            data=form,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        try:
+            with opener.open(request, timeout=10) as response:
+                if response.status != 200:
+                    raise FinalKitError(
+                        f"Claude Science local nonce admission returned HTTP {response.status}"
+                    )
+            with opener.open(origin + "/api/me", timeout=10) as response:
+                if response.status != 200:
+                    raise FinalKitError(
+                        f"Claude Science local identity returned HTTP {response.status}"
+                    )
+                profile = json.loads(response.read().decode("utf-8"))
+            with opener.open(origin + "/", timeout=10) as response:
+                if response.status != 200:
+                    raise FinalKitError(
+                        f"Claude Science workbench returned HTTP {response.status}"
+                    )
+                document = response.read().decode("utf-8", errors="replace")
+        except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
+            raise FinalKitError(
+                f"Claude Science local session admission failed: {type(exc).__name__}"
+            ) from exc
+        if not isinstance(profile, dict):
+            raise FinalKitError("Claude Science /api/me returned a non-object profile")
+        title = re.search(r"<title>\s*Claude Science\s*</title>", document, flags=re.IGNORECASE)
+        if title is None:
+            raise FinalKitError("Claude Science did not admit the local session to its workbench")
+        return {"admitted": True, "profile": "local", "cookies": len(cookies)}
+
+    @staticmethod
+    def science_status_endpoint_matches(status_value: dict[str, Any], endpoint: str) -> bool:
         if status_value.get("control_error") or not status_value.get("running"):
             return False
         pid = int(status_value.get("pid", 0) or 0)
         return process_environment(pid).get("ANTHROPIC_BASE_URL") == endpoint
 
+    def science_endpoint_matches(self, endpoint: str) -> bool:
+        return self.science_status_endpoint_matches(self.science_status(), endpoint)
+
     def ensure_bridge_config(self) -> None:
         route = self.model_routes()["codex"]
-        codex_opus_model = route["opus"]
-        codex_sonnet_model = route["sonnet"]
-        codex_haiku_model = route["haiku"]
-        codex_reasoning_effort = route["reasoning_effort"]
+        codex_opus_model = route["model_opus"]
+        codex_sonnet_model = route["model_sonnet"]
+        codex_haiku_model = route["model_haiku"]
+        codex_reasoning_map = {
+            "claude-opus": route["reasoning_opus"],
+            "claude-sonnet": route["reasoning_sonnet"],
+            "claude-haiku": route["reasoning_haiku"],
+        }
         config = {
             "deepseek_api_key": "",
             "openai_api_key": "",
@@ -1459,7 +1947,8 @@ class RuntimeManager:
             "codex_client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
             "codex_backend_url": "https://chatgpt.com/backend-api/codex",
             "codex_model": codex_opus_model,
-            "codex_reasoning_effort": codex_reasoning_effort,
+            "codex_reasoning": route["reasoning_opus"],
+            "codex_reasoning_map": codex_reasoning_map,
             "codex_model_map": {
                 # Claude Science owns these UI compatibility IDs.  The
                 # connector maps every current/future version suffix within a
@@ -1498,22 +1987,17 @@ class RuntimeManager:
         routes = routes or self.model_routes()
         if mode in API_PROVIDERS:
             provider = API_PROVIDERS[mode]
-            main = routes["providers"][mode]["main"]
-            fast = routes["providers"][mode]["fast"]
-            return (
-                f"Opus/Sonnet request aliases -> {provider['label']} {main}; "
-                f"Haiku request alias -> {provider['label']} {fast}"
-            )
+            route = routes["providers"][mode]
+            return "; ".join(
+                f"{role.title()}: Model={route[f'model_{role}']}, Reasoning={route[f'reasoning_{role}']}"
+                for role in CLAUDE_ROUTE_ROLES
+            ) + f" ({provider['label']})"
         if mode == "codex":
-            opus = routes["codex"]["opus"]
-            sonnet = routes["codex"]["sonnet"]
-            haiku = routes["codex"]["haiku"]
-            effort = routes["codex"]["reasoning_effort"]
-            return (
-                f"Opus request alias -> ChatGPT Codex {opus} (effort={effort}); "
-                f"Sonnet -> {sonnet} (effort={effort}); "
-                f"Haiku -> {haiku} (effort={effort})"
-            )
+            route = routes["codex"]
+            return "; ".join(
+                f"{role.title()}: Model={route[f'model_{role}']}, Reasoning={route[f'reasoning_{role}']}"
+                for role in CLAUDE_ROUTE_ROLES
+            ) + " (ChatGPT Codex)"
         return "unconfigured"
 
     @staticmethod
@@ -1556,12 +2040,35 @@ class RuntimeManager:
             raise FinalKitError(self.science_recovery_message(previous_science_status))
         previous_science_running = bool(previous_science_status.get("running"))
 
+        # A non-Science client may reuse the backend already serving Science,
+        # but it must never stop or restart the live Science daemon merely to
+        # select another provider.  Provider changes for Science remain an
+        # explicit ``fkctl start <mode>`` operation with its normal rollback.
+        if not start_science and previous_science_running:
+            if (
+                previous_gateway_running
+                and previous_record
+                and previous_record.get("backend") == mode
+                and self.science_status_endpoint_matches(
+                    previous_science_status, str(previous_record["endpoint"])
+                )
+            ):
+                self.write_mode(mode)
+                return str(previous_record["endpoint"])
+            raise FinalKitError(
+                "Claude Science is running; a non-Science gateway selection will not "
+                "stop or reroute it. Use 'fkctl start <mode>' to explicitly switch "
+                "Science, or stop Science first."
+            )
+
         if previous_science_running:
             if not previous_gateway_running or not previous_record:
                 raise FinalKitError(
                     "Claude Science is running without a healthy owned gateway; run fkctl stop before switching"
                 )
-            if not self.science_endpoint_matches(str(previous_record["endpoint"])):
+            if not self.science_status_endpoint_matches(
+                previous_science_status, str(previous_record["endpoint"])
+            ):
                 raise FinalKitError(
                     "Claude Science and the owned gateway have different endpoints; run fkctl stop before switching"
                 )
@@ -1577,8 +2084,12 @@ class RuntimeManager:
             and previous_record
             and previous_record.get("backend") == mode
         ):
-            if start_science and self.science_endpoint_matches(str(previous_record["endpoint"])):
-                return self.science_url()
+            if start_science and self.science_status_endpoint_matches(
+                previous_science_status, str(previous_record["endpoint"])
+            ):
+                admission_deadline = time.monotonic() + SCIENCE_START_READY_SECONDS
+                self.verify_science_local_session(startup_deadline=admission_deadline)
+                return self.science_url(startup_deadline=admission_deadline)
             if not start_science:
                 return str(previous_record["endpoint"])
 
@@ -1586,14 +2097,20 @@ class RuntimeManager:
         self.stop_gateway()
         try:
             endpoint = self.spawn_gateway(mode)
+            started_science: dict[str, Any] | None = None
             if start_science:
-                self.science_start(endpoint)
+                started_science = self.science_start(endpoint)
             if not self.gateway_health() or (
-                start_science and not self.science_endpoint_matches(endpoint)
+                start_science
+                and not self.science_status_endpoint_matches(started_science or {}, endpoint)
             ):
                 raise FinalKitError("post-switch runtime identity verification failed")
             self.write_mode(mode)
-            return self.science_url() if start_science else endpoint
+            if start_science:
+                return self.science_url(
+                    startup_deadline=time.monotonic() + SCIENCE_START_READY_SECONDS
+                )
+            return endpoint
         except Exception as primary_error:
             rollback_errors: list[str] = []
             try:
@@ -1661,7 +2178,7 @@ class RuntimeManager:
                 raise FinalKitError(f"Claude Science did not create {key_file}")
             identity = self.ensure_science_identity()
             print(
-                "Science credential boundary is ready "
+                "Science local identity is ready "
                 f"({identity.get('schema', 'unknown')}; {identity.get('action', 'verified')})."
             )
 
@@ -1673,16 +2190,19 @@ class RuntimeManager:
         if not first or "\n" in first or "\r" in first:
             raise FinalKitError("API key cannot be empty or contain a newline")
         key_path = self.p.provider_keys[provider_name]
-        atomic_write(key_path, first)
-        first = ""
-        print(f"{provider['label']} key saved inside this Linux user's WSL home: {key_path}")
+        with FileLock(self.p.lock):
+            atomic_write(key_path, first)
+            first = ""
+            print(f"{provider['label']} key saved inside this Linux user's WSL home: {key_path}")
+            result = self.configure_model_routes_interactive(provider_name)
+        print("Route: " + self.route_description(provider_name, result["routes"]))
 
     def configure_codex(self) -> None:
         self.require_runtime()
         with FileLock(self.p.lock):
             self.ensure_bridge_config()
             environment = codex_network_environment(
-                self.p.science_home,
+                self.p.client_home,
                 "https://auth.openai.com",
             )
             print("Starting the official Codex browser login in Claude Science's isolated home.")
@@ -1693,6 +2213,8 @@ class RuntimeManager:
                 "the official Codex browser login did not complete. "
                 "If localhost OAuth is unavailable, run: fkctl configure-codex-device",
             )
+            result = self.configure_model_routes_interactive("codex")
+        print("Route: " + self.route_description("codex", result["routes"]))
 
     def configure_codex_device(self) -> None:
         """Explicit beta fallback for headless or blocked localhost OAuth."""
@@ -1701,7 +2223,7 @@ class RuntimeManager:
         with FileLock(self.p.lock):
             self.ensure_bridge_config()
             environment = codex_network_environment(
-                self.p.science_home,
+                self.p.client_home,
                 "https://auth.openai.com/api/accounts/deviceauth/usercode",
             )
             print("Starting the official Codex device-code login (beta).")
@@ -1712,6 +2234,89 @@ class RuntimeManager:
                 "the official Codex device login did not complete. Use fkctl configure-codex "
                 "for the default browser flow, or enable device login in ChatGPT settings",
             )
+            result = self.configure_model_routes_interactive("codex")
+        print("Route: " + self.route_description("codex", result["routes"]))
+
+    @staticmethod
+    def _validate_imported_codex_auth(payload: bytes | bytearray) -> None:
+        """Admit only an official ChatGPT token chain without exposing its values."""
+
+        if not payload or len(payload) > MAX_CODEX_AUTH_BYTES:
+            raise FinalKitError("the imported Codex auth payload is empty or exceeds 1 MiB")
+        try:
+            value = json.loads(bytes(payload).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FinalKitError("the imported Codex auth payload is not valid UTF-8 JSON") from exc
+        if not isinstance(value, dict) or value.get("auth_mode") != "chatgpt":
+            raise FinalKitError("the imported auth must be an official Codex ChatGPT login")
+        tokens = value.get("tokens")
+        if not isinstance(tokens, dict) or not all(
+            isinstance(tokens.get(name), str) and bool(tokens.get(name))
+            for name in ("access_token", "refresh_token")
+        ):
+            raise FinalKitError("the imported ChatGPT auth token chain is incomplete")
+
+    def import_codex_auth(self, payload: bytearray) -> None:
+        """One-time stdin import into the WSL-owned official Codex cache.
+
+        The caller must stop Science and its gateway first. The candidate is
+        validated in a temporary HOME, then atomically replaces the WSL cache.
+        A failed final validation restores the prior file byte-for-byte. Once
+        committed, the Linux Codex CLI and connector independently own future
+        refreshes and re-login; there is no recurring Windows synchronization.
+        """
+
+        self.require_runtime()
+        self._validate_imported_codex_auth(payload)
+        with FileLock(self.p.lock):
+            science_status = self.science_status()
+            if science_status.get("control_error"):
+                raise FinalKitError(self.science_recovery_message(science_status))
+            if science_status.get("running") or self.read_gateway_record():
+                raise FinalKitError(
+                    "stop the active FinalKit Science/gateway before importing Codex auth"
+                )
+
+            self.ensure_bridge_config()
+            auth = self.p.codex_auth
+            auth.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            auth.parent.chmod(0o700)
+            previous = bytearray(auth.read_bytes()) if auth.is_file() else None
+            previous_mode = stat.S_IMODE(auth.stat().st_mode) if auth.is_file() else 0o600
+            replaced = False
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix=".codex-import.", dir=self.p.client_home
+                ) as scratch:
+                    staging_home = Path(scratch)
+                    staged_auth = staging_home / ".codex" / "auth.json"
+                    atomic_write_bytes(staged_auth, payload)
+                    staging_environment = private_child_environment(staging_home)
+                    if not self._codex_login_status(staging_environment):
+                        raise FinalKitError(
+                            "official Codex login status did not validate the imported auth"
+                        )
+                    os.replace(staged_auth, auth)
+                    replaced = True
+                    auth.chmod(0o600)
+
+                self._finalize_codex_auth(private_child_environment(self.p.client_home))
+            except Exception:
+                if replaced:
+                    if previous is None:
+                        auth.unlink(missing_ok=True)
+                    else:
+                        atomic_write_bytes(auth, previous, previous_mode)
+                raise
+            finally:
+                if previous is not None:
+                    for index in range(len(previous)):
+                        previous[index] = 0
+
+        print(
+            "One-time Codex auth import committed. WSL now owns its independent "
+            "refresh and re-login lifecycle."
+        )
 
     def _replace_codex_auth(
         self,
@@ -1723,7 +2328,7 @@ class RuntimeManager:
         auth = self.p.codex_auth
         auth.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         auth.parent.chmod(0o700)
-        with tempfile.TemporaryDirectory(prefix=".codex-login.", dir=self.p.science_home) as scratch:
+        with tempfile.TemporaryDirectory(prefix=".codex-login.", dir=self.p.client_home) as scratch:
             staging_home = Path(scratch)
             staging_environment = environment.copy()
             staging_environment["HOME"] = str(staging_home)
@@ -1793,7 +2398,7 @@ class RuntimeManager:
         if not self.codex_auth_configured():
             return False
         try:
-            environment = private_child_environment(self.p.science_home)
+            environment = private_child_environment(self.p.client_home)
             return self._codex_login_status(environment)
         except (OSError, subprocess.SubprocessError):
             return False
@@ -1829,7 +2434,8 @@ class RuntimeManager:
         ):
             environment.pop(name, None)
         environment["ANTHROPIC_BASE_URL"] = str(record["endpoint"])
-        environment["ANTHROPIC_AUTH_TOKEN"] = "finalkit-local-token"
+        environment["ANTHROPIC_AUTH_TOKEN"] = SCIENCE_LOCAL_SESSION_TOKEN
+        environment["ANTHROPIC_API_KEY"] = ""
         append_no_proxy(environment)
         result = subprocess.run([str(self.p.claude), *arguments], env=environment, check=False)
         return result.returncode
@@ -1844,6 +2450,7 @@ class RuntimeManager:
                 record = self.read_gateway_record()
                 if not record or not self.gateway_identity(record) or not self.gateway_health(record):
                     raise FinalKitError("an unhealthy runtime is active; stop or repair it before smoke")
+                self.verify_gateway_science_identity(str(record["endpoint"]))
                 if science_status.get("running") and not self.science_endpoint_matches(str(record["endpoint"])):
                     raise FinalKitError("Science/backend endpoint mismatch")
                 client_state = "Science running" if science_status.get("running") else "gateway-only"
@@ -1856,14 +2463,23 @@ class RuntimeManager:
                     health = self.gateway_health()
                     if not health or health.get("finalkit_backend") != provider_name:
                         raise FinalKitError(f"local {provider_name} gateway identity verification failed")
+                    self.verify_gateway_science_identity(endpoint)
                     passed.append(provider_name)
                 finally:
                     self.stop_gateway()
             endpoint = self.spawn_gateway("deepseek", key_override="finalkit-local-smoke-key")
             try:
                 self.science_start(endpoint)
-                if not self.gateway_health() or not self.science_endpoint_matches(endpoint):
-                    raise FinalKitError("Claude Science/local gateway identity verification failed")
+                self.verify_gateway_science_identity(endpoint)
+                identity = self.ensure_science_identity(check_only=True)
+                gateway_ok = bool(self.gateway_health())
+                endpoint_ok = self.science_endpoint_matches(endpoint)
+                identity_schema = str(identity.get("schema") or "unknown")
+                if not gateway_ok or not endpoint_ok or identity_schema != "science-local-v2":
+                    raise FinalKitError(
+                        "Claude Science/local gateway identity verification failed "
+                        f"(gateway={gateway_ok}, endpoint={endpoint_ok}, identity={identity_schema})"
+                    )
             finally:
                 self.science_stop()
                 self.stop_gateway()
@@ -1912,12 +2528,12 @@ class RuntimeManager:
         except (FileNotFoundError, json.JSONDecodeError, TypeError) as exc:
             raise FinalKitError("connector route config is unavailable") from exc
         model_map = config.get("codex_model_map", {})
-        if not isinstance(model_map, dict):
-            raise FinalKitError("connector Codex model map is invalid")
-        effort = str(config.get("codex_reasoning_effort") or "").strip().lower()
+        reasoning_map = config.get("codex_reasoning_map", {})
+        if not isinstance(model_map, dict) or not isinstance(reasoning_map, dict):
+            raise FinalKitError("connector Codex route maps are invalid")
         aliases = tuple(
             (
-                f"{family.removeprefix('claude-')} -> {model_map.get(family)} ({effort})",
+                f"{family.removeprefix('claude-')} -> {model_map.get(family)} ({reasoning_map.get(family)})",
                 alias,
             )
             for family, alias in (
@@ -1926,14 +2542,16 @@ class RuntimeManager:
                 ("claude-haiku", "claude-haiku-4-5-20251001"),
             )
         )
-        if effort not in CODEX_REASONING_EFFORTS or any(
-            not isinstance(model_map.get(family), str) or not model_map.get(family)
+        if any(
+            not isinstance(model_map.get(family), str)
+            or not model_map.get(family)
+            or str(reasoning_map.get(family, "")).lower() not in CODEX_REASONING_EFFORTS
             for family in ("claude-opus", "claude-sonnet", "claude-haiku")
         ):
             raise FinalKitError("connector Codex three-tier route is incomplete")
         catalog = self.codex_model_catalog(record)
         expected_catalog = {
-            alias: f"ChatGPT Codex | {model_map[family]} | {effort}"
+            alias: f"ChatGPT Codex | {model_map[family]} | reasoning={reasoning_map[family]}"
             for family, alias in (
                 ("claude-opus", "claude-opus-4-8"),
                 ("claude-sonnet", "claude-sonnet-4-5"),
@@ -1957,7 +2575,7 @@ class RuntimeManager:
         }
         return {
             "route": self.route_description("codex"),
-            "reasoning_effort": effort,
+            "reasoning": reasoning_map,
             "model_catalog": catalog,
             "tiers": results,
         }
@@ -1996,15 +2614,12 @@ class RuntimeManager:
                 add(f"{label} permission 600", stat.S_IMODE(path.stat().st_mode) == 0o600)
         try:
             science_identity = self.ensure_science_identity(check_only=True)
-            science_identity_ok = science_identity.get("schema") in {
-                "science-login-required",
-                "science-credentials-preserved",
-            }
+            science_identity_ok = science_identity.get("schema") == "science-local-v2"
         except FinalKitError as exc:
             science_identity_ok = False
             science_identity = {"error": str(exc)}
         add(
-            "isolated Science credential boundary",
+            "isolated Science local identity",
             science_identity_ok,
             str(science_identity.get("schema") or science_identity.get("error") or self.p.data_dir),
         )
@@ -2034,16 +2649,19 @@ class RuntimeManager:
             config_ok = False
         add("connector config JSON", config_ok, str(self.p.bridge_config))
         model_map = config.get("codex_model_map", {})
-        effort = str(config.get("codex_reasoning_effort", "")).strip().lower()
+        reasoning_map = config.get("codex_reasoning_map", {})
         codex_route = routes.get("codex", {}) if isinstance(routes, dict) else {}
         route_ok = (
             routes_ok
             and isinstance(model_map, dict)
-            and model_map.get("claude-opus") == codex_route.get("opus")
-            and model_map.get("claude-sonnet") == codex_route.get("sonnet")
-            and model_map.get("claude-haiku") == codex_route.get("haiku")
+            and isinstance(reasoning_map, dict)
+            and model_map.get("claude-opus") == codex_route.get("model_opus")
+            and model_map.get("claude-sonnet") == codex_route.get("model_sonnet")
+            and model_map.get("claude-haiku") == codex_route.get("model_haiku")
+            and reasoning_map.get("claude-opus") == codex_route.get("reasoning_opus")
+            and reasoning_map.get("claude-sonnet") == codex_route.get("reasoning_sonnet")
+            and reasoning_map.get("claude-haiku") == codex_route.get("reasoning_haiku")
             and not config.get("force_model")
-            and effort == codex_route.get("reasoning_effort")
         )
         route_detail = (
             self.route_description("codex", routes)
@@ -2056,7 +2674,7 @@ class RuntimeManager:
             patch_ok = all(marker in proxy_text for marker in (
                 "FINALKIT_CONTROL_FD",
                 "finalkit_backend",
-                "codex_reasoning_effort",
+                "codex_reasoning_map",
                 "mapped_from_alias",
                 "Expose the real Codex route behind Claude-compatible model IDs",
             ))
@@ -2095,10 +2713,10 @@ class RuntimeManager:
                 f"{'configured' if self.p.provider_keys[name].is_file() else 'not configured'}"
             )
         print(f"[INFO] ChatGPT Codex auth: {'configured' if self.codex_auth_configured() else 'not configured'}")
-        if science_identity.get("schema") == "science-login-required":
-            print("[INFO] Claude Science account: sign-in required in the Science web UI")
+        if science_identity.get("schema") == "science-local-v2":
+            print("[INFO] Claude Science identity: FinalKit local-only profile; no Claude account used")
         elif science_identity.get("schema") == "science-credentials-preserved":
-            print("[INFO] Claude Science account: credential state preserved; confirm sign-in in the web UI")
+            print("[INFO] Claude Science identity: unknown/real credentials preserved; direct start is blocked")
         record = self.read_gateway_record()
         if record and self.gateway_identity(record) and self.gateway_health(record):
             print(f"[OK] active gateway: {record.get('backend')} (identity verified)")
@@ -2151,18 +2769,24 @@ class RuntimeManager:
             if record and health:
                 print(
                     "Runtime identity:    "
-                    + ("matched" if self.science_endpoint_matches(str(record["endpoint"])) else "MISMATCH")
+                    + (
+                        "matched"
+                        if self.science_status_endpoint_matches(science, str(record["endpoint"]))
+                        else "MISMATCH"
+                    )
                 )
         else:
             print("Claude Science:     stopped")
         try:
             identity = self.ensure_science_identity(check_only=True)
-            if identity.get("schema") == "science-login-required":
-                print("Science account:    sign-in required in the Science web UI")
+            if identity.get("schema") == "science-local-v2":
+                print("Science identity:   FinalKit local-only; no Claude account used")
+            elif identity.get("schema") == "science-local-missing":
+                print("Science identity:   not initialized; run update-runtime or init-profile")
             else:
-                print("Science account:    credential state preserved; confirm in the web UI")
+                print("Science identity:   unknown/real credentials preserved; direct start is blocked")
         except FinalKitError as exc:
-            print(f"Science account:    credential audit failed ({exc})")
+            print(f"Science identity:   credential audit failed ({exc})")
 
     def capabilities(self) -> None:
         """Machine-readable command support; package versions never gate use."""
@@ -2191,6 +2815,10 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_parser(f"configure-{provider_name}")
     sub.add_parser("configure-codex")
     sub.add_parser("configure-codex-device")
+    sub.add_parser(
+        "import-codex-auth",
+        help="one-time import of an official ChatGPT Codex auth JSON from stdin",
+    )
     sub.add_parser("login-linux-codex")
     claude = sub.add_parser("claude", help="run native Claude Code through a selected FinalKit backend")
     claude.add_argument("mode", choices=sorted(VALID_MODES))
@@ -2221,7 +2849,16 @@ def build_parser() -> argparse.ArgumentParser:
     update_models.add_argument("--opus")
     update_models.add_argument("--sonnet")
     update_models.add_argument("--haiku")
-    update_models.add_argument("--effort", choices=sorted(CODEX_REASONING_EFFORTS))
+    update_models.add_argument(
+        "--reasoning", "--effort", dest="effort", choices=sorted(GENERIC_REASONING_EFFORTS)
+    )
+    for role in CLAUDE_ROUTE_ROLES:
+        update_models.add_argument(
+            f"--reasoning-{role}",
+            f"--effort-{role}",
+            dest=f"effort_{role}",
+            choices=sorted(GENERIC_REASONING_EFFORTS),
+        )
     update_models.add_argument("--dry-run", action="store_true")
     update_models.add_argument("--restart", action="store_true")
     update_models.add_argument("--json", action="store_true", dest="as_json")
@@ -2253,6 +2890,15 @@ def main() -> int:
             manager.configure_codex()
         elif args.command == "configure-codex-device":
             manager.configure_codex_device()
+        elif args.command == "import-codex-auth":
+            if sys.stdin.isatty():
+                raise FinalKitError("import-codex-auth accepts auth JSON only through stdin")
+            payload = bytearray(sys.stdin.buffer.read(MAX_CODEX_AUTH_BYTES + 1))
+            try:
+                manager.import_codex_auth(payload)
+            finally:
+                for index in range(len(payload)):
+                    payload[index] = 0
         elif args.command == "login-linux-codex":
             manager.login_linux_codex()
         elif args.command == "claude":
@@ -2288,12 +2934,20 @@ def main() -> int:
             else:
                 for provider_name in API_PROVIDERS:
                     route = routes["providers"][provider_name]
-                    print(f"{provider_name}: main={route['main']} fast={route['fast']}")
+                    print(
+                        f"{provider_name}: "
+                        + " ".join(
+                            f"{role}=({route[f'model_{role}']}, {route[f'reasoning_{role}']})"
+                            for role in CLAUDE_ROUTE_ROLES
+                        )
+                    )
                 route = routes["codex"]
                 print(
                     "codex: "
-                    f"opus={route['opus']} sonnet={route['sonnet']} "
-                    f"haiku={route['haiku']} effort={route['reasoning_effort']}"
+                    + " ".join(
+                        f"{role}=({route[f'model_{role}']}, {route[f'reasoning_{role}']})"
+                        for role in CLAUDE_ROUTE_ROLES
+                    )
                 )
                 print(f"CONFIG={manager.p.model_routes}")
         elif args.command == "discover-models":
@@ -2308,14 +2962,12 @@ def main() -> int:
                 for index, model in enumerate(result["models"], start=1):
                     print(f"{index:3d} {model}")
                 current = result["current"]
-                print(
-                    f"CURRENT main={current['main']} "
-                    f"available={str(result['current_main_available']).lower()}"
-                )
-                print(
-                    f"CURRENT fast={current['fast']} "
-                    f"available={str(result['current_fast_available']).lower()}"
-                )
+                for role in CLAUDE_ROUTE_ROLES:
+                    print(
+                        f"CURRENT {role} Model={current[f'model_{role}']} "
+                        f"Reasoning={current[f'reasoning_{role}']} "
+                        f"available={str(result['current_availability'][role]).lower()}"
+                    )
                 print(f"SOURCE={result['catalog_source']}")
         elif args.command == "update-models":
             with FileLock(manager.p.lock):
@@ -2327,6 +2979,9 @@ def main() -> int:
                     sonnet=args.sonnet,
                     haiku=args.haiku,
                     effort=args.effort,
+                    effort_opus=args.effort_opus,
+                    effort_sonnet=args.effort_sonnet,
+                    effort_haiku=args.effort_haiku,
                     dry_run=args.dry_run,
                     restart=args.restart,
                 )

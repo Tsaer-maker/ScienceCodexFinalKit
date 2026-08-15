@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""Audit FinalKit's isolated Claude Science credential boundary.
+"""Own FinalKit's isolated, restart-stable Claude Science local identity.
 
-Claude Science 0.1.27 requires its own supported Claude account sign-in before
-the web application will load provider models.  A DeepSeek/Kimi/GLM API key or
-a ChatGPT/Codex login authenticates FinalKit's local gateway, not the Science
-web application.  Older FinalKit builds wrote two exact synthetic OAuth
-shapes; current Science refreshes those values against the real Claude OAuth
-service and then signs the UI out.
+Claude Science has two independent gates: a local UI identity and an inference
+endpoint.  FinalKit supplies both only inside ``~/.science-finalkit``: this
+helper installs one cryptographically authenticated local identity, while the
+runtime injects a loopback ``ANTHROPIC_BASE_URL`` and session-only auth token.
+DeepSeek/Kimi/GLM keys and ChatGPT/Codex credentials remain owned by their
+gateways and are never copied into the Science profile.
 
-This helper removes only those cryptographically recognized legacy FinalKit
-identities.  An empty profile remains explicitly ``login-required`` and every
-unknown or real credential is preserved byte-for-byte for Claude Science to
-own.  FinalKit never manufactures a replacement account identity.
+The local identity is deliberately not a Claude.ai account, subscription, or
+service-side authorization.  It has an empty refresh token and a far-future
+local expiry, so no usable Anthropic refresh chain is created.  Claude Science
+may still make its own best-effort account-metadata probe, but FinalKit admits
+the local workbench through the daemon's loopback nonce gate and routes only
+inference through the selected gateway.  The identity is created only in an
+empty isolated profile, reused byte-for-byte on later starts, and migrated only
+from exact legacy FinalKit shapes.  Unknown or real credentials are preserved
+byte-for-byte and never overwritten.
 """
 
 from __future__ import annotations
@@ -45,6 +50,9 @@ KEY_NAMES = (
 HKDF_INFO = b"operon:aes-256-gcm:oauth"
 OAUTH_AAD = b"v2:oauth"
 VIRTUAL_EMAIL = "virtual@localhost.invalid"
+LOCAL_ACCOUNT_UUID = "00000000-0000-4000-8000-000000000001"
+LOCAL_ORG_UUID = "00000000-0000-4000-8000-000000000002"
+LOCAL_ACCESS_PREFIX = "sk-ant-finalkit-local-"
 LEGACY_ACCOUNT = "byok-user-000000000000000000"
 LEGACY_ORG = "org_byok_000000000000"
 LEGACY_EMAIL = "byok@localhost"
@@ -208,7 +216,7 @@ def _decode_json(raw: bytes, label: str) -> dict[str, Any]:
     return value
 
 
-def _validate_current(data_dir: Path, keys: dict[str, str]) -> dict[str, str] | None:
+def _validate_v2(data_dir: Path, keys: dict[str, str]) -> dict[str, Any] | None:
     files = _token_files(data_dir / ".oauth-tokens")
     if not files:
         return None
@@ -237,7 +245,7 @@ def _validate_current(data_dir: Path, keys: dict[str, str]) -> dict[str, str] | 
         token.get("email") == VIRTUAL_EMAIL,
         token.get("provider") == "claude_ai",
         isinstance(token.get("access_token"), str)
-        and token.get("access_token", "").startswith("sk-ant-virtual-"),
+        and bool(token.get("access_token")),
         token.get("refresh_token") == "",
         token.get("api_key") is None,
         token.get("token_expires_at") == "2099-01-01T00:00:00.000Z",
@@ -245,7 +253,13 @@ def _validate_current(data_dir: Path, keys: dict[str, str]) -> dict[str, str] | 
     )
     if not all(checks):
         return None
-    return {"account_uuid": str(account), "org_uuid": str(org)}
+    return {
+        "account_uuid": str(account),
+        "org_uuid": str(org),
+        "current": str(account) == LOCAL_ACCOUNT_UUID
+        and str(org) == LOCAL_ORG_UUID
+        and str(token.get("access_token", "")).startswith(LOCAL_ACCESS_PREFIX),
+    }
 
 
 def _is_exact_legacy(data_dir: Path, keys: dict[str, str]) -> bool:
@@ -311,6 +325,85 @@ def _remove_recognized_identity(data_dir: Path) -> None:
     active_previous.unlink(missing_ok=True)
 
 
+def _install_local_identity(data_dir: Path, keys: dict[str, str]) -> dict[str, str]:
+    """Install the one FinalKit-owned identity into a proven-empty profile."""
+
+    if _token_files(data_dir / ".oauth-tokens") or _read_private(
+        data_dir / "active-org.json", required=False
+    ) is not None:
+        raise IdentityError("refusing to install a local identity over existing credentials")
+
+    token = {
+        "access_token": LOCAL_ACCESS_PREFIX + secrets.token_hex(24),
+        "refresh_token": "",
+        "api_key": None,
+        "token_expires_at": "2099-01-01T00:00:00.000Z",
+        "provider": "claude_ai",
+        "scopes": "user:inference user:file_upload user:profile user:mcp_servers user:plugins",
+        "email": VIRTUAL_EMAIL,
+        "account_uuid": LOCAL_ACCOUNT_UUID,
+        "subscription_type": "max",
+        "rate_limit_tier": None,
+        "seat_tier": None,
+        "org_uuid": LOCAL_ORG_UUID,
+        "billing_type": "api",
+        "has_extra_usage_enabled": True,
+    }
+    plaintext = json.dumps(token, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encrypted = _encrypt_v2(plaintext, keys["OAUTH_ENCRYPTION_KEY"])
+    if _decode_json(
+        _decrypt_v2(encrypted, keys["OAUTH_ENCRYPTION_KEY"]),
+        "new local Science identity",
+    ) != token:
+        raise IdentityError("local Science identity encryption self-check failed")
+
+    suffix = secrets.token_hex(8)
+    staged_tokens = data_dir / f".oauth-tokens.finalkit-next-{suffix}"
+    staged_active = data_dir / f".active-org.finalkit-next-{suffix}.json"
+    token_dir = data_dir / ".oauth-tokens"
+    active_path = data_dir / "active-org.json"
+    installed_tokens = False
+    installed_active = False
+    try:
+        staged_tokens.mkdir(mode=0o700)
+        staged_tokens.chmod(0o700)
+        _atomic_private(staged_tokens / f"{LOCAL_ACCOUNT_UUID}.enc", encrypted)
+        _atomic_private(
+            staged_active,
+            (
+                json.dumps(
+                    {"org_uuid": LOCAL_ORG_UUID},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
+        os.replace(staged_tokens, token_dir)
+        installed_tokens = True
+        os.replace(staged_active, active_path)
+        installed_active = True
+    except BaseException:
+        if installed_active:
+            active_path.unlink(missing_ok=True)
+        if installed_tokens and token_dir.exists():
+            for path in token_dir.iterdir():
+                path.unlink()
+            token_dir.rmdir()
+        raise
+    finally:
+        staged_active.unlink(missing_ok=True)
+        if staged_tokens.exists():
+            for path in staged_tokens.iterdir():
+                path.unlink()
+            staged_tokens.rmdir()
+
+    verified = _validate_v2(data_dir, keys)
+    if verified is None or verified.get("current") is not True:
+        raise IdentityError("installed local Science identity did not verify")
+    return verified
+
+
 def inspect_identity(data_dir: Path) -> dict[str, Any]:
     _private_directory(data_dir, create=False)
     keys = _parse_keys(data_dir / "encryption.key")
@@ -319,22 +412,34 @@ def inspect_identity(data_dir: Path) -> dict[str, Any]:
     if not files and active is None:
         return {
             "ok": True,
-            "schema": "science-login-required",
+            "schema": "science-local-missing",
             "authenticated": False,
+            "installation_required": True,
         }
-    current = _validate_current(data_dir, keys)
-    if current is not None:
+    v2 = _validate_v2(data_dir, keys)
+    if v2 is not None and v2.get("current") is True:
         return {
             "ok": True,
             "schema": "science-local-v2",
-            "removal_required": True,
-            **current,
+            "authenticated": True,
+            "local_only": True,
+            "refresh_disabled": True,
+            "account_uuid": v2["account_uuid"],
+            "org_uuid": v2["org_uuid"],
+        }
+    if v2 is not None:
+        return {
+            "ok": True,
+            "schema": "science-local-v2-legacy",
+            "migration_required": True,
+            "account_uuid": v2["account_uuid"],
+            "org_uuid": v2["org_uuid"],
         }
     if _is_exact_legacy(data_dir, keys):
         return {
             "ok": True,
             "schema": "science-local-legacy",
-            "removal_required": True,
+            "migration_required": True,
         }
     return {
         "ok": True,
@@ -349,15 +454,36 @@ def ensure_identity(data_dir: Path) -> dict[str, Any]:
     _private_directory(data_dir, create=True)
     status = inspect_identity(data_dir)
     schema = str(status.get("schema"))
-    if schema in {"science-login-required", "science-credentials-preserved"}:
+    if schema in {"science-local-v2", "science-credentials-preserved"}:
         return {**status, "action": "reused"}
-    if schema not in {"science-local-legacy", "science-local-v2"}:
+    if schema == "science-local-missing":
+        keys = _parse_keys(data_dir / "encryption.key")
+        installed = _install_local_identity(data_dir, keys)
+        return {
+            "ok": True,
+            "schema": "science-local-v2",
+            "authenticated": True,
+            "local_only": True,
+            "refresh_disabled": True,
+            "account_uuid": installed["account_uuid"],
+            "org_uuid": installed["org_uuid"],
+            "action": "created",
+        }
+    if schema not in {"science-local-legacy", "science-local-v2-legacy"}:
         raise IdentityError("unrecognized Science auth state; refusing overwrite")
     _remove_recognized_identity(data_dir)
-    verified = inspect_identity(data_dir)
-    if verified.get("schema") != "science-login-required":
-        raise IdentityError("obsolete FinalKit Science identity removal did not verify")
-    return {**verified, "action": f"removed-{schema}"}
+    keys = _parse_keys(data_dir / "encryption.key")
+    installed = _install_local_identity(data_dir, keys)
+    return {
+        "ok": True,
+        "schema": "science-local-v2",
+        "authenticated": True,
+        "local_only": True,
+        "refresh_disabled": True,
+        "account_uuid": installed["account_uuid"],
+        "org_uuid": installed["org_uuid"],
+        "action": f"migrated-{schema}",
+    }
 
 
 def main(argv: list[str] | None = None) -> int:

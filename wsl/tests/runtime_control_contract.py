@@ -9,7 +9,9 @@ the host's real processes, WSL service, credentials, or network.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -63,18 +65,156 @@ def verify(manager_path: Path) -> None:
         manager = module.RuntimeManager(paths)
         paths.data_dir.mkdir(parents=True, exist_ok=True)
 
+        # A one-time Windows -> WSL Codex auth migration is accepted only while
+        # this runtime is stopped. The candidate crosses stdin in production,
+        # is validated in a temporary HOME, and either commits at mode 0600 or
+        # restores the prior bytes and permissions exactly.
+        auth_manager = module.RuntimeManager(paths)
+        auth_manager.require_runtime = lambda: None
+        auth_manager.ensure_bridge_config = lambda: None
+        auth_manager.science_status = lambda: {"running": False}
+        auth_manager.read_gateway_record = lambda: None
+        auth_manager._codex_login_status = lambda environment: True
+        imported_secret = "contract-import-secret"
+        imported = bytearray(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "access_token": imported_secret,
+                        "refresh_token": "contract-import-refresh",
+                    },
+                }
+            ).encode("utf-8")
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            auth_manager.import_codex_auth(imported)
+        assert paths.codex_auth.read_bytes() == bytes(imported)
+        assert stat.S_IMODE(paths.codex_auth.stat().st_mode) == 0o600
+        assert imported_secret not in output.getvalue()
+
+        previous = (
+            b'{\n  "auth_mode": "chatgpt", "tokens": '
+            b'{"access_token": "old", "refresh_token": "old-refresh"}\n}\n'
+        )
+        paths.codex_auth.write_bytes(previous)
+        paths.codex_auth.chmod(0o640)
+        checks = iter((True, False))
+        auth_manager._codex_login_status = lambda environment: next(checks)
+        try:
+            auth_manager.import_codex_auth(imported)
+        except module.FinalKitError as exc:
+            assert "official Codex login status" in str(exc), exc
+        else:
+            raise AssertionError("failed final Codex validation unexpectedly committed imported auth")
+        assert paths.codex_auth.read_bytes() == previous
+        assert stat.S_IMODE(paths.codex_auth.stat().st_mode) == 0o640
+
+        auth_manager.science_status = lambda: {"running": True}
+        auth_manager._codex_login_status = lambda environment: (_ for _ in ()).throw(
+            AssertionError("live-runtime import reached Codex validation")
+        )
+        try:
+            auth_manager.import_codex_auth(imported)
+        except module.FinalKitError as exc:
+            assert "stop the active FinalKit" in str(exc), exc
+        else:
+            raise AssertionError("Codex auth import was allowed while Science was running")
+        assert paths.codex_auth.read_bytes() == previous
+
         # The long-lived daemon never inherits Windows drive paths or a caller
-        # working directory. FinalKit owns only the local endpoint; Claude
-        # Science itself owns its supported account sign-in.
+        # working directory. FinalKit supplies a session-only loopback token;
+        # real provider credentials remain exclusively inside the gateway.
         os.environ["PATH"] = "/mnt/c/Windows/System32:/usr/bin:/mnt/d/Tools"
         os.environ["PWD"] = "/mnt/d/Tools/ScienceCodexFinalKit"
         daemon_environment = manager.science_environment("http://127.0.0.1:9876")
         assert daemon_environment["PATH"] == module.LINUX_SYSTEM_PATH
         assert daemon_environment["PWD"] == str(paths.science_home)
         assert daemon_environment["HOME"] == str(paths.science_home)
-        assert "ANTHROPIC_API_KEY" not in daemon_environment
-        assert "ANTHROPIC_AUTH_TOKEN" not in daemon_environment
+        assert daemon_environment["ANTHROPIC_API_KEY"] == ""
+        assert daemon_environment["ANTHROPIC_AUTH_TOKEN"] == "sk-ant-finalkit-local-session"
         assert "/mnt/" not in daemon_environment["PATH"]
+
+        origin, nonce = manager.science_login_target(
+            "http://localhost:8765/?nonce=one-time-local-nonce", 8765
+        )
+        assert origin == "http://127.0.0.1:8765"
+        assert nonce == "one-time-local-nonce"
+        for invalid in (
+            "https://127.0.0.1:8765/?nonce=x",
+            "http://example.com:8765/?nonce=x",
+            "http://127.0.0.1:9999/?nonce=x",
+            "http://127.0.0.1:not-a-port/?nonce=x",
+            "http://127.0.0.1:8765/",
+            "http://127.0.0.1:8765/?nonce=x&nonce=y",
+        ):
+            try:
+                manager.science_login_target(invalid, 8765)
+            except module.FinalKitError:
+                pass
+            else:
+                raise AssertionError(f"unsafe Science login URL was accepted: {invalid}")
+
+        # A gateway-only selection may reuse the provider already serving a
+        # live Science instance, but it must never stop or reroute that
+        # instance in order to select a different provider for another client.
+        guard_manager = module.RuntimeManager(paths)
+        gateway_record = {
+            "backend": "codex",
+            "endpoint": "http://127.0.0.1:9876",
+        }
+        guard_manager.current_mode = lambda: "codex"
+        guard_manager.read_gateway_record = lambda: gateway_record
+        guard_manager.gateway_identity = lambda record=None: True
+        guard_manager.gateway_health = lambda record=None: {"status": "ok"}
+        guard_manager.science_status = lambda: {"running": True}
+        guard_manager.science_status_endpoint_matches = (
+            lambda status, endpoint: status.get("running") is True
+            and endpoint == gateway_record["endpoint"]
+        )
+        guard_manager.write_mode = lambda mode: None
+        guard_manager.science_stop = lambda: (_ for _ in ()).throw(
+            AssertionError("gateway-only selection stopped Claude Science")
+        )
+        guard_manager.stop_gateway = lambda: (_ for _ in ()).throw(
+            AssertionError("gateway-only selection stopped the Science gateway")
+        )
+        guard_manager.spawn_gateway = lambda mode: (_ for _ in ()).throw(
+            AssertionError("gateway-only selection rerouted Claude Science")
+        )
+
+        reused_endpoint = guard_manager._switch_locked("codex", start_science=False)
+        assert reused_endpoint == gateway_record["endpoint"]
+        try:
+            guard_manager._switch_locked("deepseek", start_science=False)
+        except module.FinalKitError as exc:
+            assert "will not stop or reroute" in str(exc), exc
+        else:
+            raise AssertionError("gateway-only provider change was allowed to reroute live Science")
+
+        # A newly started Science transaction carries the bounded startup
+        # deadline through the second, user-facing nonce URL instead of
+        # treating one transient control-socket miss as a switch failure.
+        switch_manager = module.RuntimeManager(paths)
+        switch_manager.current_mode = lambda: None
+        switch_manager.read_gateway_record = lambda: None
+        switch_manager.science_status = lambda: {"running": False}
+        switch_manager.science_stop = lambda: None
+        switch_manager.stop_gateway = lambda: None
+        switch_manager.spawn_gateway = lambda mode: "http://127.0.0.1:9876"
+        switch_manager.science_start = lambda endpoint: {"running": True, "pid": PID}
+        switch_manager.gateway_health = lambda record=None: {"status": "ok"}
+        switch_manager.science_status_endpoint_matches = lambda status, endpoint: True
+        switch_manager.write_mode = lambda mode: None
+        user_url_deadlines = []
+        switch_manager.science_url = lambda **kwargs: (
+            user_url_deadlines.append(kwargs.get("startup_deadline"))
+            or "http://127.0.0.1:8765/?nonce=user"
+        )
+        switched_url = switch_manager._switch_locked("codex", start_science=True)
+        assert switched_url.endswith("nonce=user")
+        assert len(user_url_deadlines) == 1 and user_url_deadlines[0] is not None
 
         original_run = module.subprocess.run
         original_live = module.process_is_live
@@ -82,6 +222,8 @@ def verify(manager_path: Path) -> None:
         original_environment = module.process_environment
         original_state = module.process_state
         original_kill = module.os.kill
+        original_sleep = module.time.sleep
+        original_monotonic = module.time.monotonic
 
         live_pids: set[int] = set()
 
@@ -118,6 +260,9 @@ def verify(manager_path: Path) -> None:
             )
             healthy = manager.science_status()
             assert healthy.get("running") is True and not healthy.get("control_error"), healthy
+            assert manager.science_status_endpoint_matches(
+                healthy, "http://127.0.0.1:9876"
+            )
 
             # One transient control-socket miss for the same fully owned daemon
             # is retried and recovered instead of blocking a healthy Start.
@@ -151,6 +296,104 @@ def verify(manager_path: Path) -> None:
             assert transient_io.get("running") is True
             assert not transient_io.get("control_error"), transient_io
             module.process_state = lambda pid: "S"
+
+            # The URL control command can miss the same freshly detached
+            # owner's socket even after status first turns healthy. Startup
+            # retries that exact transient without weakening steady-state URL.
+            url_manager = module.RuntimeManager(paths)
+            url_manager.science_lock_process = lambda: {"pid": PID, "owned": True}
+            module.subprocess.run = FakeRun(
+                [
+                    completed(1, stderr="claude-science: could not reach daemon control socket"),
+                    completed(0, "http://127.0.0.1:8765/?nonce=fixture\n"),
+                ]
+            )
+            module.time.sleep = lambda _seconds: None
+            module.time.monotonic = lambda: 0.0
+            assert url_manager.science_url(startup_deadline=1.0).endswith("nonce=fixture")
+
+            # Science 0.1.27 may remain in verified ext4 database I/O for
+            # several seconds after serve --detached exits. Only science_start
+            # may wait for that exact result, and only until its ready deadline.
+            startup_manager = module.RuntimeManager(paths)
+            startup_states = iter(
+                (
+                    {"running": False},
+                    {
+                        "running": True,
+                        "control_error": "unavailable",
+                        "owned": True,
+                        "pid": PID,
+                        "process_state": "D",
+                        "detail": (
+                            "Claude Science owner is blocked in uninterruptible I/O; "
+                            "its page and control socket are not reliable"
+                        ),
+                    },
+                    {"running": True, "owned": True, "pid": PID, "port": 8765},
+                    {
+                        "running": True,
+                        "control_error": "unavailable",
+                        "owned": True,
+                        "pid": PID,
+                        "process_state": "D",
+                        "detail": (
+                            "Claude Science owner is blocked in uninterruptible I/O; "
+                            "its page and control socket are not reliable"
+                        ),
+                    },
+                    {"running": True, "owned": True, "pid": PID, "port": 8765},
+                )
+            )
+            startup_manager.science_status = lambda: next(startup_states)
+            startup_manager.ensure_science_identity = lambda: {"action": "existing"}
+            session_checks = []
+            startup_manager.verify_science_local_session = lambda **_kwargs: (
+                session_checks.append("verified") or {"verified": True}
+            )
+            module.subprocess.run = FakeRun([completed(0)])
+            module.time.sleep = lambda _seconds: None
+            module.time.monotonic = lambda: 0.0
+            started = startup_manager.science_start("http://127.0.0.1:9876")
+            assert started.get("pid") == PID
+            assert started.get("local_session", {}).get("verified") is True
+            assert session_checks == ["verified"], session_checks
+
+            blocked_start_manager = module.RuntimeManager(paths)
+            blocked_start_states = iter(
+                (
+                    {"running": False},
+                    {
+                        "running": True,
+                        "control_error": "unavailable",
+                        "owned": True,
+                        "pid": PID,
+                        "process_state": "D",
+                        "detail": (
+                            "Claude Science owner is blocked in uninterruptible I/O; "
+                            "its page and control socket are not reliable"
+                        ),
+                    },
+                )
+            )
+            blocked_start_manager.science_status = lambda: next(blocked_start_states)
+            blocked_start_manager.ensure_science_identity = lambda: {"action": "existing"}
+            blocked_start_manager.verify_science_local_session = lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("permanently blocked startup reached session verification")
+            )
+            module.subprocess.run = FakeRun([completed(0)])
+            monotonic_values = iter((0.0, 0.0, module.SCIENCE_START_READY_SECONDS + 1.0))
+            module.time.monotonic = lambda: next(
+                monotonic_values, module.SCIENCE_START_READY_SECONDS + 1.0
+            )
+            try:
+                blocked_start_manager.science_start("http://127.0.0.1:9876")
+            except module.FinalKitError as exc:
+                assert "did not become ready" in str(exc), exc
+            else:
+                raise AssertionError("permanently blocked Science startup exceeded its deadline")
+            module.time.sleep = original_sleep
+            module.time.monotonic = original_monotonic
 
             # A live owned process plus a failed control socket is an explicit error, not stopped.
             module.subprocess.run = FakeRun([completed(1, stderr="non-retryable control failure")])
@@ -193,8 +436,14 @@ def verify(manager_path: Path) -> None:
             module.process_environment = original_environment
             module.process_state = original_state
             module.os.kill = original_kill
+            module.time.sleep = original_sleep
+            module.time.monotonic = original_monotonic
 
-    print("RUNTIME_CONTROL_CONTRACT_OK stopped=usable healthy=owned stale=fail-closed signals=none")
+    print(
+        "RUNTIME_CONTROL_CONTRACT_OK stopped=usable healthy=owned "
+        "local-session=loopback-only non-science-switch=guarded "
+        "auth-import=atomic+stopped-only startup-io=bounded stale=fail-closed signals=none"
+    )
 
 
 def main() -> int:

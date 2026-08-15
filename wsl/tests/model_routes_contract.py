@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 sys.dont_write_bytecode = True
 
@@ -57,12 +58,78 @@ def verify(manager_path: Path) -> None:
         )
         routes = manager.model_routes()
         assert routes["codex"] == {
-            "opus": "gpt-5.6-sol",
-            "sonnet": "gpt-5.6-terra",
-            "haiku": "gpt-5.6-luna",
-            "reasoning_effort": "max",
+            "model_opus": "gpt-5.6-sol",
+            "reasoning_opus": "max",
+            "model_sonnet": "gpt-5.6-terra",
+            "reasoning_sonnet": "max",
+            "model_haiku": "gpt-5.6-luna",
+            "reasoning_haiku": "max",
         }, routes
+        assert routes["schema_version"] == 2
         assert stat.S_IMODE(paths.model_routes.stat().st_mode) == 0o600
+
+        # Schema 1's main/fast/shared-effort shape is upgraded once to the
+        # compact per-tier Model/Reasoning owner without losing user choices.
+        legacy_routes = {
+            "schema_version": 1,
+            "providers": {
+                name: {
+                    "main": route["model_opus"],
+                    "fast": route["model_haiku"],
+                    "reasoning_effort": "auto",
+                }
+                for name, route in routes["providers"].items()
+            },
+            "codex": {
+                "opus": "gpt-5.6-sol",
+                "sonnet": "gpt-5.6-terra",
+                "haiku": "gpt-5.6-luna",
+                "reasoning_effort": "high",
+            },
+        }
+        module.atomic_write(paths.model_routes, json.dumps(legacy_routes) + "\n")
+        routes = manager.model_routes()
+        assert routes["codex"]["reasoning_opus"] == "high"
+        assert routes["codex"]["reasoning_sonnet"] == "high"
+        assert routes["codex"]["reasoning_haiku"] == "high"
+
+        # The WSL configure-codex route editor reads this Linux Codex cache,
+        # shows each model's real capabilities, and prompts only Model/Reasoning.
+        paths.codex_auth.parent.mkdir(parents=True, exist_ok=True)
+        (paths.codex_auth.parent / "models_cache.json").write_text(
+            json.dumps(
+                {
+                    "models": [
+                        {
+                            "slug": "gpt-5.6-sol",
+                            "visibility": "list",
+                            "default_reasoning_level": "max",
+                            "supported_reasoning_levels": [
+                                {"effort": "high", "description": "strong"},
+                                {"effort": "max", "description": "deepest"},
+                            ],
+                        },
+                        {
+                            "slug": "gpt-5.6-terra",
+                            "visibility": "list",
+                            "default_reasoning_level": "high",
+                            "supported_reasoning_levels": ["high", "max"],
+                        },
+                        {
+                            "slug": "gpt-5.6-luna",
+                            "visibility": "list",
+                            "default_reasoning_level": "low",
+                            "supported_reasoning_levels": ["low", "max"],
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch("builtins.input", side_effect=["", "", "", "", "", ""]):
+            interactive = manager.configure_model_routes_interactive("codex")
+        assert interactive["routes"]["codex"]["model_opus"] == "gpt-5.6-sol"
+        assert interactive["routes"]["codex"]["reasoning_haiku"] == "low"
 
         # Provider discovery is a read-only official catalog lookup.  The key
         # is passed only to the fixed-endpoint fetcher, no route file changes,
@@ -88,7 +155,7 @@ def verify(manager_path: Path) -> None:
         discovery = manager.discover_provider_models("deepseek")
         assert fetched == {"provider": "deepseek", "api_key": "fixture-secret"}
         assert discovery["models"] == ["deepseek-v4-flash", "deepseek-v4-pro"]
-        assert discovery["current_main_available"] and discovery["current_fast_available"]
+        assert all(discovery["current_availability"].values())
         assert discovery["writes_performed"] is False
         assert discovery["generation_request_performed"] is False
         assert paths.model_routes.read_bytes() == discovery_before
@@ -96,10 +163,18 @@ def verify(manager_path: Path) -> None:
         # A preview is deterministic and does not mutate the owning file.
         original = paths.model_routes.read_bytes()
         preview = manager.update_model_routes(
-            "deepseek", main="deepseek-v5-pro", fast="deepseek-v5-flash", dry_run=True
+            "deepseek",
+            opus="deepseek-v5-pro",
+            sonnet="deepseek-v5-chat",
+            haiku="deepseek-v5-flash",
+            effort_opus="max",
+            effort_sonnet="high",
+            effort_haiku="none",
+            dry_run=True,
         )
         assert preview["changed"] and preview["dry_run"]
-        assert preview["routes"]["providers"]["deepseek"]["main"] == "deepseek-v5-pro"
+        assert preview["routes"]["providers"]["deepseek"]["model_sonnet"] == "deepseek-v5-chat"
+        assert preview["routes"]["providers"]["deepseek"]["reasoning_haiku"] == "none"
         assert paths.model_routes.read_bytes() == original
 
         # A healthy runtime for another provider is not interrupted.  The
@@ -107,7 +182,9 @@ def verify(manager_path: Path) -> None:
         manager.read_gateway_record = lambda: {"backend": "deepseek"}
         manager.gateway_identity = lambda record=None: True
         manager.gateway_health = lambda record=None: {"status": "ok"}
-        unrelated = manager.update_model_routes("glm", main="glm-6", fast="glm-6-flash")
+        unrelated = manager.update_model_routes(
+            "glm", opus="glm-6", sonnet="glm-6-air", haiku="glm-6-flash"
+        )
         assert unrelated["changed"] and not unrelated["restart_required"]
         manager.read_gateway_record = lambda: None
 
@@ -118,19 +195,26 @@ def verify(manager_path: Path) -> None:
             opus="gpt-6-sol",
             sonnet="gpt-6-terra",
             haiku="gpt-6-luna",
-            effort="xhigh",
+            effort_opus="max",
+            effort_sonnet="high",
+            effort_haiku="low",
         )
         assert updated["changed"] and not updated["runtime_restarted"]
         manager.ensure_bridge_config()
         persisted = manager.model_routes()
-        assert persisted["codex"]["opus"] == "gpt-6-sol"
+        assert persisted["codex"]["model_opus"] == "gpt-6-sol"
         derived = json.loads(paths.bridge_config.read_text(encoding="utf-8"))
         assert derived["codex_model_map"] == {
             "claude-opus": "gpt-6-sol",
             "claude-sonnet": "gpt-6-terra",
             "claude-haiku": "gpt-6-luna",
         }
-        assert derived["codex_reasoning_effort"] == "xhigh"
+        assert derived["codex_reasoning_map"] == {
+            "claude-opus": "max",
+            "claude-sonnet": "high",
+            "claude-haiku": "low",
+        }
+        assert derived["codex_reasoning"] == "max"
         assert derived["force_model"] == ""
 
         # Changing the active provider is fail-closed unless the caller gives
@@ -158,12 +242,16 @@ def verify(manager_path: Path) -> None:
         # defaults and preserves unknown well-formed provider entries.
         custom = manager_again.model_routes()
         custom["providers"]["future-vendor"] = {
-            "main": "future/model@3+pro",
-            "fast": "future-3-flash",
+            "model_opus": "future/model@3+pro",
+            "reasoning_opus": "max",
+            "model_sonnet": "future/model@3+chat",
+            "reasoning_sonnet": "high",
+            "model_haiku": "future-3-flash",
+            "reasoning_haiku": "auto",
         }
         module.atomic_write(paths.model_routes, json.dumps(custom) + "\n")
         merged = manager_again.model_routes()
-        assert merged["providers"]["future-vendor"]["main"] == "future/model@3+pro"
+        assert merged["providers"]["future-vendor"]["model_opus"] == "future/model@3+pro"
         assert set(module.API_PROVIDERS).issubset(merged["providers"])
 
         try:
@@ -173,7 +261,7 @@ def verify(manager_path: Path) -> None:
         else:
             raise AssertionError("invalid model ID was accepted")
         malformed = manager.model_routes()
-        del malformed["providers"]["deepseek"]["main"]
+        del malformed["providers"]["deepseek"]["model_opus"]
         try:
             manager.validate_model_routes(malformed)
         except module.FinalKitError as exc:
@@ -196,15 +284,17 @@ def verify(manager_path: Path) -> None:
             check=False,
         )
         assert shown.returncode == 0, shown.stderr
-        assert json.loads(shown.stdout)["providers"]["future-vendor"]["main"] == "future/model@3+pro"
+        assert json.loads(shown.stdout)["providers"]["future-vendor"]["model_opus"] == "future/model@3+pro"
         cli_before = paths.model_routes.read_bytes()
         cli_preview = subprocess.run(
             [
                 *cli,
                 "update-models",
                 "kimi",
-                "--main",
+                "--sonnet",
                 "kimi-k4",
+                "--reasoning-sonnet",
+                "high",
                 "--dry-run",
                 "--json",
             ],
@@ -215,7 +305,8 @@ def verify(manager_path: Path) -> None:
             check=False,
         )
         assert cli_preview.returncode == 0, cli_preview.stderr
-        assert json.loads(cli_preview.stdout)["routes"]["providers"]["kimi"]["main"] == "kimi-k4"
+        assert json.loads(cli_preview.stdout)["routes"]["providers"]["kimi"]["model_sonnet"] == "kimi-k4"
+        assert json.loads(cli_preview.stdout)["routes"]["providers"]["kimi"]["reasoning_sonnet"] == "high"
         assert paths.model_routes.read_bytes() == cli_before
         cli_discovery = subprocess.run(
             [*cli, "discover-models", "deepseek", "--json"],
@@ -231,7 +322,7 @@ def verify(manager_path: Path) -> None:
         assert "fixture-secret" not in cli_discovery.stdout + cli_discovery.stderr
         assert paths.model_routes.read_bytes() == cli_before
         cli_invalid = subprocess.run(
-            [*cli, "update-models", "kimi", "--main", "bad model"],
+            [*cli, "update-models", "kimi", "--opus", "bad model"],
             env=environment,
             text=True,
             stdout=subprocess.PIPE,

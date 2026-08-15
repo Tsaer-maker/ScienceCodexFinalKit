@@ -3,11 +3,14 @@ param(
   [ValidateSet(
     "help", "menu", "clear", "build", "bootstrap",
     "configure-deepseek", "configure-kimi", "configure-glm", "configure-codex", "configure-codex-device",
+    "migrate-windows-codex-auth-to-wsl",
     "login-linux-codex", "deepseek", "kimi", "glm", "codex", "claude", "science",
     "restart", "smoke", "test-deepseek", "test-kimi", "test-glm", "test-codex", "test-codex-tiers",
     "models", "discover-models", "update-runtime", "update-models", "update-tools",
     "status", "doctor", "stop", "browser-start", "browser-science", "browser-status", "browser-stop",
-    "browser-mcp-info", "init-project", "windows-review"
+    "browser-mcp-info", "init-project", "windows-review",
+    "windows-claude-menu", "windows-claude-init", "windows-claude-configure", "windows-claude",
+    "windows-claude-status", "windows-claude-stop", "windows-claude-official"
   )]
   [string]$Action = "help",
 
@@ -42,6 +45,13 @@ $BrowserStateRoot = Join-Path $env:LOCALAPPDATA "ScienceCodexFinalKit"
 $BrowserProfile = Join-Path $BrowserStateRoot "ChromeProfile"
 $BrowserState = Join-Path $BrowserStateRoot "browser.json"
 $script:ResolvedLinuxUser = ""
+$script:RouteRoles = @("opus", "sonnet", "haiku")
+$script:ProviderReasoning = @{
+  deepseek = @("auto", "none", "high", "max")
+  kimi = @("auto", "none", "low", "high", "max")
+  glm = @("auto", "none", "high", "max")
+  codex = @("none", "low", "medium", "high", "xhigh", "max", "ultra")
+}
 
 function ConvertTo-NativeArgumentString {
   param([Parameter(Mandatory = $true)][string[]]$Arguments)
@@ -154,7 +164,8 @@ function Invoke-WslCapture {
   param(
     [Parameter(Mandatory = $true)][string[]]$Arguments,
     [System.Text.Encoding]$Encoding = $null,
-    [ValidateRange(0, 86400)][int]$TimeoutSeconds = 0
+    [ValidateRange(0, 86400)][int]$TimeoutSeconds = 0,
+    [AllowNull()][byte[]]$StandardInputBytes = $null
   )
   $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
   if (-not $wsl) {
@@ -170,6 +181,7 @@ function Invoke-WslCapture {
   $startInfo.UseShellExecute = $false
   $startInfo.RedirectStandardOutput = $true
   $startInfo.RedirectStandardError = $true
+  $startInfo.RedirectStandardInput = ($null -ne $StandardInputBytes)
   $startInfo.CreateNoWindow = $true
   $process = New-Object System.Diagnostics.Process
   $process.StartInfo = $startInfo
@@ -180,6 +192,16 @@ function Invoke-WslCapture {
   $stderrBuffer = New-Object System.IO.MemoryStream
   $stdoutTask = $process.StandardOutput.BaseStream.CopyToAsync($stdoutBuffer)
   $stderrTask = $process.StandardError.BaseStream.CopyToAsync($stderrBuffer)
+  if ($null -ne $StandardInputBytes) {
+    try {
+      if ($StandardInputBytes.Length -gt 0) {
+        $process.StandardInput.BaseStream.Write($StandardInputBytes, 0, $StandardInputBytes.Length)
+        $process.StandardInput.BaseStream.Flush()
+      }
+    } finally {
+      $process.StandardInput.Close()
+    }
+  }
   $timedOut = $false
   if ($TimeoutSeconds -gt 0) {
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
@@ -405,13 +427,14 @@ function Invoke-WslLinuxCapture {
   param(
     [Parameter(Mandatory = $true)][string[]]$Command,
     [string]$AsUser = "",
-    [ValidateRange(0, 86400)][int]$TimeoutSeconds = 0
+    [ValidateRange(0, 86400)][int]$TimeoutSeconds = 0,
+    [AllowNull()][byte[]]$StandardInputBytes = $null
   )
   $arguments = @("-d", $Distro)
   if ($AsUser) { $arguments += @("-u", $AsUser) }
   $arguments += "--"
   $arguments += $Command
-  return Invoke-WslCapture -Arguments $arguments -Encoding (New-Object System.Text.UTF8Encoding($false)) -TimeoutSeconds $TimeoutSeconds
+  return Invoke-WslCapture -Arguments $arguments -Encoding (New-Object System.Text.UTF8Encoding($false)) -TimeoutSeconds $TimeoutSeconds -StandardInputBytes $StandardInputBytes
 }
 
 function Invoke-WslManagement {
@@ -593,6 +616,126 @@ function Get-FkctlOutput {
   return Get-WslOutput -AsUser (Resolve-LinuxUser) -Command (@(Get-FkctlPath) + $Arguments)
 }
 
+function Get-WindowsCodexAuthOwnerPath {
+  $codexHome = if (-not [string]::IsNullOrWhiteSpace([string]$env:CODEX_HOME)) {
+    [string]$env:CODEX_HOME
+  } else {
+    Join-Path $env:USERPROFILE ".codex"
+  }
+  try { $resolvedHome = [IO.Path]::GetFullPath($codexHome) } catch {
+    throw "Windows CODEX_HOME is malformed"
+  }
+  if ($resolvedHome -match '(?i)(\\\\wsl\$|\\\\wsl\.localhost|/mnt/|/home/|wsl\.exe)') {
+    throw "The Windows Codex auth source cannot reference WSL"
+  }
+  return Join-Path $resolvedHome "auth.json"
+}
+
+function Get-WindowsCodexAuthPayload {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    throw "Windows Codex auth is missing: $Path. Run Windows 'codex login' first."
+  }
+  $item = Get-Item -LiteralPath $Path
+  if ($item.Length -le 0 -or $item.Length -gt 1MB) {
+    throw "Windows Codex auth has an invalid size"
+  }
+
+  $codex = Get-Command codex -ErrorAction SilentlyContinue
+  if ($null -eq $codex) { throw "Windows Codex CLI was not found; install it and run: codex login" }
+  & $codex.Source login status | Out-Host
+  if ($LASTEXITCODE -ne 0) { throw "Windows Codex is not logged in. Run: codex login" }
+
+  [byte[]]$bytes = [IO.File]::ReadAllBytes($Path)
+  try {
+    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    $auth = ($strictUtf8.GetString($bytes) | ConvertFrom-Json)
+    $modeProperty = $auth.PSObject.Properties["auth_mode"]
+    $tokensProperty = $auth.PSObject.Properties["tokens"]
+    $tokens = if ($null -ne $tokensProperty) { $tokensProperty.Value } else { $null }
+    $accessProperty = if ($null -ne $tokens) { $tokens.PSObject.Properties["access_token"] } else { $null }
+    $refreshProperty = if ($null -ne $tokens) { $tokens.PSObject.Properties["refresh_token"] } else { $null }
+    if ($null -eq $modeProperty -or [string]$modeProperty.Value -ne "chatgpt") {
+      throw "Windows Codex is not using the official ChatGPT login"
+    }
+    if (
+      $null -eq $accessProperty -or [string]::IsNullOrWhiteSpace([string]$accessProperty.Value) -or
+      $null -eq $refreshProperty -or [string]::IsNullOrWhiteSpace([string]$refreshProperty.Value)
+    ) {
+      throw "Windows Codex ChatGPT token chain is incomplete"
+    }
+    return [pscustomobject]@{ Path = $Path; Bytes = $bytes }
+  } catch {
+    [Array]::Clear($bytes, 0, $bytes.Length)
+    throw
+  }
+}
+
+function Invoke-WindowsCodexAuthMigrationToWsl {
+  Assert-FinalKitInstalled
+  Assert-FkctlCapability -Capability "stdin-codex-auth-import" -ActionLabel "one-time Windows Codex auth import"
+  $user = Resolve-LinuxUser
+  $fkctl = Get-FkctlPath
+  $sourcePath = Get-WindowsCodexAuthOwnerPath
+  Write-Host "One-time Windows Codex auth -> WSL migration" -ForegroundColor Cyan
+  Write-Host "  Source:      $sourcePath"
+  Write-Host "  Destination: $Distro /home/$user/.finalkit-client/.codex/auth.json"
+  Write-Host "This replaces the WSL Codex login once. It does not create startup sync; WSL keeps its own refresh and login commands."
+  if (-not $Force) {
+    $confirmation = Read-Host "Type MIGRATE to stop WSL Science, replace its Codex login, and restart Codex Science"
+    if ($confirmation -cne "MIGRATE") {
+      Write-Host "Migration cancelled; Windows and WSL auth were not changed."
+      return
+    }
+  }
+
+  $payload = Get-WindowsCodexAuthPayload -Path $sourcePath
+  $stopped = $false
+  $importCommitted = $false
+  try {
+    Invoke-Fkctl @("stop")
+    $stopped = $true
+    $result = Invoke-WslLinuxCapture `
+      -AsUser $user `
+      -Command @($fkctl, "import-codex-auth") `
+      -TimeoutSeconds 60 `
+      -StandardInputBytes $payload.Bytes
+    if ($result.StdOut) { Write-Host $result.StdOut.TrimEnd() }
+    if ($result.StdErr) { Write-Host $result.StdErr.TrimEnd() }
+    if ($result.ExitCode -ne 0) {
+      throw "WSL rejected the imported Windows Codex login (exit $($result.ExitCode))"
+    }
+    $importCommitted = $true
+    Invoke-Fkctl @("start", "codex")
+    Invoke-Fkctl @("status")
+    Write-Host "WINDOWS_CODEX_AUTH_MIGRATION_OK distro=$Distro linux_user=$user" -ForegroundColor Green
+    Write-Host "Windows and WSL now hold separate copies. Future WSL refresh or re-login does not change Windows, and no startup copy occurs."
+    Write-Host "They initially share one OAuth token chain, not two newly issued sessions; if upstream refresh rotation invalidates one copy, re-login only on that side."
+  } catch {
+    $primary = $_.Exception.Message
+    if ($stopped -and -not $importCommitted) {
+      $restartFailure = ""
+      try {
+        Invoke-Fkctl @("start", "codex")
+      } catch {
+        $restartFailure = $_.Exception.Message
+      }
+      if ($restartFailure) {
+        throw "$primary`nThe WSL importer restored the prior auth bytes, but restarting the prior Codex runtime also failed: $restartFailure"
+      }
+      throw "$primary`nThe WSL importer restored the prior auth bytes, and Codex Science was restarted with the prior login."
+    }
+    if ($importCommitted) {
+      throw "$primary`nThe one-time auth import passed official Codex validation and remains committed; no recurring sync was enabled."
+    }
+    throw
+  } finally {
+    if ($null -ne $payload -and $null -ne $payload.Bytes) {
+      [Array]::Clear($payload.Bytes, 0, $payload.Bytes.Length)
+    }
+  }
+}
+
 function Get-UbuntuTargets {
   if (-not $AllUbuntu) { return @(Get-WslRegistration -Name $Distro) }
   $targets = @()
@@ -772,12 +915,20 @@ function Show-ModelRoutes {
 
 function Invoke-ModelUpdateInteractive {
   Assert-FkctlCapability -Capability "model-route-update" -ActionLabel "independent model-route updates"
+  Assert-FkctlCapability -Capability "per-role-provider-routes" -ActionLabel "Opus/Sonnet/Haiku Model routes"
+  Assert-FkctlCapability -Capability "per-role-reasoning" -ActionLabel "per-tier Reasoning routes"
   $routes = (Get-FkctlOutput @("models", "--json")) | ConvertFrom-Json
   Write-Host "Current persistent model routes:" -ForegroundColor Cyan
-  Write-Host "  1 DeepSeek  main=$($routes.providers.deepseek.main)  fast=$($routes.providers.deepseek.fast)"
-  Write-Host "  2 Kimi      main=$($routes.providers.kimi.main)  fast=$($routes.providers.kimi.fast)"
-  Write-Host "  3 GLM       main=$($routes.providers.glm.main)  fast=$($routes.providers.glm.fast)"
-  Write-Host "  4 Codex     Opus=$($routes.codex.opus)  Sonnet=$($routes.codex.sonnet)  Haiku=$($routes.codex.haiku)  effort=$($routes.codex.reasoning_effort)"
+  $routeTargets = @($routes.providers.deepseek, $routes.providers.kimi, $routes.providers.glm, $routes.codex)
+  $routeLabels = @("DeepSeek", "Kimi", "GLM", "Codex")
+  for ($index = 0; $index -lt $routeTargets.Count; $index++) {
+    $target = $routeTargets[$index]
+    $parts = @($script:RouteRoles | ForEach-Object {
+      $reasoningName = "reasoning_$_"
+      "$_=($([string]$target.$_),$([string]$target.$reasoningName))"
+    })
+    Write-Host ("  {0} {1,-8} {2}" -f ($index + 1), $routeLabels[$index], ($parts -join " "))
+  }
   $selection = Read-Host "Provider [1-4]"
   $arguments = @("update-models")
   switch ($selection) {
@@ -788,48 +939,42 @@ function Invoke-ModelUpdateInteractive {
     default { throw "Provider selection must be 1, 2, 3 or 4" }
   }
   $arguments += $provider
-  if ($provider -eq "codex") {
-    $opus = Read-Host "Opus-tier model [$($current.opus)]"; if (-not $opus) { $opus = $current.opus }
-    $sonnet = Read-Host "Sonnet-tier model [$($current.sonnet)]"; if (-not $sonnet) { $sonnet = $current.sonnet }
-    $haiku = Read-Host "Haiku-tier model [$($current.haiku)]"; if (-not $haiku) { $haiku = $current.haiku }
-    $effort = Read-Host "Reasoning effort none|low|medium|high|xhigh|max [$($current.reasoning_effort)]"
-    if (-not $effort) { $effort = $current.reasoning_effort }
-    $arguments += @("--opus", $opus, "--sonnet", $sonnet, "--haiku", $haiku, "--effort", $effort)
-  } else {
-    $catalog = $null
-    if (Test-FkctlCapability -Capability "provider-model-discovery") {
-      $discover = Read-Host "Read this account's official callable model list now? [Y/n]"
-      if ($discover -notmatch '^(?i:n|no)$') {
-        try {
-          $catalog = (Get-FkctlOutput @("discover-models", $provider, "--json")) | ConvertFrom-Json
-          Write-Host "Official callable models (read-only; no generation charge):" -ForegroundColor Cyan
-          for ($index = 0; $index -lt @($catalog.models).Count; $index++) {
-            Write-Host ("  {0,2} {1}" -f ($index + 1), $catalog.models[$index])
-          }
-          Write-Host "Current main available=$($catalog.current_main_available); fast available=$($catalog.current_fast_available)"
-          Write-Host "Catalog source: $($catalog.catalog_source)" -ForegroundColor DarkGray
-        } catch {
-          Write-Warning "Official catalog discovery failed; manual model entry remains available. $($_.Exception.Message)"
+  $catalog = $null
+  if ($provider -ne "codex" -and (Test-FkctlCapability -Capability "provider-model-discovery")) {
+    $discover = Read-Host "Read this account's official callable Models now? [Y/n]"
+    if ($discover -notmatch '^(?i:n|no)$') {
+      try {
+        $catalog = (Get-FkctlOutput @("discover-models", $provider, "--json")) | ConvertFrom-Json
+        Write-Host "Models:" -ForegroundColor Cyan
+        for ($index = 0; $index -lt @($catalog.models).Count; $index++) {
+          Write-Host ("  {0,2} {1}" -f ($index + 1), $catalog.models[$index])
         }
+        Write-Host "Catalog source: $($catalog.catalog_source)" -ForegroundColor DarkGray
+      } catch {
+        Write-Warning "Official catalog discovery failed; manual Model entry remains available. $($_.Exception.Message)"
       }
-    } else {
-      Write-Host "Installed runtime has no catalog discovery capability; manual entry remains available. Menu 16 adds discovery without rebuilding WSL." -ForegroundColor Yellow
     }
-    $mainPrompt = "Main model ID or list number [$($current.main)]"
-    $main = Read-Host $mainPrompt; if (-not $main) { $main = $current.main }
-    if ($catalog -and $main -match '^\d+$') {
-      $mainIndex = [int]$main
-      if ($mainIndex -lt 1 -or $mainIndex -gt @($catalog.models).Count) { throw "Main model selection is outside the displayed list" }
-      $main = [string]$catalog.models[$mainIndex - 1]
+  }
+  Write-Host ("Reasoning: " + (@($script:ProviderReasoning[$provider]) -join ", "))
+  foreach ($role in $script:RouteRoles) {
+    $roleLabel = (Get-Culture).TextInfo.ToTitleCase($role)
+    $model = Read-Host "$roleLabel Model or list number [$([string]$current.$role)]"
+    if (-not $model) { $model = [string]$current.$role }
+    if ($catalog -and $model -match '^\d+$') {
+      $modelIndex = [int]$model
+      if ($modelIndex -lt 1 -or $modelIndex -gt @($catalog.models).Count) {
+        throw "$roleLabel Model selection is outside the displayed list"
+      }
+      $model = [string]$catalog.models[$modelIndex - 1]
     }
-    $fastPrompt = "Fast model ID or list number [$($current.fast)]"
-    $fast = Read-Host $fastPrompt; if (-not $fast) { $fast = $current.fast }
-    if ($catalog -and $fast -match '^\d+$') {
-      $fastIndex = [int]$fast
-      if ($fastIndex -lt 1 -or $fastIndex -gt @($catalog.models).Count) { throw "Fast model selection is outside the displayed list" }
-      $fast = [string]$catalog.models[$fastIndex - 1]
+    $reasoningName = "reasoning_$role"
+    $reasoning = Read-Host "$roleLabel Reasoning [$([string]$current.$reasoningName)]"
+    if (-not $reasoning) { $reasoning = [string]$current.$reasoningName }
+    $reasoning = $reasoning.ToLowerInvariant()
+    if ($reasoning -notin @($script:ProviderReasoning[$provider])) {
+      throw "$roleLabel Reasoning must be one of: $(@($script:ProviderReasoning[$provider]) -join ', ')"
     }
-    $arguments += @("--main", $main, "--fast", $fast)
+    $arguments += @("--$role", $model, "--reasoning-$role", $reasoning)
   }
   $preview = (Get-FkctlOutput ($arguments + @("--dry-run", "--json"))) | ConvertFrom-Json
   if (-not $preview.changed) {
@@ -837,10 +982,11 @@ function Invoke-ModelUpdateInteractive {
     return
   }
   Write-Host "Preview:" -ForegroundColor Cyan
-  if ($provider -eq "codex") {
-    Write-Host "  Opus=$($preview.routes.codex.opus); Sonnet=$($preview.routes.codex.sonnet); Haiku=$($preview.routes.codex.haiku); effort=$($preview.routes.codex.reasoning_effort)"
-  } else {
-    Write-Host "  main=$($preview.routes.providers.$provider.main); fast=$($preview.routes.providers.$provider.fast)"
+  $previewRoute = if ($provider -eq "codex") { $preview.routes.codex } else { $preview.routes.providers.$provider }
+  foreach ($role in $script:RouteRoles) {
+    $roleLabel = (Get-Culture).TextInfo.ToTitleCase($role)
+    $reasoningName = "reasoning_$role"
+    Write-Host "  $roleLabel  Model=$([string]$previewRoute.$role)  Reasoning=$([string]$previewRoute.$reasoningName)"
   }
   $confirmation = Read-Host "Apply this persistent route and restart the active FinalKit runtime if needed? [y/N]"
   if ($confirmation -notmatch '^(?i:y|yes)$') {
@@ -875,23 +1021,27 @@ function Open-NativeClaude {
 
 function Open-Science {
   param([ValidateSet("deepseek", "kimi", "glm", "codex")][string]$Mode)
+  Assert-FkctlCapability -Capability "science-isolated-local-identity" -ActionLabel "direct Claude Science local identity"
+  Assert-FkctlCapability -Capability "science-local-session-admission" -ActionLabel "Claude Science local session admission"
   $user = Resolve-LinuxUser
   $output = Get-WslOutput -AsUser $user -Command (@(Get-FkctlPath) + @("start", $Mode))
   if ($output) { Write-Host $output }
   $urls = @($output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^https?://\S+$' })
   $url = if ($urls.Count -gt 0) { $urls[-1] } else { Get-FkctlOutput -Arguments @("url") }
-  Write-Host "Claude Science requires its own supported Claude account sign-in; provider API keys and ChatGPT/Codex login authenticate only the selected gateway." -ForegroundColor Yellow
+  Write-Host "Claude Science uses FinalKit's local-only identity in the isolated WSL profile; no Claude account is required." -ForegroundColor Green
   Write-Host "Claude Science: $url"
   if (-not $NoBrowser) { Start-Process -FilePath $url }
 }
 
 function Open-CurrentScience {
+  Assert-FkctlCapability -Capability "science-isolated-local-identity" -ActionLabel "direct Claude Science local identity"
+  Assert-FkctlCapability -Capability "science-local-session-admission" -ActionLabel "Claude Science local session admission"
   $user = Resolve-LinuxUser
   $output = Get-WslOutput -AsUser $user -Command (@(Get-FkctlPath) + @("restart"))
   if ($output) { Write-Host $output }
   $urls = @($output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^https?://\S+$' })
   $url = if ($urls.Count -gt 0) { $urls[-1] } else { Get-FkctlOutput -Arguments @("url") }
-  Write-Host "Claude Science requires its own supported Claude account sign-in; provider API keys and ChatGPT/Codex login authenticate only the selected gateway." -ForegroundColor Yellow
+  Write-Host "Claude Science uses FinalKit's local-only identity in the isolated WSL profile; no Claude account is required." -ForegroundColor Green
   Write-Host "Claude Science: $url"
   if (-not $NoBrowser) { Start-Process -FilePath $url }
 }
@@ -1048,6 +1198,38 @@ function Invoke-WindowsReview {
   if ($LASTEXITCODE -ne 0) { throw "Windows Codex review failed with exit code $LASTEXITCODE" }
 }
 
+function Invoke-WindowsClaudeController {
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("help", "menu", "init", "configure", "start", "status", "stop", "official")]
+    [string]$ControllerAction,
+    [ValidateSet("", "deepseek", "kimi", "glm", "codex")]
+    [string]$ProfileMode = ""
+  )
+  $controller = Join-Path $PSScriptRoot "WindowsClaude.ps1"
+  if (-not (Test-Path -LiteralPath $controller -PathType Leaf)) {
+    throw "Independent Windows Claude controller is missing: $controller"
+  }
+  $arguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $controller, "-Action", $ControllerAction)
+  if ($ProfileMode) { $arguments += @("-Mode", $ProfileMode) }
+  if ($NoBrowser) { $arguments += "-NoLaunch" }
+  if ($Force) { $arguments += "-Force" }
+  if ($NoBackup) { $arguments += "-NoBackup" }
+  & powershell.exe @arguments
+  if ($LASTEXITCODE -ne 0) { throw "Windows Claude controller failed with exit code $LASTEXITCODE" }
+}
+
+function Get-WindowsClaudeModeArgument {
+  $values = @()
+  foreach ($argument in @($RemainingArgs)) {
+    $values += @($argument -split ',' | Where-Object { $_ -ne "" })
+  }
+  if ($values.Count -ne 1 -or $values[0] -notin @("deepseek", "kimi", "glm", "codex")) {
+    throw "Specify exactly one Windows Claude provider mode: deepseek|kimi|glm|codex"
+  }
+  return [string]$values[0]
+}
+
 function Show-Menu {
   while ($true) {
     Write-Host ""
@@ -1065,6 +1247,8 @@ function Show-Menu {
     Write-Host "  12 Status   13 Doctor   14 Stop Science/gateway   15 Stop automation Chrome"
     Write-Host "  16 Update FinalKit runtime   17 Update provider models   18 Update official tools"
     Write-Host "  19 Claude Code + DeepSeek   20 + Kimi   21 + GLM   22 + Codex"
+    Write-Host "  23 Independent Windows Claude provider stack (three API keys + Codex login)"
+    Write-Host "  24 One-time Windows Codex login -> WSL Codex Science (optional)"
     Write-Host "  0  Exit"
     $selection = Read-Host "Select"
     try {
@@ -1094,6 +1278,8 @@ function Show-Menu {
         "20" { Open-NativeClaude kimi }
         "21" { Open-NativeClaude glm }
         "22" { Open-NativeClaude codex }
+        "23" { Invoke-WindowsClaudeController -ControllerAction menu }
+        "24" { Invoke-WindowsCodexAuthMigrationToWsl }
         "0" { return }
         default { Write-Warning "Unknown selection" }
       }
@@ -1119,9 +1305,10 @@ Providers and start:
   .\FinalKit.ps1 -Action configure-deepseek | configure-kimi | configure-glm
   .\FinalKit.ps1 -Action configure-codex
   .\FinalKit.ps1 -Action configure-codex-device  # beta fallback when browser OAuth cannot return to WSL
+  .\FinalKit.ps1 -Action migrate-windows-codex-auth-to-wsl  # optional one-time copy; WSL remains independent afterwards
   .\FinalKit.ps1 -Action test-codex-tiers        # explicit 3-request Sol/Terra/Luna account acceptance test
   .\FinalKit.ps1 -Action deepseek | kimi | glm | codex  # start Claude Science with the selected route
-  .\FinalKit.ps1 -Action science                         # open Science; supported Claude sign-in required
+  .\FinalKit.ps1 -Action science                         # open the current local-only Science workbench
   .\FinalKit.ps1 -Action claude -RemainingArgs deepseek,--help  # explicit native Claude Code path
 
 Independent updates (no WSL rebuild):
@@ -1129,7 +1316,7 @@ Independent updates (no WSL rebuild):
   .\FinalKit.ps1 -Action models
   .\FinalKit.ps1 -Action discover-models -RemainingArgs deepseek  # read-only official account catalog
   .\FinalKit.ps1 -Action update-models             # interactive preview + persistent update
-  .\FinalKit.ps1 -Action update-models -RemainingArgs codex,--opus,gpt-6-sol,--sonnet,gpt-6-terra,--haiku,gpt-6-luna,--effort,max,--restart
+  .\FinalKit.ps1 -Action update-models -RemainingArgs codex,--opus,gpt-6-sol,--reasoning-opus,max,--sonnet,gpt-6-terra,--reasoning-sonnet,max,--haiku,gpt-6-luna,--reasoning-haiku,max,--restart
   .\FinalKit.ps1 -Action update-tools              # explicit network update; asks for confirmation
   .\FinalKit.ps1 -Action update-tools -Force       # automation: same update without the second prompt
 
@@ -1138,6 +1325,13 @@ Isolated Windows browser bridge:
   .\FinalKit.ps1 -Action browser-science
   .\FinalKit.ps1 -Action browser-mcp-info
   .\FinalKit.ps1 -Action browser-stop
+
+Independent Windows Claude application (three API keys + Windows Codex login; never invokes WSL):
+  .\FinalKit.ps1 -Action windows-claude-init
+  .\FinalKit.ps1 -Action windows-claude-configure -RemainingArgs deepseek  # or kimi/glm/codex
+  .\FinalKit.ps1 -Action windows-claude -RemainingArgs deepseek            # start one configured profile
+  .\FinalKit.ps1 -Action windows-claude-status | windows-claude-stop
+  .\FinalKit.ps1 -Action windows-claude-official                           # restore official 1P mode
 
 Collaboration:
   .\FinalKit.ps1 -Action init-project -Project D:\path\to\project
@@ -1193,6 +1387,7 @@ try {
       Assert-FkctlCapability -Capability "codex-device-oauth" -ActionLabel "ChatGPT Codex device-code login"
       Invoke-Fkctl @("configure-codex-device")
     }
+    "migrate-windows-codex-auth-to-wsl" { Invoke-WindowsCodexAuthMigrationToWsl }
     "login-linux-codex" { Invoke-Fkctl @("login-linux-codex") }
     "deepseek" { Open-Science deepseek }
     "kimi" { Open-Science kimi }
@@ -1231,6 +1426,17 @@ try {
     "browser-mcp-info" { Show-BrowserMcpInfo }
     "init-project" { Initialize-ProjectHandoff }
     "windows-review" { Invoke-WindowsReview }
+    "windows-claude-menu" { Invoke-WindowsClaudeController -ControllerAction menu }
+    "windows-claude-init" { Invoke-WindowsClaudeController -ControllerAction init }
+    "windows-claude-configure" {
+      Invoke-WindowsClaudeController -ControllerAction configure -ProfileMode (Get-WindowsClaudeModeArgument)
+    }
+    "windows-claude" {
+      Invoke-WindowsClaudeController -ControllerAction start -ProfileMode (Get-WindowsClaudeModeArgument)
+    }
+    "windows-claude-status" { Invoke-WindowsClaudeController -ControllerAction status }
+    "windows-claude-stop" { Invoke-WindowsClaudeController -ControllerAction stop }
+    "windows-claude-official" { Invoke-WindowsClaudeController -ControllerAction official }
     "help" { Show-Help }
   }
 } catch {

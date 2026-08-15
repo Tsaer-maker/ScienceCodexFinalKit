@@ -1,7 +1,8 @@
 * text=auto
 *.sh text eol=lf
 *.py text eol=lf
-*.patch text eol=lf
+# Unified-diff syntax requires a single leading space on blank context lines.
+*.patch text eol=lf whitespace=-blank-at-eol
 wsl/fkctl text eol=lf
 wsl/chrome-devtools-mcp-finalkit text eol=lf
 *.ps1 text eol=crlf

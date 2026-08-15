@@ -26,7 +26,7 @@ Science SwitchModel / FinalKit installs or integrates the following components a
 - Source: `https://github.com/haoyuan-sjtu/claude-science-codex-connector.git`
 - Pinned commit: `30b26d7c6f097b186bbd228e93a427a731399960`
 - Upstream license: MIT
-- FinalKit applies `wsl/connector-security.patch` locally after verifying the exact commit.
+- FinalKit applies `wsl/connector-security.patch` locally after verifying the exact commit; the patch aligns the connector's loopback OAuth/user/organization mocks with FinalKit's restart-stable local Science identity.
 - The connector is used only for the ChatGPT/Codex account backend. DeepSeek, Kimi, and GLM use FinalKit's independent direct gateway.
 
 ## Node.js
@@ -48,7 +48,7 @@ Science SwitchModel / FinalKit installs or integrates the following components a
 - Audited local release: HGSX Windows Offline AILAB r7, dated 2026-08-07.
 - `ailab-switch` metadata declares a proprietary license.
 - No HGSX code, binary, Docker layer, credential, or licensed content is included in FinalKit.
-- FinalKit independently implements general mechanisms such as transactional switching, process identity checks, private local endpoints, and rollback.
+- FinalKit independently implements general mechanisms such as isolated local Science identity, empty-refresh-token sessions, transactional switching, process identity checks, private local endpoints, and rollback.
 
 ## Python dependencies
 
