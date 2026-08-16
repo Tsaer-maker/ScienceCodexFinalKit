@@ -7,8 +7,9 @@ param(
     "login-linux-codex", "deepseek", "kimi", "glm", "codex", "claude", "science",
     "restart", "smoke", "test-deepseek", "test-kimi", "test-glm", "test-codex", "test-codex-tiers",
     "models", "discover-models", "update-runtime", "update-models", "update-tools",
+    "agents-menu", "agents-install", "agents-status", "agents", "agents-on", "agents-off", "agents-stop",
     "status", "doctor", "stop", "browser-start", "browser-science", "browser-status", "browser-stop",
-    "browser-mcp-info", "init-project", "windows-review",
+    "browser-mcp-info",
     "windows-claude-menu", "windows-claude-init", "windows-claude-configure", "windows-claude",
     "windows-claude-status", "windows-claude-stop", "windows-claude-official"
   )]
@@ -45,12 +46,34 @@ $BrowserStateRoot = Join-Path $env:LOCALAPPDATA "ScienceCodexFinalKit"
 $BrowserProfile = Join-Path $BrowserStateRoot "ChromeProfile"
 $BrowserState = Join-Path $BrowserStateRoot "browser.json"
 $script:ResolvedLinuxUser = ""
+$script:ResolvedLinuxHome = ""
 $script:RouteRoles = @("opus", "sonnet", "haiku")
 $script:ProviderReasoning = @{
   deepseek = @("auto", "none", "high", "max")
   kimi = @("auto", "none", "low", "high", "max")
-  glm = @("auto", "none", "high", "max")
-  codex = @("none", "low", "medium", "high", "xhigh", "max", "ultra")
+  glm = @("auto", "none", "low", "medium", "high", "xhigh", "max")
+  codex = @("auto", "none", "low", "medium", "high", "xhigh", "max", "ultra")
+}
+
+function Get-ProviderReasoningChoices {
+  param(
+    [Parameter(Mandatory = $true)][ValidateSet("deepseek", "kimi", "glm", "codex")][string]$Provider,
+    [Parameter(Mandatory = $true)][string]$Model
+  )
+  $modelValue = $Model.Trim().ToLowerInvariant()
+  if ($Provider -eq "kimi") {
+    if ($modelValue -match '^kimi-k3(?:\[[a-z0-9._+-]+\])?$') { return @("auto", "low", "high", "max") }
+    if ($modelValue -match '^kimi-k2\.(?:5|6)(?:\[[a-z0-9._+-]+\])?$') { return @("auto", "none") }
+    if ($modelValue -match '^kimi-k2\.7-code(?:-highspeed)?(?:\[[a-z0-9._+-]+\])?$') { return @("auto") }
+    return @("auto")
+  }
+  if ($Provider -eq "glm") {
+    if ($modelValue -match '^glm-5\.3(?:[-._][a-z0-9]+)*$') { return @("auto", "low", "high", "max") }
+    if ($modelValue -match '^glm-5\.2(?:[-._][a-z0-9]+)*$') { return @("auto", "none", "low", "medium", "high", "xhigh", "max") }
+    if ($modelValue -match '^glm-4\.(?:[5-9])(?:[-._][a-z0-9]+)*$') { return @("auto", "none") }
+    return @("auto")
+  }
+  return @($script:ProviderReasoning[$Provider])
 }
 
 function ConvertTo-NativeArgumentString {
@@ -276,10 +299,10 @@ function Test-WindowsAdministrator {
 
 function Invoke-ElevatedWslPreparation {
   $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
-  if (-not $wsl) { throw 'wsl.exe was not found. FinalKit requires Windows 10 2004+ or Windows 11.' }
+  if (-not $wsl) { throw 'wsl.exe was not found. Switchboard requires Windows 10 2004+ or Windows 11.' }
   Write-Host 'Windows must enable/update the WSL platform before a user distribution can be installed.' -ForegroundColor Yellow
-  Write-Host 'FinalKit will request Administrator approval for: wsl.exe --install --no-distribution'
-  Write-Host 'The elevated process installs no Ubuntu distribution and writes no FinalKit credentials.'
+  Write-Host 'Switchboard will request Administrator approval for: wsl.exe --install --no-distribution'
+  Write-Host 'The elevated process installs no Ubuntu distribution and writes no Switchboard credentials.'
   if (Test-WindowsAdministrator) {
     $result = Invoke-WslCapture -Arguments @('--install', '--no-distribution')
     if ($result.StdOut) { Write-Host $result.StdOut.TrimEnd() }
@@ -309,7 +332,7 @@ function Ensure-WslPlatform {
   $detail = Get-WslResultDetail $status
   if ($status.ExitCode -eq 124) {
     throw @"
-The WSL status probe timed out. FinalKit did not create or remove a distribution.
+The WSL status probe timed out. Switchboard did not create or remove a distribution.
 
 Windows reported:
 $detail
@@ -334,7 +357,7 @@ WSL system preparation completed, but Build must stop before installing Ubuntu.
 $restartHint
 
 Restart Windows, sign back in as the same normal Windows user, then run Build again.
-FinalKit deliberately did not install a distribution from the elevated process.
+Switchboard deliberately did not install a distribution from the elevated process.
 
 Current Windows diagnostic:
 $afterDetail
@@ -345,7 +368,7 @@ $afterDetail
 
 function Invoke-WslDistroInstall {
   param([Parameter(Mandatory = $true)][string[]]$Arguments)
-  Write-Host 'The Ubuntu download can take several minutes; FinalKit will preserve the complete WSL diagnostic.'
+  Write-Host 'The Ubuntu download can take several minutes; Switchboard will preserve the complete WSL diagnostic.'
   $result = Invoke-WslCapture -Arguments $Arguments
   if ($result.StdOut) { Write-Host $result.StdOut.TrimEnd() }
   if ($result.StdErr) { Write-Host $result.StdErr.TrimEnd() }
@@ -380,7 +403,7 @@ $detail
         throw @"
 WSL system preparation completed, but Windows must restart before Ubuntu can be installed.
 Restart Windows, sign back in as the same normal Windows user, then run Build again.
-FinalKit deliberately did not install Ubuntu from the elevated process.
+Switchboard deliberately did not install Ubuntu from the elevated process.
 
 Current Windows diagnostic:
 $detail
@@ -390,7 +413,7 @@ $detail
       throw @"
 WSL system preparation completed, but Windows must restart before Ubuntu can be installed.
 Restart Windows, sign back in as the same normal Windows user, then run Build again.
-FinalKit deliberately did not install Ubuntu from the elevated process.
+Switchboard deliberately did not install Ubuntu from the elevated process.
 
 Current Windows diagnostic:
 $afterDetail
@@ -464,7 +487,7 @@ function Get-WslDistroNames {
     if (-not $detail) { $detail = "wsl.exe exited with code $($result.ExitCode)" }
     if ($result.ExitCode -eq 124) {
       throw @"
-The WSL distribution probe timed out. FinalKit did not create, remove, or repair a distribution.
+The WSL distribution probe timed out. Switchboard did not create, remove, or repair a distribution.
 
 Windows reported:
 $detail
@@ -473,7 +496,7 @@ Run `wsl --shutdown`, restart Windows if needed, and then run Build again. Do no
 "@
     }
     throw @"
-WSL is installed but not ready for FinalKit.
+WSL is installed but not ready for Switchboard.
 
 Windows reported:
 $detail
@@ -481,7 +504,7 @@ $detail
 Open PowerShell as Administrator and run:
   wsl --install --no-distribution
 
-Then restart Windows and run Build again. FinalKit did not delete or create a distribution.
+Then restart Windows and run Build again. Switchboard did not delete or create a distribution.
 "@
   }
   return @(($result.StdOut -replace "`0", "") -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -513,7 +536,7 @@ function Convert-ToWslMountPath {
   param([Parameter(Mandatory = $true)][string]$WindowsPath)
   $resolved = (Resolve-Path -LiteralPath $WindowsPath).Path
   if ($resolved -notmatch '^(?<drive>[A-Za-z]):\\(?<rest>.*)$') {
-    throw "FinalKit must be stored on a mounted Windows drive: $resolved"
+    throw "Switchboard must be stored on a mounted Windows drive: $resolved"
   }
   return "/mnt/$($Matches['drive'].ToLowerInvariant())/$($Matches['rest'].Replace('\', '/'))"
 }
@@ -575,13 +598,31 @@ function Resolve-LinuxUser {
   return $candidate
 }
 
-function Get-FkctlPath { return "/home/$(Resolve-LinuxUser)/.local/bin/fkctl" }
+function Resolve-LinuxHome {
+  $user = Resolve-LinuxUser
+  if ($script:ResolvedLinuxHome) { return $script:ResolvedLinuxHome }
+  if (Test-WslDistro) {
+    try {
+      $entry = Get-WslOutput -AsUser root -Command @("getent", "passwd", $user)
+      $fields = @(([string]$entry).Split(":", 7))
+      if ($fields.Count -ge 6 -and $fields[5] -match '^/[^\r\n]*$') {
+        $script:ResolvedLinuxHome = $fields[5]
+        return $script:ResolvedLinuxHome
+      }
+    } catch {
+      # Before first-user creation, useradd's default remains /home/<name>.
+    }
+  }
+  return "/home/$user"
+}
+
+function Get-FkctlPath { return "$(Resolve-LinuxHome)/.local/bin/fkctl" }
 
 function Get-FkctlCapabilities {
   try {
     if (@(Get-WslRegistration -Name $Distro).Count -eq 0) { return @() }
     $user = Resolve-LinuxUser
-    $fkctl = "/home/$user/.local/bin/fkctl"
+    $fkctl = Get-FkctlPath
     $result = Invoke-WslLinuxCapture -AsUser $user -Command @($fkctl, "capabilities") -TimeoutSeconds 12
     if ($result.ExitCode -ne 0) { return @() }
     $payload = (($result.StdOut | Out-String) -replace "`0", "").Trim() | ConvertFrom-Json
@@ -602,7 +643,7 @@ function Assert-FkctlCapability {
     [Parameter(Mandatory = $true)][string]$ActionLabel
   )
   if (-not (Test-FkctlCapability -Capability $Capability)) {
-    throw "RUNTIME_UPDATE_REQUIRED: the installed fkctl does not support $ActionLabel (missing capability '$Capability'). Existing supported commands remain usable. Run menu 16 / -Action update-runtime. If FinalKit is not installed yet, use menu 2."
+    throw "RUNTIME_UPDATE_REQUIRED: the installed fkctl does not support $ActionLabel (missing capability '$Capability'). Existing supported commands remain usable. Run menu 16 / -Action update-runtime. If Switchboard is not installed yet, use menu 2."
   }
 }
 
@@ -672,17 +713,19 @@ function Get-WindowsCodexAuthPayload {
 }
 
 function Invoke-WindowsCodexAuthMigrationToWsl {
-  Assert-FinalKitInstalled
+  Assert-SwitchboardInstalled
   Assert-FkctlCapability -Capability "stdin-codex-auth-import" -ActionLabel "one-time Windows Codex auth import"
+  Assert-FkctlCapability -Capability "transactional-codex-auth-migration" -ActionLabel "one-lock WSL auth migration"
   $user = Resolve-LinuxUser
   $fkctl = Get-FkctlPath
   $sourcePath = Get-WindowsCodexAuthOwnerPath
   Write-Host "One-time Windows Codex auth -> WSL migration" -ForegroundColor Cyan
   Write-Host "  Source:      $sourcePath"
-  Write-Host "  Destination: $Distro /home/$user/.finalkit-client/.codex/auth.json"
+  Write-Host "  Destination: $Distro $(Resolve-LinuxHome)/.finalkit-client/.codex/auth.json"
+  Write-Host "  WSL runtime: captured, stopped and restored atomically under one WSL lock"
   Write-Host "This replaces the WSL Codex login once. It does not create startup sync; WSL keeps its own refresh and login commands."
   if (-not $Force) {
-    $confirmation = Read-Host "Type MIGRATE to stop WSL Science, replace its Codex login, and restart Codex Science"
+    $confirmation = Read-Host "Type MIGRATE to temporarily stop the WSL runtime, replace its Codex login, and restore the prior runtime state"
     if ($confirmation -cne "MIGRATE") {
       Write-Host "Migration cancelled; Windows and WSL auth were not changed."
       return
@@ -690,45 +733,26 @@ function Invoke-WindowsCodexAuthMigrationToWsl {
   }
 
   $payload = Get-WindowsCodexAuthPayload -Path $sourcePath
-  $stopped = $false
-  $importCommitted = $false
   try {
-    Invoke-Fkctl @("stop")
-    $stopped = $true
     $result = Invoke-WslLinuxCapture `
       -AsUser $user `
-      -Command @($fkctl, "import-codex-auth") `
-      -TimeoutSeconds 60 `
+      -Command @(
+        "/usr/bin/timeout", "--signal=TERM", "--kill-after=120s", "240s",
+        $fkctl, "migrate-codex-auth"
+      ) `
       -StandardInputBytes $payload.Bytes
     if ($result.StdOut) { Write-Host $result.StdOut.TrimEnd() }
     if ($result.StdErr) { Write-Host $result.StdErr.TrimEnd() }
     if ($result.ExitCode -ne 0) {
       throw "WSL rejected the imported Windows Codex login (exit $($result.ExitCode))"
     }
-    $importCommitted = $true
-    Invoke-Fkctl @("start", "codex")
     Invoke-Fkctl @("status")
     Write-Host "WINDOWS_CODEX_AUTH_MIGRATION_OK distro=$Distro linux_user=$user" -ForegroundColor Green
+    Write-Host "WSL reported that its exact prior runtime state was restored under one lock."
     Write-Host "Windows and WSL now hold separate copies. Future WSL refresh or re-login does not change Windows, and no startup copy occurs."
     Write-Host "They initially share one OAuth token chain, not two newly issued sessions; if upstream refresh rotation invalidates one copy, re-login only on that side."
   } catch {
-    $primary = $_.Exception.Message
-    if ($stopped -and -not $importCommitted) {
-      $restartFailure = ""
-      try {
-        Invoke-Fkctl @("start", "codex")
-      } catch {
-        $restartFailure = $_.Exception.Message
-      }
-      if ($restartFailure) {
-        throw "$primary`nThe WSL importer restored the prior auth bytes, but restarting the prior Codex runtime also failed: $restartFailure"
-      }
-      throw "$primary`nThe WSL importer restored the prior auth bytes, and Codex Science was restarted with the prior login."
-    }
-    if ($importCommitted) {
-      throw "$primary`nThe one-time auth import passed official Codex validation and remains committed; no recurring sync was enabled."
-    }
-    throw
+    throw "$($_.Exception.Message)`nThe WSL command owns snapshot, stop, auth replacement and restoration as one locked transaction; inspect any explicit rollback-incomplete detail above."
   } finally {
     if ($null -ne $payload -and $null -ne $payload.Bytes) {
       [Array]::Clear($payload.Bytes, 0, $payload.Bytes.Length)
@@ -831,6 +855,7 @@ function Ensure-LinuxUser {
   if ($identity -eq $user) {
     Write-Host "Default Linux user is already correct: $user"
     $script:ResolvedLinuxUser = $user
+    $script:ResolvedLinuxHome = ""
     return
   }
   Invoke-WslManagement `
@@ -841,10 +866,11 @@ function Ensure-LinuxUser {
   $identity = Get-WslOutput -Command @("id", "-un")
   if ($identity -ne $user) { throw "Default-user verification failed: expected $user, got $identity" }
   $script:ResolvedLinuxUser = $user
+  $script:ResolvedLinuxHome = ""
 }
 
 function Invoke-Build {
-  Write-Host "FinalKit package folder: $KitRoot" -ForegroundColor DarkGray
+  Write-Host "Switchboard package folder: $KitRoot" -ForegroundColor DarkGray
   Ensure-Distro
   Ensure-LinuxUser
   $user = Resolve-LinuxUser
@@ -856,35 +882,35 @@ function Invoke-Build {
   Invoke-WslNative -AsUser $user -Command @("bash", $installer, "--user")
   Write-Host "[3/4] Pinned browser bridge dependencies ..."
   Invoke-Fkctl -Arguments @("doctor")
-  Write-Host "[4/4] Windows Codex collaboration lane ..."
+  Write-Host "[4/4] Windows Codex login availability ..."
   $windowsCodex = Get-Command codex -ErrorAction SilentlyContinue
   if ($windowsCodex) {
     & $windowsCodex.Source --version
     & $windowsCodex.Source login status
   } else {
-    Write-Warning "Windows Codex was not found; WSL stack works, but windows-review needs Codex Desktop/CLI."
+    Write-Warning "Windows Codex CLI was not found; the WSL provider stack still works, but Windows login reuse and one-time auth import are unavailable."
   }
   Write-Host "BUILD_OK distro=$Distro linux_user=$user" -ForegroundColor Green
   Write-Host "Each additional Linux user can rerun Build with -LinuxUser <name>; credentials remain per-user."
 }
 
-function Assert-FinalKitInstalled {
+function Assert-SwitchboardInstalled {
   if (-not (Test-WslDistro)) {
-    throw "FinalKit update needs an existing $Distro distribution. Use menu 2 for the first installation."
+    throw "Switchboard update needs an existing $Distro distribution. Use menu 2 for the first installation."
   }
   $user = Resolve-LinuxUser
-  $fkctl = "/home/$user/.local/bin/fkctl"
+  $fkctl = Get-FkctlPath
   $result = Invoke-WslLinuxCapture -AsUser $user -Command @("test", "-x", $fkctl) -TimeoutSeconds 12
   if ($result.ExitCode -ne 0) {
-    throw "FinalKit is not installed for Linux user '$user'. Use menu 2 for the first installation."
+    throw "Switchboard is not installed for Linux user '$user'. Use menu 2 for the first installation."
   }
 }
 
 function Invoke-RuntimeUpdate {
-  Assert-FinalKitInstalled
+  Assert-SwitchboardInstalled
   $user = Resolve-LinuxUser
   $wslKitRoot = Convert-ToWslMountPath -WindowsPath $KitRoot
-  Write-Host "Updating only the FinalKit manager, gateways and managed connector patch ..." -ForegroundColor Cyan
+  Write-Host "Updating only the Switchboard manager, gateways and managed connector patch ..." -ForegroundColor Cyan
   Write-Host "Ubuntu, official clients, API keys, OAuth and persistent model routes are not rebuilt."
   Invoke-WslNative -AsUser $user -Command @("bash", "$wslKitRoot/wsl/install-final-stack.sh", "--runtime")
   Write-Host "RUNTIME_UPDATE_OK package=$PackageVersion linux_user=$user" -ForegroundColor Green
@@ -892,11 +918,11 @@ function Invoke-RuntimeUpdate {
 }
 
 function Invoke-ToolsUpdate {
-  Assert-FinalKitInstalled
+  Assert-SwitchboardInstalled
   $user = Resolve-LinuxUser
   $wslKitRoot = Convert-ToWslMountPath -WindowsPath $KitRoot
   Write-Host "This network operation updates official Claude Science, Claude Code, Codex CLI," -ForegroundColor Cyan
-  Write-Host "plus the Node/Chrome MCP versions pinned by this package. FinalKit auth and model routes are preserved."
+  Write-Host "plus the Node/Chrome MCP versions pinned by this package. Switchboard auth and model routes are preserved."
   if (-not $Force) {
     $confirmation = Read-Host "Continue with the official tool update? [y/N]"
     if ($confirmation -notmatch '^(?i:y|yes)$') {
@@ -924,8 +950,9 @@ function Invoke-ModelUpdateInteractive {
   for ($index = 0; $index -lt $routeTargets.Count; $index++) {
     $target = $routeTargets[$index]
     $parts = @($script:RouteRoles | ForEach-Object {
+      $modelName = "model_$_"
       $reasoningName = "reasoning_$_"
-      "$_=($([string]$target.$_),$([string]$target.$reasoningName))"
+      "$_=($([string]$target.$modelName),$([string]$target.$reasoningName))"
     })
     Write-Host ("  {0} {1,-8} {2}" -f ($index + 1), $routeLabels[$index], ($parts -join " "))
   }
@@ -955,11 +982,13 @@ function Invoke-ModelUpdateInteractive {
       }
     }
   }
-  Write-Host ("Reasoning: " + (@($script:ProviderReasoning[$provider]) -join ", "))
+  Write-Host "Reasoning is shown per selected model below."
+  $usesCodexAuto = $false
   foreach ($role in $script:RouteRoles) {
     $roleLabel = (Get-Culture).TextInfo.ToTitleCase($role)
-    $model = Read-Host "$roleLabel Model or list number [$([string]$current.$role)]"
-    if (-not $model) { $model = [string]$current.$role }
+    $modelName = "model_$role"
+    $model = Read-Host "$roleLabel Model or list number [$([string]$current.$modelName)]"
+    if (-not $model) { $model = [string]$current.$modelName }
     if ($catalog -and $model -match '^\d+$') {
       $modelIndex = [int]$model
       if ($modelIndex -lt 1 -or $modelIndex -gt @($catalog.models).Count) {
@@ -968,13 +997,21 @@ function Invoke-ModelUpdateInteractive {
       $model = [string]$catalog.models[$modelIndex - 1]
     }
     $reasoningName = "reasoning_$role"
-    $reasoning = Read-Host "$roleLabel Reasoning [$([string]$current.$reasoningName)]"
-    if (-not $reasoning) { $reasoning = [string]$current.$reasoningName }
+    $reasoningChoices = @(Get-ProviderReasoningChoices -Provider $provider -Model $model)
+    $reasoningSeed = [string]$current.$reasoningName
+    if ($reasoningSeed -notin $reasoningChoices) { $reasoningSeed = "auto" }
+    Write-Host ("$roleLabel Reasoning: " + ($reasoningChoices -join ", "))
+    $reasoning = Read-Host "$roleLabel Reasoning [$reasoningSeed]"
+    if (-not $reasoning) { $reasoning = $reasoningSeed }
     $reasoning = $reasoning.ToLowerInvariant()
-    if ($reasoning -notin @($script:ProviderReasoning[$provider])) {
-      throw "$roleLabel Reasoning must be one of: $(@($script:ProviderReasoning[$provider]) -join ', ')"
+    if ($reasoning -notin $reasoningChoices) {
+      throw "$roleLabel Reasoning must be one of: $($reasoningChoices -join ', ')"
     }
+    if ($provider -eq "codex" -and $reasoning -eq "auto") { $usesCodexAuto = $true }
     $arguments += @("--$role", $model, "--reasoning-$role", $reasoning)
+  }
+  if ($usesCodexAuto) {
+    Assert-FkctlCapability -Capability "codex-reasoning-auto-pass-through" -ActionLabel "Codex role-effort pass-through"
   }
   $preview = (Get-FkctlOutput ($arguments + @("--dry-run", "--json"))) | ConvertFrom-Json
   if (-not $preview.changed) {
@@ -985,10 +1022,11 @@ function Invoke-ModelUpdateInteractive {
   $previewRoute = if ($provider -eq "codex") { $preview.routes.codex } else { $preview.routes.providers.$provider }
   foreach ($role in $script:RouteRoles) {
     $roleLabel = (Get-Culture).TextInfo.ToTitleCase($role)
+    $modelName = "model_$role"
     $reasoningName = "reasoning_$role"
-    Write-Host "  $roleLabel  Model=$([string]$previewRoute.$role)  Reasoning=$([string]$previewRoute.$reasoningName)"
+    Write-Host "  $roleLabel  Model=$([string]$previewRoute.$modelName)  Reasoning=$([string]$previewRoute.$reasoningName)"
   }
-  $confirmation = Read-Host "Apply this persistent route and restart the active FinalKit runtime if needed? [y/N]"
+  $confirmation = Read-Host "Apply this persistent route and restart the active Switchboard runtime if needed? [y/N]"
   if ($confirmation -notmatch '^(?i:y|yes)$') {
     Write-Host "Model update cancelled; the preview did not write anything."
     return
@@ -1028,7 +1066,7 @@ function Open-Science {
   if ($output) { Write-Host $output }
   $urls = @($output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^https?://\S+$' })
   $url = if ($urls.Count -gt 0) { $urls[-1] } else { Get-FkctlOutput -Arguments @("url") }
-  Write-Host "Claude Science uses FinalKit's local-only identity in the isolated WSL profile; no Claude account is required." -ForegroundColor Green
+  Write-Host "Claude Science uses Switchboard's local-only identity in the isolated WSL profile; no Claude account is required." -ForegroundColor Green
   Write-Host "Claude Science: $url"
   if (-not $NoBrowser) { Start-Process -FilePath $url }
 }
@@ -1041,7 +1079,7 @@ function Open-CurrentScience {
   if ($output) { Write-Host $output }
   $urls = @($output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^https?://\S+$' })
   $url = if ($urls.Count -gt 0) { $urls[-1] } else { Get-FkctlOutput -Arguments @("url") }
-  Write-Host "Claude Science uses FinalKit's local-only identity in the isolated WSL profile; no Claude account is required." -ForegroundColor Green
+  Write-Host "Claude Science uses Switchboard's local-only identity in the isolated WSL profile; no Claude account is required." -ForegroundColor Green
   Write-Host "Claude Science: $url"
   if (-not $NoBrowser) { Start-Process -FilePath $url }
 }
@@ -1142,11 +1180,11 @@ function Stop-BrowserBridge {
 function Show-BrowserMcpInfo {
   param([switch]$ScienceReady)
   $user = Resolve-LinuxUser
-  $linuxHome = "/home/$user"
+  $linuxHome = Resolve-LinuxHome
   $binary = "$linuxHome/.local/bin/chrome-devtools-mcp-finalkit"
   if (-not $ScienceReady) {
-    Write-Host "Open current Science: .\FinalKit.ps1 -Action browser-science"
-    Write-Host "Browser only:        .\FinalKit.ps1 -Action browser-start"
+    Write-Host "Open current Science: .\Switchboard.ps1 -Action browser-science"
+    Write-Host "Browser only:        .\Switchboard.ps1 -Action browser-start"
   }
   Write-Host "Claude Science > Customize > Connectors > Custom MCP (stdio):"
   Write-Host "  Command: $binary"
@@ -1154,48 +1192,6 @@ function Show-BrowserMcpInfo {
   Write-Host "Optional Claude Code registration (run inside this WSL user):"
   Write-Host "  claude mcp add chrome-devtools -- $binary --browser-url=$(Get-BrowserEndpoint) --slim"
   Write-Warning "This MCP can inspect and control every tab opened in the isolated Chrome profile."
-}
-
-function Resolve-ProjectPath {
-  if (-not $Project) { return (Get-Location).Path }
-  if (-not (Test-Path -LiteralPath $Project -PathType Container)) { throw "Project does not exist: $Project" }
-  return (Resolve-Path -LiteralPath $Project).Path
-}
-
-function Initialize-ProjectHandoff {
-  $projectPath = Resolve-ProjectPath
-  $targetDir = Join-Path $projectPath ".science-codex"
-  $target = Join-Path $targetDir "HANDOFF.md"
-  $template = Join-Path $KitRoot "project-template\HANDOFF.md"
-  $reviewSkillSource = Join-Path $KitRoot "claude-science-skills\reviewing-codex-science\SKILL.md"
-  $reviewSkill = Join-Path $KitRoot "claude-science-skills\reviewing-codex-science.zip"
-  if (Test-Path -LiteralPath $target) {
-    Write-Host "Handoff already exists; unchanged: $target"
-  } else {
-    New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-    Copy-Item -LiteralPath $template -Destination $target
-    Write-Host "Created collaboration handoff: $target"
-  }
-  if ((Test-Path -LiteralPath $reviewSkillSource -PathType Leaf) -and (Test-Path -LiteralPath $reviewSkill -PathType Leaf)) {
-    Write-Host "Claude Science review skill source: $reviewSkillSource"
-    Write-Host "Portable skill ZIP: $reviewSkill"
-    Write-Host "Publish from the user-controlled Claude Science browser with customize + host.skills; see operation.md section 9.2"
-  } else {
-    Write-Warning "Claude Science review skill source or package is missing: $reviewSkillSource ; $reviewSkill"
-  }
-}
-
-function Invoke-WindowsReview {
-  $projectPath = Resolve-ProjectPath
-  $prompt = Get-Content -LiteralPath (Join-Path $KitRoot "project-template\windows-codex-review-prompt.zh-CN.md") -Raw -Encoding UTF8
-  $handoff = Join-Path $projectPath ".science-codex\HANDOFF.md"
-  if (Test-Path -LiteralPath $handoff) { $prompt += "`n`nProject handoff file: $handoff" }
-  $codex = Get-Command codex -ErrorAction Stop
-  & $codex.Source login status
-  if ($LASTEXITCODE -ne 0) { throw "Windows Codex is not logged in. Run: codex login" }
-  & $codex.Source exec --ignore-user-config --ephemeral --sandbox read-only --color never `
-    --cd $projectPath --skip-git-repo-check $prompt
-  if ($LASTEXITCODE -ne 0) { throw "Windows Codex review failed with exit code $LASTEXITCODE" }
 }
 
 function Invoke-WindowsClaudeController {
@@ -1219,6 +1215,76 @@ function Invoke-WindowsClaudeController {
   if ($LASTEXITCODE -ne 0) { throw "Windows Claude controller failed with exit code $LASTEXITCODE" }
 }
 
+function Open-MultiAgentCodex {
+  param(
+    [ValidateSet("deepseek", "kimi", "glm", "codex")][string]$Mode,
+    [string]$ProjectPath = "",
+    [string[]]$Arguments = @()
+  )
+  Assert-FkctlCapability -Capability "multi-agent-provider-shell" -ActionLabel "provider-routed multi-agent Codex"
+  $resolvedProject = if ($ProjectPath) {
+    if (-not (Test-Path -LiteralPath $ProjectPath -PathType Container)) {
+      throw "Project does not exist: $ProjectPath"
+    }
+    (Resolve-Path -LiteralPath $ProjectPath).Path
+  } else {
+    (Get-Location).Path
+  }
+  $wslProject = Convert-ToWslMountPath -WindowsPath $resolvedProject
+  $forwarded = @()
+  foreach ($argument in @($Arguments)) {
+    $forwarded += @($argument -split ',' | Where-Object { $_ -ne "" })
+  }
+  $user = Resolve-LinuxUser
+  $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
+  if (-not $wsl) { throw "wsl.exe was not found" }
+  $terminalArgs = @(
+    "-d", $Distro, "-u", $user, "--cd", $wslProject, "--",
+    (Get-FkctlPath), "codex", $Mode
+  ) + $forwarded
+  [void](Start-Process -FilePath $wsl.Source -ArgumentList (ConvertTo-NativeArgumentString -Arguments $terminalArgs))
+  Write-Host "Opened provider-routed multi-agent Codex in $resolvedProject." -ForegroundColor Green
+  Write-Host "Claude worker route: $Mode; Windows and Claude Science authentication were not changed."
+  Write-Host "Start a fresh Codex task, then explicitly invoke:" -ForegroundColor Cyan
+  Write-Host '  Use $codex-claude-orchestrator:claude-pty-agents for this bounded outcome; keep Codex as authority and verify the handoff.'
+  Write-Host "Plugin installation exposes transport; it does not silently add executor policy to AGENTS.md."
+}
+
+function Invoke-MultiAgentControl {
+  param([Parameter(Mandatory = $true)][string[]]$Arguments)
+  Assert-FkctlCapability -Capability "pinned-multi-agent-module" -ActionLabel "optional multi-agent module"
+  Invoke-Fkctl (@("agents") + $Arguments)
+}
+
+function Show-MultiAgentMenu {
+  while ($true) {
+    Write-Host ""
+    Write-Host "Switchboard Multi-Agent (optional WSL module)"
+    Write-Host "  1  Install/update pinned integration   2 Status"
+    Write-Host "  3  Start with DeepSeek   4 Kimi   5 GLM   6 ChatGPT Codex route"
+    Write-Host "  7  Enable new workers    8 Disable new workers   9 Disable and stop owned workers"
+    Write-Host "  0  Back"
+    $selection = Read-Host "Select"
+    try {
+      switch ($selection) {
+        "1" { Invoke-MultiAgentControl @("install") }
+        "2" { Invoke-MultiAgentControl @("status") }
+        "3" { Open-MultiAgentCodex -Mode deepseek -ProjectPath $Project }
+        "4" { Open-MultiAgentCodex -Mode kimi -ProjectPath $Project }
+        "5" { Open-MultiAgentCodex -Mode glm -ProjectPath $Project }
+        "6" { Open-MultiAgentCodex -Mode codex -ProjectPath $Project }
+        "7" { Invoke-MultiAgentControl @("on") }
+        "8" { Invoke-MultiAgentControl @("off") }
+        "9" { Invoke-MultiAgentControl @("off", "--stop") }
+        "0" { return }
+        default { Write-Warning "Unknown selection" }
+      }
+    } catch {
+      Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    }
+  }
+}
+
 function Get-WindowsClaudeModeArgument {
   $values = @()
   foreach ($argument in @($RemainingArgs)) {
@@ -1233,7 +1299,7 @@ function Get-WindowsClaudeModeArgument {
 function Show-Menu {
   while ($true) {
     Write-Host ""
-    Write-Host "Science SwitchModel / FinalKit $PackageVersion"
+    Write-Host "Claude Codex Switchboard $PackageVersion"
     Write-Host "  Running from: $KitRoot" -ForegroundColor DarkGray
     Write-Host "  Default route: Opus=Sol max | Sonnet=Terra max | Haiku=Luna max; menu 17 persists future models" -ForegroundColor Cyan
     Write-Host "  1  Clear selected Ubuntu WSL (confirmed + backup)"
@@ -1245,10 +1311,11 @@ function Show-Menu {
     Write-Host "  7  Start Science + DeepSeek   8 + Kimi   9 + GLM   10 + Codex"
     Write-Host "  11 Open current Science in automation Chrome"
     Write-Host "  12 Status   13 Doctor   14 Stop Science/gateway   15 Stop automation Chrome"
-    Write-Host "  16 Update FinalKit runtime   17 Update provider models   18 Update official tools"
+    Write-Host "  16 Update Switchboard runtime   17 Update provider models   18 Update official tools"
     Write-Host "  19 Claude Code + DeepSeek   20 + Kimi   21 + GLM   22 + Codex"
     Write-Host "  23 Independent Windows Claude provider stack (three API keys + Codex login)"
-    Write-Host "  24 One-time Windows Codex login -> WSL Codex Science (optional)"
+    Write-Host "  24 One-time Windows Codex login -> independent WSL Codex login (optional)"
+    Write-Host "  25 Optional multi-agent module (Codex controls provider-routed Claude workers)"
     Write-Host "  0  Exit"
     $selection = Read-Host "Select"
     try {
@@ -1280,6 +1347,7 @@ function Show-Menu {
         "22" { Open-NativeClaude codex }
         "23" { Invoke-WindowsClaudeController -ControllerAction menu }
         "24" { Invoke-WindowsCodexAuthMigrationToWsl }
+        "25" { Show-MultiAgentMenu }
         "0" { return }
         default { Write-Warning "Unknown selection" }
       }
@@ -1291,53 +1359,53 @@ function Show-Menu {
 
 function Show-Help {
   @"
-Science SwitchModel / FinalKit $PackageVersion
+Claude Codex Switchboard $PackageVersion
 
 1. Clear (optional, destructive, exact-name confirmation, backup by default):
-  .\FinalKit.ps1 -Action clear
-  .\FinalKit.ps1 -Action clear -AllUbuntu
+  .\Switchboard.ps1 -Action clear
+  .\Switchboard.ps1 -Action clear -AllUbuntu
 
 2. First install or full repair of standard Ubuntu-24.04:
-  .\FinalKit.ps1 -Action build
-  .\FinalKit.ps1 -Action build -LinuxUser alice
+  .\Switchboard.ps1 -Action build
+  .\Switchboard.ps1 -Action build -LinuxUser alice
 
 Providers and start:
-  .\FinalKit.ps1 -Action configure-deepseek | configure-kimi | configure-glm
-  .\FinalKit.ps1 -Action configure-codex
-  .\FinalKit.ps1 -Action configure-codex-device  # beta fallback when browser OAuth cannot return to WSL
-  .\FinalKit.ps1 -Action migrate-windows-codex-auth-to-wsl  # optional one-time copy; WSL remains independent afterwards
-  .\FinalKit.ps1 -Action test-codex-tiers        # explicit 3-request Sol/Terra/Luna account acceptance test
-  .\FinalKit.ps1 -Action deepseek | kimi | glm | codex  # start Claude Science with the selected route
-  .\FinalKit.ps1 -Action science                         # open the current local-only Science workbench
-  .\FinalKit.ps1 -Action claude -RemainingArgs deepseek,--help  # explicit native Claude Code path
+  .\Switchboard.ps1 -Action configure-deepseek | configure-kimi | configure-glm
+  .\Switchboard.ps1 -Action configure-codex
+  .\Switchboard.ps1 -Action configure-codex-device  # beta fallback when browser OAuth cannot return to WSL
+  .\Switchboard.ps1 -Action migrate-windows-codex-auth-to-wsl  # optional one-time copy; WSL remains independent afterwards
+  .\Switchboard.ps1 -Action test-codex-tiers        # explicit 3-request Sol/Terra/Luna account acceptance test
+  .\Switchboard.ps1 -Action deepseek | kimi | glm | codex  # start Claude Science with the selected route
+  .\Switchboard.ps1 -Action science                         # open the current local-only Science workbench
+  .\Switchboard.ps1 -Action claude -RemainingArgs deepseek,--help  # explicit native Claude Code path
 
 Independent updates (no WSL rebuild):
-  .\FinalKit.ps1 -Action update-runtime
-  .\FinalKit.ps1 -Action models
-  .\FinalKit.ps1 -Action discover-models -RemainingArgs deepseek  # read-only official account catalog
-  .\FinalKit.ps1 -Action update-models             # interactive preview + persistent update
-  .\FinalKit.ps1 -Action update-models -RemainingArgs codex,--opus,gpt-6-sol,--reasoning-opus,max,--sonnet,gpt-6-terra,--reasoning-sonnet,max,--haiku,gpt-6-luna,--reasoning-haiku,max,--restart
-  .\FinalKit.ps1 -Action update-tools              # explicit network update; asks for confirmation
-  .\FinalKit.ps1 -Action update-tools -Force       # automation: same update without the second prompt
+  .\Switchboard.ps1 -Action update-runtime
+  .\Switchboard.ps1 -Action models
+  .\Switchboard.ps1 -Action discover-models -RemainingArgs deepseek  # read-only official account catalog
+  .\Switchboard.ps1 -Action update-models             # interactive preview + persistent update
+  .\Switchboard.ps1 -Action update-models -RemainingArgs codex,--opus,gpt-6-sol,--reasoning-opus,max,--sonnet,gpt-6-terra,--reasoning-sonnet,max,--haiku,gpt-6-luna,--reasoning-haiku,max,--restart
+  .\Switchboard.ps1 -Action update-tools              # explicit network update; asks for confirmation
+  .\Switchboard.ps1 -Action update-tools -Force       # automation: same update without the second prompt
+
+Optional multi-agent module (WSL only; does not change Windows or Science auth):
+  .\Switchboard.ps1 -Action agents-install
+  .\Switchboard.ps1 -Action agents-status
+  .\Switchboard.ps1 -Action agents -Project D:\path\to\repo -RemainingArgs deepseek
+  .\Switchboard.ps1 -Action agents-on | agents-off | agents-stop
 
 Isolated Windows browser bridge:
-  .\FinalKit.ps1 -Action browser-start
-  .\FinalKit.ps1 -Action browser-science
-  .\FinalKit.ps1 -Action browser-mcp-info
-  .\FinalKit.ps1 -Action browser-stop
+  .\Switchboard.ps1 -Action browser-start
+  .\Switchboard.ps1 -Action browser-science
+  .\Switchboard.ps1 -Action browser-mcp-info
+  .\Switchboard.ps1 -Action browser-stop
 
 Independent Windows Claude application (three API keys + Windows Codex login; never invokes WSL):
-  .\FinalKit.ps1 -Action windows-claude-init
-  .\FinalKit.ps1 -Action windows-claude-configure -RemainingArgs deepseek  # or kimi/glm/codex
-  .\FinalKit.ps1 -Action windows-claude -RemainingArgs deepseek            # start one configured profile
-  .\FinalKit.ps1 -Action windows-claude-status | windows-claude-stop
-  .\FinalKit.ps1 -Action windows-claude-official                           # restore official 1P mode
-
-Collaboration:
-  .\FinalKit.ps1 -Action init-project -Project D:\path\to\project
-  .\FinalKit.ps1 -Action windows-review -Project D:\path\to\project
-  Publish claude-science-skills\reviewing-codex-science\SKILL.md from the Claude Science browser with customize + host.skills
-  The sibling ZIP is only for Claude surfaces that expose standard custom-Skills upload
+  .\Switchboard.ps1 -Action windows-claude-init
+  .\Switchboard.ps1 -Action windows-claude-configure -RemainingArgs deepseek  # or kimi/glm/codex
+  .\Switchboard.ps1 -Action windows-claude -RemainingArgs deepseek            # start one configured profile
+  .\Switchboard.ps1 -Action windows-claude-status | windows-claude-stop
+  .\Switchboard.ps1 -Action windows-claude-official                           # restore official 1P mode
 
 Defaults: distro=$Distro; normal per-Windows-user WSL storage; Linux user=auto from the current Windows username (or -LinuxUser)
 "@
@@ -1376,6 +1444,24 @@ try {
       }
     }
     "update-tools" { Invoke-ToolsUpdate }
+    "agents-menu" { Show-MultiAgentMenu }
+    "agents-install" { Invoke-MultiAgentControl @("install") }
+    "agents-status" { Invoke-MultiAgentControl @("status") }
+    "agents-on" { Invoke-MultiAgentControl @("on") }
+    "agents-off" { Invoke-MultiAgentControl @("off") }
+    "agents-stop" { Invoke-MultiAgentControl @("off", "--stop") }
+    "agents" {
+      $agentArguments = @()
+      foreach ($argument in @($RemainingArgs)) {
+        $agentArguments += @($argument -split ',' | Where-Object { $_ -ne "" })
+      }
+      if ($agentArguments.Count -lt 1 -or $agentArguments[0] -notin @("deepseek", "kimi", "glm", "codex")) {
+        throw "agents requires provider first: deepseek|kimi|glm|codex"
+      }
+      $agentMode = [string]$agentArguments[0]
+      $agentTail = if ($agentArguments.Count -gt 1) { @($agentArguments[1..($agentArguments.Count - 1)]) } else { @() }
+      Open-MultiAgentCodex -Mode $agentMode -ProjectPath $Project -Arguments $agentTail
+    }
     "configure-deepseek" { Invoke-Fkctl @("configure-deepseek") }
     "configure-kimi" { Invoke-Fkctl @("configure-kimi") }
     "configure-glm" { Invoke-Fkctl @("configure-glm") }
@@ -1424,8 +1510,6 @@ try {
     "browser-status" { Show-BrowserStatus }
     "browser-stop" { Stop-BrowserBridge }
     "browser-mcp-info" { Show-BrowserMcpInfo }
-    "init-project" { Initialize-ProjectHandoff }
-    "windows-review" { Invoke-WindowsReview }
     "windows-claude-menu" { Invoke-WindowsClaudeController -ControllerAction menu }
     "windows-claude-init" { Invoke-WindowsClaudeController -ControllerAction init }
     "windows-claude-configure" {

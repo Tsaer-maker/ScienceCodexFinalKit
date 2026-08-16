@@ -1,11 +1,11 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "host": "127.0.0.1",
   "port": 18987,
   "profiles": {
     "deepseek": {
       "profile_id": "c20f9d40-9b8e-5bc3-a3b1-1b326edd8a63",
-      "name": "FinalKit Windows DeepSeek API",
+      "name": "DeepSeek API",
       "protocol": "anthropic-messages",
       "upstream": "https://api.deepseek.com/anthropic",
       "auth_style": "x-api-key",
@@ -18,7 +18,7 @@
     },
     "kimi": {
       "profile_id": "73af0626-0caa-56fb-87f3-e87eb120235e",
-      "name": "FinalKit Windows Kimi API",
+      "name": "Kimi API",
       "protocol": "anthropic-messages",
       "upstream": "https://api.moonshot.ai/anthropic",
       "auth_style": "bearer",
@@ -31,7 +31,7 @@
     },
     "glm": {
       "profile_id": "84e1ab3e-593c-5fc9-a078-5757f400fba7",
-      "name": "FinalKit Windows GLM API",
+      "name": "GLM API",
       "protocol": "anthropic-messages",
       "upstream": "https://open.bigmodel.cn/api/anthropic",
       "auth_style": "x-api-key",
@@ -44,7 +44,7 @@
     },
     "codex": {
       "profile_id": "642becc7-c4ca-52ec-8c7d-7e66a1c56023",
-      "name": "FinalKit Windows Codex Login",
+      "name": "Codex Login",
       "protocol": "openai-responses",
       "upstream": "https://chatgpt.com/backend-api/codex",
       "auth_style": "codex-cli",

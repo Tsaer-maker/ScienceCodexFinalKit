@@ -3,6 +3,7 @@
 *.py text eol=lf
 # Unified-diff syntax requires a single leading space on blank context lines.
 *.patch text eol=lf whitespace=-blank-at-eol
+*.lock text eol=lf
 wsl/fkctl text eol=lf
 wsl/chrome-devtools-mcp-finalkit text eol=lf
 *.ps1 text eol=crlf

@@ -25,13 +25,44 @@ $RuntimeRoot = Join-Path $StateRoot "runtime"
 $LogsRoot = Join-Path $StateRoot "logs"
 $GatewayStatePath = Join-Path $RuntimeRoot "gateway-state.json"
 $RuntimeConfigPath = Join-Path $RuntimeRoot "gateway-runtime.json"
+$ControllerLockPath = Join-Path $StateRoot "controller.lock"
+$script:WindowsClaudeMutationLockDepth = 0
+$script:WindowsClaudeMutationLockStream = $null
 $script:Modes = @("deepseek", "kimi", "glm", "codex")
 $script:Roles = @("opus", "sonnet", "haiku")
 $script:ReasoningChoices = @{
   deepseek = @("auto", "none", "high", "max")
   kimi = @("auto", "none", "low", "high", "max")
-  glm = @("auto", "none", "high", "max")
-  codex = @("none", "low", "medium", "high", "xhigh", "max", "ultra")
+  glm = @("auto", "none", "low", "medium", "high", "xhigh", "max")
+  codex = @("auto", "none", "low", "medium", "high", "xhigh", "max", "ultra")
+}
+
+function Get-ProfileReasoningChoices {
+  param(
+    [Parameter(Mandatory = $true)][ValidateSet("deepseek", "kimi", "glm", "codex")][string]$ProfileMode,
+    [Parameter(Mandatory = $true)][string]$Model
+  )
+  $modelValue = $Model.Trim().ToLowerInvariant()
+  if ($ProfileMode -eq "deepseek") { return @($script:ReasoningChoices.deepseek) }
+  if ($ProfileMode -eq "kimi") {
+    if ($modelValue -match '^kimi-k3(?:\[[a-z0-9._+-]+\])?$') { return @("auto", "low", "high", "max") }
+    if ($modelValue -match '^kimi-k2\.(?:5|6)(?:\[[a-z0-9._+-]+\])?$') { return @("auto", "none") }
+    if ($modelValue -match '^kimi-k2\.7-code(?:-highspeed)?(?:\[[a-z0-9._+-]+\])?$') { return @("auto") }
+    return @("auto")
+  }
+  if ($ProfileMode -eq "glm") {
+    if ($modelValue -match '^glm-5\.3(?:[-._][a-z0-9]+)*$') {
+      return @("auto", "low", "high", "max")
+    }
+    if ($modelValue -match '^glm-5\.2(?:[-._][a-z0-9]+)*$') {
+      return @("auto", "none", "low", "medium", "high", "xhigh", "max")
+    }
+    if ($modelValue -match '^glm-4\.(?:[5-9])(?:[-._][a-z0-9]+)*$') {
+      return @("auto", "none")
+    }
+    return @("auto")
+  }
+  return @($script:ReasoningChoices.codex)
 }
 $script:ProviderModels = @{
   deepseek = @("deepseek-v4-pro", "deepseek-v4-flash")
@@ -45,6 +76,49 @@ $script:ProfileIds = @{
   codex = "642becc7-c4ca-52ec-8c7d-7e66a1c56023"
 }
 $script:Entropy = [Text.Encoding]::UTF8.GetBytes("ScienceCodexFinalKit/WindowsClaude/DPAPI/v1")
+
+function Invoke-WithWindowsClaudeMutationLock {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)][scriptblock]$Body,
+    [ValidateRange(1, 300000)][int]$TimeoutMilliseconds = 30000
+  )
+  if ($script:WindowsClaudeMutationLockDepth -gt 0) {
+    $script:WindowsClaudeMutationLockDepth++
+    try { & $Body } finally { $script:WindowsClaudeMutationLockDepth-- }
+    return
+  }
+
+  if (-not (Test-Path -LiteralPath $StateRoot -PathType Container)) {
+    New-Item -ItemType Directory -Path $StateRoot -Force | Out-Null
+  }
+  $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+  $lockStream = $null
+  while ($null -eq $lockStream) {
+    try {
+      $lockStream = [IO.File]::Open(
+        $ControllerLockPath,
+        [IO.FileMode]::OpenOrCreate,
+        [IO.FileAccess]::ReadWrite,
+        [IO.FileShare]::None
+      )
+    } catch [IO.IOException] {
+      if ($stopwatch.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
+        throw "Another Windows Claude controller mutation is active; wait for it to finish, then retry"
+      }
+      Start-Sleep -Milliseconds 100
+    }
+  }
+  $script:WindowsClaudeMutationLockStream = $lockStream
+  $script:WindowsClaudeMutationLockDepth = 1
+  try {
+    & $Body
+  } finally {
+    $script:WindowsClaudeMutationLockDepth = 0
+    $script:WindowsClaudeMutationLockStream = $null
+    $lockStream.Dispose()
+  }
+}
 
 function Write-AtomicBytes {
   param(
@@ -171,7 +245,7 @@ function Assert-WindowsOnlyValue {
     throw "$Label must use HTTPS unless it is a Windows loopback endpoint"
   }
   if ($uri.Host -in @("127.0.0.1", "localhost", "::1") -and $uri.Port -in @(9876, 18987)) {
-    throw "$Label cannot use a reserved FinalKit gateway port"
+    throw "$Label cannot use a reserved Switchboard gateway port"
   }
 }
 
@@ -209,7 +283,7 @@ function Protect-StateRootAcl {
 
 function Assert-StateShape {
   param([Parameter(Mandatory = $true)]$State)
-  if ($State.schema_version -ne 3) { throw "Unsupported Windows Claude profile schema" }
+  if ($State.schema_version -ne 4) { throw "Unsupported Windows Claude profile schema" }
   if ($State.host -ne "127.0.0.1") { throw "Windows Claude host must remain 127.0.0.1" }
   if ([int]$State.port -ne 18987) { throw "Windows Claude port must remain the isolated port 18987" }
   foreach ($profileMode in $script:Modes) {
@@ -233,7 +307,8 @@ function Assert-StateShape {
       $model = Get-OptionalJsonString -Object $profile -Name "model_$role"
       $reasoning = Get-OptionalJsonString -Object $profile -Name "reasoning_$role"
       if ([string]::IsNullOrWhiteSpace($model)) { throw "Missing $profileMode $role Model" }
-      if ($reasoning -notin @($script:ReasoningChoices[$profileMode])) {
+      $reasoningChoices = @(Get-ProfileReasoningChoices -ProfileMode $profileMode -Model $model)
+      if ($reasoning -notin $reasoningChoices) {
         throw "Unsupported $profileMode $role Reasoning=$reasoning"
       }
     }
@@ -249,6 +324,9 @@ function Assert-StateShape {
 }
 
 function Initialize-WindowsClaudeState {
+  if ($script:WindowsClaudeMutationLockDepth -eq 0) {
+    return (Invoke-WithWindowsClaudeMutationLock -Body { Initialize-WindowsClaudeState })
+  }
   if (-not (Test-Path -LiteralPath $TemplatePath -PathType Leaf)) { throw "Missing profile template: $TemplatePath" }
   if (-not (Test-Path -LiteralPath $GatewayScript -PathType Leaf)) { throw "Missing Windows gateway: $GatewayScript" }
   foreach ($directory in @($StateRoot, $SecretsRoot, $RuntimeRoot, $LogsRoot)) {
@@ -260,7 +338,7 @@ function Initialize-WindowsClaudeState {
   $changed = $false
   if (Test-Path -LiteralPath $ProfilesPath -PathType Leaf) {
     $state = Read-JsonObject -Path $ProfilesPath
-    if ([int]$state.schema_version -notin @(1, 2, 3)) { throw "Unsupported existing Windows Claude profile schema" }
+    if ([int]$state.schema_version -notin @(1, 2, 3, 4)) { throw "Unsupported existing Windows Claude profile schema" }
     if ($null -eq $state.PSObject.Properties["profiles"]) { throw "Existing profiles.json has no profiles object" }
     $existingSchema = [int]$state.schema_version
   } else {
@@ -323,6 +401,18 @@ function Initialize-WindowsClaudeState {
       if (-not $reasoning) { $reasoning = Get-OptionalJsonString -Object $profile -Name $longReasoningName }
       if (-not $reasoning) { $reasoning = $legacyReasoning }
       if (-not $reasoning) { $reasoning = [string]$templateProfile.$reasoningName }
+      $modelReasoningChoices = @(Get-ProfileReasoningChoices -ProfileMode $profileMode -Model $model)
+      $legacyProviderChoices = @($script:ReasoningChoices[$profileMode])
+      if (
+        $existingSchema -le 3 -and
+        $reasoning -in $legacyProviderChoices -and
+        $reasoning -notin $modelReasoningChoices
+      ) {
+        # Schema 1-3 admitted one provider-wide list.  Preserve the selected
+        # model, but move a now-known invalid model/effort pair to safe auto.
+        $reasoning = "auto"
+        $changed = $true
+      }
       Set-JsonProperty -Object $profile -Name $modelName -Value $model
       Set-JsonProperty -Object $profile -Name $reasoningName -Value $reasoning
     }
@@ -334,12 +424,22 @@ function Initialize-WindowsClaudeState {
         Remove-JsonProperty -Object $profile -Name $legacyName
       }
     }
-    if ($existingSchema -ne 3) { $changed = $true }
+    if ($existingSchema -ne 4) { $changed = $true }
     foreach ($property in $templateProfile.PSObject.Properties) {
       if ($null -eq $profile.PSObject.Properties[$property.Name]) {
         Set-JsonProperty -Object $profile -Name $property.Name -Value (Copy-JsonValue -Value $property.Value)
         $changed = $true
       }
+    }
+    $legacyProfileNames = @(
+      "FinalKit Windows DeepSeek API", "FinalKit Windows Kimi API",
+      "FinalKit Windows GLM API", "FinalKit Windows Codex Login",
+      "Switchboard Windows DeepSeek API", "Switchboard Windows Kimi API",
+      "Switchboard Windows GLM API", "Switchboard Windows Codex Login"
+    )
+    if ([string]$profile.name -in $legacyProfileNames -and [string]$profile.name -ne [string]$templateProfile.name) {
+      Set-JsonProperty -Object $profile -Name "name" -Value ([string]$templateProfile.name)
+      $changed = $true
     }
     if ($profileMode -eq "codex") {
       $legacyApiProfile = (
@@ -377,11 +477,14 @@ function Initialize-WindowsClaudeState {
 }
 
 function Get-WindowsClaudeState {
+  if ($script:WindowsClaudeMutationLockDepth -eq 0) {
+    return (Invoke-WithWindowsClaudeMutationLock -Body { Get-WindowsClaudeState })
+  }
   if (-not (Test-Path -LiteralPath $ProfilesPath -PathType Leaf)) {
     throw "Windows Claude state is not initialized"
   }
   $state = Read-JsonObject -Path $ProfilesPath
-  if ([int]$state.schema_version -in @(1, 2)) {
+  if ([int]$state.schema_version -in @(1, 2, 3)) {
     # Status is also the safe first read after a package update.  Migrate only
     # the known local profile schemas; credentials, gateway state, Claude mode,
     # and WSL are outside this atomic profiles.json rewrite.
@@ -485,7 +588,7 @@ function Get-WindowsCodexModelDefaults {
                   } else {
                     Get-OptionalJsonString -Object $level -Name "effort"
                   }
-                  $effort = $effort.Trim()
+                  $effort = $effort.Trim().ToLowerInvariant()
                   if (-not $effort -or $effort -notmatch '^[A-Za-z0-9_-]{1,32}$' -or $seenEfforts.ContainsKey($effort)) {
                     continue
                   }
@@ -601,6 +704,7 @@ function Get-CodexPreferredEffort {
     [AllowEmptyString()][string]$Preferred = "",
     [AllowEmptyString()][string]$Fallback = "max"
   )
+  if ($Preferred -eq "auto") { return "auto" }
   if ($null -eq $CatalogEntry) {
     if ($Preferred -match '^[A-Za-z0-9_-]{1,32}$') { return $Preferred }
     if ($Fallback -match '^[A-Za-z0-9_-]{1,32}$') { return $Fallback }
@@ -627,9 +731,11 @@ function Show-CodexReasoningCapabilities {
   )
   if ($null -eq $CatalogEntry -or @($CatalogEntry.SupportedReasoning).Count -eq 0) {
     Write-Host "$Role ($Model) Reasoning: cache did not declare"
+    Write-Host "  auto - pass through an incoming role effort; otherwise use the model default"
     return
   }
   Write-Host "$Role ($Model) Reasoning:"
+  Write-Host "  auto - pass through an incoming role effort; otherwise use the model default"
   foreach ($level in @($CatalogEntry.SupportedReasoning)) {
     $defaultMarker = if ([string]$level.Effort -eq [string]$CatalogEntry.DefaultEffort) { " [Codex default]" } else { "" }
     $description = if ([string]$level.Description) { " - $([string]$level.Description)" } else { "" }
@@ -649,12 +755,12 @@ function Read-CodexReasoningEffort {
   Show-CodexReasoningCapabilities -Role $Role -Model $Model -CatalogEntry $entry
   $value = Read-Host "$Role Reasoning [$seed]"
   if ([string]::IsNullOrWhiteSpace([string]$value)) { $value = $seed }
-  $value = ([string]$value).Trim()
+  $value = ([string]$value).Trim().ToLowerInvariant()
   if ($value -notmatch '^[A-Za-z0-9_-]{1,32}$') { throw "$Role Reasoning is malformed" }
   if ($null -ne $entry) {
     $supported = @($entry.SupportedReasoning | ForEach-Object { [string]$_.Effort })
-    if ($supported.Count -gt 0 -and $value -notin $supported) {
-      throw "$Role Model $Model does not support Reasoning=$value; choose: $($supported -join ', ')"
+    if ($supported.Count -gt 0 -and $value -ne "auto" -and $value -notin $supported) {
+      throw "$Role Model $Model does not support Reasoning=$value; choose: auto, $($supported -join ', ')"
     }
   } else {
     Write-Warning "$Role Model $Model is not in the local Codex cache; Reasoning=$value cannot be capability-validated."
@@ -665,20 +771,24 @@ function Read-CodexReasoningEffort {
 function Assert-WindowsCodexRouteCapabilities {
   param([Parameter(Mandatory = $true)]$Profile)
   $local = Get-WindowsCodexModelDefaults
+  $capabilities = [ordered]@{}
   foreach ($role in $script:Roles) {
     $roleLabel = (Get-Culture).TextInfo.ToTitleCase($role)
     $model = Get-OptionalJsonString -Object $Profile -Name "model_$role"
     $reasoning = Get-OptionalJsonString -Object $Profile -Name "reasoning_$role"
     $entry = Get-CodexModelCatalogEntry -Catalog $local.Catalog -Model $model
     if ($null -eq $entry) {
-      Write-Warning "$roleLabel Model $model is absent from the current Windows Codex cache; capability validation is unavailable."
+      $capabilities[$role] = @()
+      Write-Warning "$roleLabel Model $model is absent from the local Windows Codex cache; capability validation is unavailable."
       continue
     }
-    $supported = @($entry.SupportedReasoning | ForEach-Object { [string]$_.Effort })
-    if ($supported.Count -gt 0 -and $reasoning -notin $supported) {
-      throw "$roleLabel Model $model does not support Reasoning=$reasoning; choose: $($supported -join ', ')"
+    $supported = @($entry.SupportedReasoning | ForEach-Object { ([string]$_.Effort).ToLowerInvariant() } | Select-Object -Unique)
+    $capabilities[$role] = @($supported)
+    if ($supported.Count -gt 0 -and $reasoning -ne "auto" -and $reasoning -notin $supported) {
+      throw "$roleLabel Model $model does not support Reasoning=$reasoning; choose: auto, $($supported -join ', ')"
     }
   }
+  return $capabilities
 }
 
 function Get-WindowsCodexAuthStatus {
@@ -738,10 +848,12 @@ function Test-ProfileConfigured {
   }
   if (-not $credentialReady) { return $false }
   foreach ($role in $script:Roles) {
-    if ([string]::IsNullOrWhiteSpace((Get-OptionalJsonString -Object $profile -Name "model_$role"))) {
+    $model = Get-OptionalJsonString -Object $profile -Name "model_$role"
+    if ([string]::IsNullOrWhiteSpace($model)) {
       return $false
     }
-    if ((Get-OptionalJsonString -Object $profile -Name "reasoning_$role") -notin @($script:ReasoningChoices[$ProfileMode])) {
+    $reasoningChoices = @(Get-ProfileReasoningChoices -ProfileMode $ProfileMode -Model $model)
+    if ((Get-OptionalJsonString -Object $profile -Name "reasoning_$role") -notin $reasoningChoices) {
       return $false
     }
   }
@@ -760,6 +872,14 @@ function Assert-ModelValue {
 
 function Configure-WindowsClaudeProfile {
   param([Parameter(Mandatory = $true)][ValidateSet("deepseek", "kimi", "glm", "codex")][string]$ProfileMode)
+  if ($script:WindowsClaudeMutationLockDepth -eq 0) {
+    return (Invoke-WithWindowsClaudeMutationLock -Body {
+      Configure-WindowsClaudeProfile -ProfileMode $ProfileMode
+    })
+  }
+  # Fail before profile/secret mutation on a machine that cannot run the
+  # Windows-only loopback gateway.
+  $null = Get-WindowsPython
   $state = Initialize-WindowsClaudeState
   $profile = Get-ModeProfile -State $state -ProfileMode $ProfileMode
   Write-Host "Configure the independent Windows Claude $ProfileMode profile." -ForegroundColor Cyan
@@ -793,7 +913,7 @@ function Configure-WindowsClaudeProfile {
     }
   } else {
     Write-Host ("Models: " + (@($script:ProviderModels[$ProfileMode]) -join ", ") + " (package suggestions)")
-    Write-Host ("Reasoning: " + (@($script:ReasoningChoices[$ProfileMode]) -join ", "))
+    Write-Host "Reasoning is shown per selected model below."
   }
   Write-Host "Configure each Claude tier (only Model and Reasoning are stored):"
   foreach ($role in $script:Roles) {
@@ -808,7 +928,7 @@ function Configure-WindowsClaudeProfile {
     $modelValue = ([string]$modelValue).Trim()
     Assert-ModelValue -Value $modelValue -Label "$roleLabel Model"
     if ($ProfileMode -eq "codex" -and $listedModels.Count -gt 0 -and $modelValue -notin $listedModels) {
-      throw "$roleLabel Model $modelValue is not in the Windows Codex cache"
+      throw "$roleLabel Model $modelValue is not advertised by the local Windows Codex cache"
     }
     $selectedModels[$role] = $modelValue
 
@@ -820,11 +940,14 @@ function Configure-WindowsClaudeProfile {
       }
       $reasoningValue = Read-CodexReasoningEffort -Role $roleLabel -Model $modelValue -Preferred $reasoningSeed -Catalog $catalog
     } else {
+      $reasoningChoices = @(Get-ProfileReasoningChoices -ProfileMode $ProfileMode -Model $modelValue)
+      if ($reasoningSeed -notin $reasoningChoices) { $reasoningSeed = "auto" }
+      Write-Host ("$roleLabel Reasoning: " + ($reasoningChoices -join ", "))
       $reasoningValue = Read-Host "$roleLabel Reasoning [$reasoningSeed]"
       if ([string]::IsNullOrWhiteSpace([string]$reasoningValue)) { $reasoningValue = $reasoningSeed }
       $reasoningValue = ([string]$reasoningValue).Trim().ToLowerInvariant()
-      if ($reasoningValue -notin @($script:ReasoningChoices[$ProfileMode])) {
-        throw "$roleLabel Reasoning must be one of: $(@($script:ReasoningChoices[$ProfileMode]) -join ', ')"
+      if ($reasoningValue -notin $reasoningChoices) {
+        throw "$roleLabel Reasoning must be one of: $($reasoningChoices -join ', ')"
       }
     }
     $selectedReasoning[$role] = $reasoningValue
@@ -874,7 +997,7 @@ function Configure-WindowsClaudeProfile {
   }
   Protect-StateRootAcl
   if ($ProfileMode -eq "codex") {
-    Write-Host "Windows Claude Codex profile configured from Windows Codex login; token was not copied into FinalKit or WSL." -ForegroundColor Green
+    Write-Host "Windows Claude Codex profile configured from Windows Codex login; token was not copied into Switchboard or WSL." -ForegroundColor Green
     Write-Host "Windows Codex auth owner: $($codexAuth.Path)"
   } else {
     Write-Host "Windows Claude $ProfileMode API profile configured; no key was written to JSON, argv, environment, or WSL." -ForegroundColor Green
@@ -1043,6 +1166,11 @@ function Install-ClaudeProfileLibrary {
     [ValidateSet("", "deepseek", "kimi", "glm", "codex")][string]$AppliedMode = "",
     [switch]$Activate
   )
+  if ($script:WindowsClaudeMutationLockDepth -eq 0) {
+    return (Invoke-WithWindowsClaudeMutationLock -Body {
+      Install-ClaudeProfileLibrary -State $State -AppliedMode $AppliedMode -Activate:$Activate
+    })
+  }
   $paths = Get-ClaudeDesktopPaths
   $files = Get-ClaudeManagedFiles -Paths $paths
   $snapshots = Get-FileSnapshots -Files $files
@@ -1088,6 +1216,10 @@ function Install-ClaudeProfileLibrary {
 }
 
 function Initialize-WindowsClaude {
+  if ($script:WindowsClaudeMutationLockDepth -eq 0) {
+    return (Invoke-WithWindowsClaudeMutationLock -Body { Initialize-WindowsClaude })
+  }
+  $python = Get-WindowsPython
   $state = Initialize-WindowsClaudeState
   $installed = Install-ClaudeProfileLibrary -State $state
   $configured = @($script:Modes | Where-Object { Test-ProfileConfigured -State $state -ProfileMode $_ }).Count
@@ -1095,6 +1227,7 @@ function Initialize-WindowsClaude {
   Write-Host "DeepSeek/Kimi/GLM use Windows API keys; Codex uses the Windows Codex CLI login."
   Write-Host "Claude remains in official 1P mode until a configured Windows profile is started."
   Write-Host "Runtime state: $StateRoot"
+  Write-Host "Windows Python runtime: $python"
   if ($installed.Backup) { Write-Host "Claude config backup: $($installed.Backup)" }
   Write-Host "Isolation: Windows port 18987; no WSL command, path, port, credential, or process is used."
 }
@@ -1106,26 +1239,38 @@ function ConvertTo-NativeArgumentString {
   }) -join ' ')
 }
 
-function Get-WindowsPython {
+function Get-WindowsPythonInfo {
   $py = Get-Command py.exe -ErrorAction SilentlyContinue
   if ($py) {
-    $resolved = @(& $py.Source -3.14 -c "import sys; print(sys.executable)" 2>$null | Where-Object { $_ })
-    if ($LASTEXITCODE -eq 0 -and $resolved.Count -gt 0 -and (Test-Path -LiteralPath $resolved[-1] -PathType Leaf)) {
-      return (Resolve-Path -LiteralPath $resolved[-1]).Path
-    }
-    $resolved = @(& $py.Source -3 -c "import sys; print(sys.executable)" 2>$null | Where-Object { $_ })
-    if ($LASTEXITCODE -eq 0 -and $resolved.Count -gt 0 -and (Test-Path -LiteralPath $resolved[-1] -PathType Leaf)) {
-      return (Resolve-Path -LiteralPath $resolved[-1]).Path
+    $resolved = @(& $py.Source -3 -c "import sys; print(sys.executable); print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null | Where-Object { $_ })
+    if ($LASTEXITCODE -eq 0 -and $resolved.Count -ge 2) {
+      $candidate = [string]$resolved[-2]
+      $version = [string]$resolved[-1]
+      if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and [version]$version -ge [version]"3.10") {
+        return [pscustomobject]@{
+          Path = (Resolve-Path -LiteralPath $candidate).Path
+          Version = $version
+        }
+      }
     }
   }
   foreach ($name in @("python.exe", "python3.exe")) {
     $command = Get-Command $name -ErrorAction SilentlyContinue
     if ($command -and $command.Source -and (Test-Path -LiteralPath $command.Source -PathType Leaf)) {
       $majorMinor = & $command.Source -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-      if ($LASTEXITCODE -eq 0 -and [version]$majorMinor -ge [version]"3.10") { return $command.Source }
+      if ($LASTEXITCODE -eq 0 -and [version]$majorMinor -ge [version]"3.10") {
+        return [pscustomobject]@{
+          Path = (Resolve-Path -LiteralPath $command.Source).Path
+          Version = [string]$majorMinor
+        }
+      }
     }
   }
-  throw "Windows Python 3.10+ was not found"
+  throw "Windows Python 3.10+ was not found. Install a current 64-bit Python from https://www.python.org/downloads/windows/, enable py.exe or python.exe for this user, then rerun the Windows Claude action. Build installs WSL Python only."
+}
+
+function Get-WindowsPython {
+  return [string](Get-WindowsPythonInfo).Path
 }
 
 function Invoke-LoopbackJson {
@@ -1180,6 +1325,9 @@ function Test-GatewayProcessIdentity {
 }
 
 function Stop-WindowsClaudeGateway {
+  if ($script:WindowsClaudeMutationLockDepth -eq 0) {
+    return (Invoke-WithWindowsClaudeMutationLock -Body { Stop-WindowsClaudeGateway })
+  }
   if (-not (Test-Path -LiteralPath $GatewayStatePath -PathType Leaf)) {
     if (Test-Path -LiteralPath $RuntimeConfigPath -PathType Leaf) { Remove-Item -LiteralPath $RuntimeConfigPath -Force }
     return
@@ -1225,13 +1373,20 @@ function Start-WindowsClaudeGateway {
     [Parameter(Mandatory = $true)]$State,
     [Parameter(Mandatory = $true)][ValidateSet("deepseek", "kimi", "glm", "codex")][string]$ProfileMode
   )
+  if ($script:WindowsClaudeMutationLockDepth -eq 0) {
+    return (Invoke-WithWindowsClaudeMutationLock -Body {
+      Start-WindowsClaudeGateway -State $State -ProfileMode $ProfileMode
+    })
+  }
   if (-not (Test-ProfileConfigured -State $State -ProfileMode $ProfileMode)) {
     throw "Windows Claude $ProfileMode is unconfigured; run configure first"
   }
   Stop-WindowsClaudeGateway
   $profile = Get-ModeProfile -State $State -ProfileMode $ProfileMode
   $codexAuth = if ($ProfileMode -eq "codex") { Assert-WindowsCodexAuthConfigured } else { $null }
-  if ($ProfileMode -eq "codex") { Assert-WindowsCodexRouteCapabilities -Profile $profile }
+  $codexCapabilities = if ($ProfileMode -eq "codex") {
+    Assert-WindowsCodexRouteCapabilities -Profile $profile
+  } else { $null }
   $instanceId = [guid]::NewGuid().ToString()
   $runtime = [pscustomobject]@{
     schema_version = 3
@@ -1251,6 +1406,9 @@ function Start-WindowsClaudeGateway {
   }
   if ($ProfileMode -eq "codex") {
     Set-JsonProperty -Object $runtime -Name "codex_auth_file" -Value ([string]$codexAuth.Path)
+    foreach ($role in $script:Roles) {
+      Set-JsonProperty -Object $runtime -Name "supported_reasoning_$role" -Value @($codexCapabilities[$role])
+    }
   }
   foreach ($role in $script:Roles) {
     foreach ($kind in @("model", "reasoning")) {
@@ -1319,6 +1477,12 @@ function Start-WindowsClaudeGateway {
 
 function Start-WindowsClaude {
   param([Parameter(Mandatory = $true)][ValidateSet("deepseek", "kimi", "glm", "codex")][string]$ProfileMode)
+  if ($script:WindowsClaudeMutationLockDepth -eq 0) {
+    return (Invoke-WithWindowsClaudeMutationLock -Body {
+      Start-WindowsClaude -ProfileMode $ProfileMode
+    })
+  }
+  $null = Get-WindowsPython
   $state = Initialize-WindowsClaudeState
   $runtime = Start-WindowsClaudeGateway -State $state -ProfileMode $ProfileMode
   try {
@@ -1338,7 +1502,7 @@ function Start-WindowsClaude {
   }
   if ($installed.Backup) { Write-Host "Claude config backup: $($installed.Backup)" }
   if ($ProfileMode -eq "codex") {
-    Write-Host "Inference auth remains owned by the Windows Codex CLI; no token enters FinalKit state, Claude profile, or WSL."
+    Write-Host "Inference auth remains owned by the Windows Codex CLI; no token enters Switchboard state, Claude profile, or WSL."
   } else {
     Write-Host "Windows API key remains DPAPI-encrypted under $SecretsRoot and never enters WSL."
   }
@@ -1362,6 +1526,9 @@ function Start-WindowsClaude {
 }
 
 function Restore-WindowsClaudeOfficial {
+  if ($script:WindowsClaudeMutationLockDepth -eq 0) {
+    return (Invoke-WithWindowsClaudeMutationLock -Body { Restore-WindowsClaudeOfficial })
+  }
   Stop-WindowsClaudeGateway
   $paths = Get-ClaudeDesktopPaths
   $files = Get-ClaudeManagedFiles -Paths $paths
@@ -1398,11 +1565,26 @@ function Restore-WindowsClaudeOfficial {
   Write-Host "Windows Claude official 1P mode restored; WSL was not inspected or changed." -ForegroundColor Green
   Write-Host "Three Windows API-key settings and the Windows Codex login binding remain available for later reuse."
   if ($backup) { Write-Host "Claude config backup: $backup" }
+  if (Get-Process -Name Claude -ErrorAction SilentlyContinue) {
+    Write-Warning "Claude is still running and may retain the previous 3P session in memory. Fully quit every Claude process, then reopen the app to enter official 1P mode."
+  } else {
+    Write-Host "Reopen Claude to start a fresh official 1P session."
+  }
 }
 
 function Show-WindowsClaudeStatus {
+  if ($script:WindowsClaudeMutationLockDepth -eq 0) {
+    return (Invoke-WithWindowsClaudeMutationLock -Body { Show-WindowsClaudeStatus })
+  }
   Write-Host "Windows Claude owner: $StateRoot"
   Write-Host "Isolation: Windows-only; fixed gateway 127.0.0.1:18987; WSL dependency=none"
+  try {
+    $python = Get-WindowsPythonInfo
+    Write-Host "Windows Python 3.10+: ready ($($python.Version); $($python.Path))"
+  } catch {
+    Write-Host "Windows Python 3.10+: missing"
+    Write-Warning $_.Exception.Message
+  }
   if (-not (Test-Path -LiteralPath $ProfilesPath -PathType Leaf)) {
     Write-Host "Initialized: false"
     Write-Host "Run: .\WindowsClaude.ps1 -Action init"
@@ -1513,7 +1695,7 @@ Inspect or stop only the Windows gateway:
 Restore official Claude account mode without deleting provider settings or the Codex binding:
   .\WindowsClaude.ps1 -Action official
 
-This controller never calls WSL. Windows port 18987 and state under
+This controller never calls WSL. Windows port 18987 and the legacy-compatible state namespace
 %LOCALAPPDATA%\ScienceCodexFinalKit\WindowsClaude are separate from WSL Science.
 "@
 }

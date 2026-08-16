@@ -4,6 +4,6 @@ set -Eeuo pipefail
 root="${FINALKIT_ROOT:-$HOME/.local/share/science-codex-finalkit}"
 node="$root/node-current/bin/node"
 entry="$root/browser-mcp/node_modules/chrome-devtools-mcp/build/src/index.js"
-[[ -x "$node" ]] || { printf 'ERROR: FinalKit Node.js is missing: %s\n' "$node" >&2; exit 1; }
+[[ -x "$node" ]] || { printf 'ERROR: Switchboard Node.js is missing: %s\n' "$node" >&2; exit 1; }
 [[ -f "$entry" ]] || { printf 'ERROR: Chrome DevTools MCP is missing: %s\n' "$entry" >&2; exit 1; }
 exec "$node" "$entry" "$@"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transactional runtime owner for ScienceCodexFinalKit.
+"""Transactional runtime owner for Claude Codex Switchboard.
 
 The manager keeps one Claude Science data directory and exactly one loopback
 backend.  A switch stops Science, replaces the verified backend process,
@@ -76,7 +76,7 @@ API_PROVIDERS = {
 }
 VALID_MODES = set(API_PROVIDERS) | {"codex"}
 CODEX_FILE_AUTH_ARGS = ("-c", 'cli_auth_credentials_store="file"')
-CODEX_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max", "ultra"}
+CODEX_REASONING_EFFORTS = {"auto", "none", "low", "medium", "high", "xhigh", "max", "ultra"}
 CLAUDE_ROUTE_ROLES = ("opus", "sonnet", "haiku")
 PROVIDER_REASONING_EFFORTS = {
     # ``auto`` preserves the upstream default; ``none`` explicitly disables
@@ -84,23 +84,29 @@ PROVIDER_REASONING_EFFORTS = {
     # documented for each Anthropic-compatible endpoint.
     "deepseek": ("auto", "none", "high", "max"),
     "kimi": ("auto", "none", "low", "high", "max"),
-    "glm": ("auto", "none", "high", "max"),
+    "glm": ("auto", "none", "low", "medium", "high", "xhigh", "max"),
 }
 GENERIC_REASONING_EFFORTS = {"auto", "none", "low", "medium", "high", "xhigh", "max", "ultra"}
+CODEX_LOGIN_STATUS_TIMEOUT_SECONDS = 30
 MAX_CODEX_AUTH_BYTES = 1024 * 1024
-MODEL_ROUTE_SCHEMA_VERSION = 2
+MODEL_ROUTE_SCHEMA_VERSION = 3
 MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]@+=-]{0,199}$")
 RUNTIME_CAPABILITIES = (
     "browser-codex-oauth",
+    "codex-reasoning-auto-pass-through",
     "codex-device-oauth",
     "codex-route-display-names",
     "codex-three-tier-route",
     "codex-tier-test",
     "effective-route-output",
     "model-route-update",
+    "multi-agent-provider-shell",
+    "pinned-multi-agent-module",
     "persistent-model-routes",
     "per-role-provider-routes",
     "per-role-reasoning",
+    "runtime-state-json",
+    "transactional-codex-auth-migration",
     "provider-model-discovery",
     "runtime-update-v1",
     "science-linux-only-runtime",
@@ -114,6 +120,77 @@ RUNTIME_CAPABILITIES = (
 
 class FinalKitError(RuntimeError):
     pass
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep provider credentials on the package-owned catalog endpoint."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+def is_kimi_k3_model(model: Any) -> bool:
+    """Return whether a package-supported model ID is in the Kimi K3 family."""
+
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"kimi-k3(?:\[[a-z0-9._+-]+\])?", value))
+
+
+def is_kimi_toggle_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"kimi-k2\.(?:5|6)(?:\[[a-z0-9._+-]+\])?", value))
+
+
+def is_kimi_always_thinking_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"kimi-k2\.7-code(?:-highspeed)?(?:\[[a-z0-9._+-]+\])?", value))
+
+
+def is_glm_52_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"glm-5\.2(?:[-._][a-z0-9]+)*", value))
+
+
+def is_glm_53_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"glm-5\.3(?:[-._][a-z0-9]+)*", value))
+
+
+def is_glm_thinking_toggle_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"glm-4\.(?:[5-9])(?:[-._][a-z0-9]+)*", value))
+
+
+def provider_reasoning_efforts(provider: str, model: Any) -> set[str]:
+    """Return the configurable reasoning values for one provider/model pair."""
+
+    if provider == "deepseek":
+        return set(PROVIDER_REASONING_EFFORTS[provider])
+    if provider == "kimi":
+        if is_kimi_k3_model(model):
+            return {"auto", "low", "high", "max"}
+        if is_kimi_toggle_model(model):
+            return {"auto", "none"}
+        if is_kimi_always_thinking_model(model):
+            return {"auto"}
+        return {"auto"}
+    if provider == "glm":
+        if is_glm_53_model(model):
+            return {"auto", "low", "high", "max"}
+        if is_glm_52_model(model):
+            return {"auto", "none", "low", "medium", "high", "xhigh", "max"}
+        if is_glm_thinking_toggle_model(model):
+            return {"auto", "none"}
+        return {"auto"}
+    return set(GENERIC_REASONING_EFFORTS)
 
 
 class Paths:
@@ -132,8 +209,8 @@ class Paths:
         # enough for Linux's 108-byte sun_path limit while retaining isolation.
         self.science_home = Path.home() / ".science-finalkit"
         # The official Linux Codex CLI owns the only ChatGPT credential cache.
-        # The connector reads and refreshes this same file instead of keeping a
-        # second refresh-token chain that can drift or invalidate the first.
+        # The connector reads it but never refreshes or rewrites it; after a
+        # 401 it can only adopt a newer access token published by the CLI.
         self.codex_auth = self.client_home / ".codex" / "auth.json"
         self.data_dir = self.science_home / ".claude-science"
         self.run = self.root / "run"
@@ -241,6 +318,11 @@ def private_child_environment(home: Path) -> dict[str, str]:
         "WSL_INTEROP",
         "WSLENV",
         "BROWSER",
+        "TERM",
+        "COLORTERM",
+        "NO_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "ALL_PROXY",
@@ -467,7 +549,7 @@ class FileLock:
                 if time.monotonic() >= deadline:
                     self.handle.close()
                     self.handle = None
-                    raise FinalKitError("another FinalKit operation still holds the switch lock")
+                    raise FinalKitError("another Switchboard operation still holds the switch lock")
                 time.sleep(0.1)
         self.handle.seek(0)
         self.handle.truncate()
@@ -567,20 +649,58 @@ class RuntimeManager:
         route: Any,
         label: str,
         allowed_efforts: set[str],
+        provider: str = "",
     ) -> dict[str, str]:
         if not isinstance(route, dict):
             raise FinalKitError(f"model route for {label} must be an object")
         normalized: dict[str, str] = {}
         for role in CLAUDE_ROUTE_ROLES:
-            normalized[f"model_{role}"] = self.validate_model_id(
+            model = self.validate_model_id(
                 route.get(f"model_{role}"), f"{label} {role} model"
+            )
+            normalized[f"model_{role}"] = model
+            role_efforts = (
+                provider_reasoning_efforts(provider, model)
+                if provider
+                else allowed_efforts
             )
             normalized[f"reasoning_{role}"] = self.validate_reasoning_effort(
                 route.get(f"reasoning_{role}"),
                 f"{label} {role} reasoning",
-                allowed_efforts,
+                role_efforts,
             )
         return normalized
+
+    @staticmethod
+    def normalize_legacy_provider_reasoning(routes: dict[str, Any]) -> None:
+        """Safely migrate combinations admitted by the former provider-wide lists.
+
+        Schema 1/2 accepted one reasoning list per provider, before Kimi and GLM
+        documented model-family differences were enforced.  Only values that
+        were valid under that older list are migrated to ``auto``; malformed or
+        otherwise unknown values still fail closed in normal validation.
+        """
+
+        providers = routes.get("providers")
+        if not isinstance(providers, dict):
+            return
+        for provider in ("kimi", "glm"):
+            route = providers.get(provider)
+            if not isinstance(route, dict):
+                continue
+            legacy_allowed = set(PROVIDER_REASONING_EFFORTS[provider])
+            for role in CLAUDE_ROUTE_ROLES:
+                model = route.get(f"model_{role}")
+                reasoning_name = f"reasoning_{role}"
+                reasoning = route.get(reasoning_name)
+                if not isinstance(reasoning, str):
+                    continue
+                effort = reasoning.strip().lower()
+                if (
+                    effort in legacy_allowed
+                    and effort not in provider_reasoning_efforts(provider, model)
+                ):
+                    route[reasoning_name] = "auto"
 
     def migrate_model_routes_payload(self, payload: Any) -> dict[str, Any]:
         """Migrate the former main/fast/shared-effort shape without losing choices."""
@@ -588,7 +708,7 @@ class RuntimeManager:
         if not isinstance(payload, dict):
             raise FinalKitError("model route config must be a JSON object")
         schema = payload.get("schema_version")
-        if schema == MODEL_ROUTE_SCHEMA_VERSION:
+        if schema in {2, MODEL_ROUTE_SCHEMA_VERSION}:
             # An early 3.2.3 preview used the longer reasoning_effort_* names.
             # Accept it once and rewrite to the compact model/reasoning schema.
             compact = json.loads(json.dumps(payload))
@@ -609,10 +729,13 @@ class RuntimeManager:
                     if short_name not in route and long_name in route:
                         route[short_name] = route[long_name]
                     route.pop(long_name, None)
+            if schema == 2:
+                self.normalize_legacy_provider_reasoning(compact)
+                compact["schema_version"] = MODEL_ROUTE_SCHEMA_VERSION
             return self.validate_model_routes(compact)
         if schema != 1:
             raise FinalKitError(
-                f"model route schema must be 1 or {MODEL_ROUTE_SCHEMA_VERSION}; found {schema!r}"
+                f"model route schema must be 1, 2, or {MODEL_ROUTE_SCHEMA_VERSION}; found {schema!r}"
             )
         providers = payload.get("providers")
         codex = payload.get("codex")
@@ -644,6 +767,7 @@ class RuntimeManager:
             "model_haiku": codex.get("haiku"),
             "reasoning_haiku": shared_codex_effort,
         }
+        self.normalize_legacy_provider_reasoning(migrated)
         return self.validate_model_routes(migrated)
 
     def validate_model_routes(self, payload: Any) -> dict[str, Any]:
@@ -666,7 +790,7 @@ class RuntimeManager:
                 raise FinalKitError(f"invalid provider route name: {name!r}")
             allowed = set(PROVIDER_REASONING_EFFORTS.get(name, tuple(GENERIC_REASONING_EFFORTS)))
             normalized["providers"][name] = self.normalize_role_route(
-                route, name, allowed
+                route, name, allowed, provider=name
             )
         normalized["codex"] = self.normalize_role_route(
             codex, "Codex", set(CODEX_REASONING_EFFORTS)
@@ -792,10 +916,10 @@ class RuntimeManager:
     def fetch_provider_model_payload(self, provider: str, api_key: str) -> Any:
         """Read one fixed official catalog endpoint without generating tokens.
 
-        Catalog URLs are package-owned constants rather than user input, so a
-        saved provider key cannot be redirected to an arbitrary host.  Try a
-        direct connection first, then the inherited proxy only for a transport
-        failure; HTTP authentication/permission failures are final.
+        Catalog URLs are package-owned constants rather than user input and
+        redirects are disabled, so a saved provider key reaches only that
+        exact endpoint. Try a direct connection first, then the inherited
+        proxy only for a transport failure; HTTP responses are final.
         """
 
         definition = API_PROVIDERS[provider]
@@ -810,14 +934,24 @@ class RuntimeManager:
         )
         transport_errors: list[str] = []
         openers = (
-            ("direct network", urllib.request.build_opener(urllib.request.ProxyHandler({}))),
-            ("configured network", urllib.request.build_opener()),
+            (
+                "direct network",
+                urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}), NoRedirectHandler()
+                ),
+            ),
+            ("configured network", urllib.request.build_opener(NoRedirectHandler())),
         )
         for label, opener in openers:
             try:
                 with opener.open(request, timeout=20) as response:
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
+                if 300 <= exc.code < 400:
+                    raise FinalKitError(
+                        f"{definition['label']} official model catalog returned a redirect; "
+                        "refusing to forward this Linux user's API key"
+                    ) from exc
                 raise FinalKitError(
                     f"{definition['label']} official model catalog returned HTTP {exc.code}; "
                     "check that this Linux user's API key is valid and allowed to list models"
@@ -941,7 +1075,9 @@ class RuntimeManager:
         value = input(f"{label} [{seed}]: ").strip()
         return value or seed
 
-    def configure_model_routes_interactive(self, provider: str) -> dict[str, Any]:
+    def configure_model_routes_interactive(
+        self, provider: str, *, lock_held: bool = False
+    ) -> dict[str, Any]:
         """Prompt for three independent Model/Reasoning pairs using compact labels."""
 
         if provider not in VALID_MODES:
@@ -960,6 +1096,7 @@ class RuntimeManager:
                         str(level["reasoning"]) for level in entry.get("reasoning", [])
                     ) or "cache did not declare"
                     print(f"  {entry['model']}: Reasoning={choices}")
+                print("  auto: pass through an incoming role effort; otherwise use the model default")
             else:
                 print("Models: local Codex cache unavailable; packaged routes remain editable.")
         else:
@@ -969,7 +1106,7 @@ class RuntimeManager:
                 print("Models: " + ", ".join(available))
             except FinalKitError as exc:
                 print(f"Models: official catalog unavailable ({exc}); current/package values remain editable.")
-            print("Reasoning: " + ", ".join(PROVIDER_REASONING_EFFORTS[provider]))
+            print("Reasoning is shown per selected model below.")
 
         selected_models: dict[str, str] = {}
         selected_reasoning: dict[str, str] = {}
@@ -982,7 +1119,7 @@ class RuntimeManager:
             model = self.validate_model_id(model, f"{role_label} Model")
             if available and model not in available:
                 raise FinalKitError(
-                    f"{role_label} Model {model!r} is not in the current account catalog"
+                    f"{role_label} Model {model!r} is not advertised by the local Codex cache"
                 )
             selected_models[role] = model
 
@@ -993,32 +1130,45 @@ class RuntimeManager:
                     str(level.get("reasoning")) for level in entry.get("reasoning", [])
                 } if entry else set()
                 seed = current_reasoning
-                if supported and seed not in supported:
+                if supported and seed != "auto" and seed not in supported:
                     default_value = str(entry.get("default_reasoning") or "")
                     seed = default_value if default_value in supported else sorted(supported)[0]
                 if supported:
-                    print(f"{role_label} Reasoning: " + ", ".join(sorted(supported)))
+                    print(
+                        f"{role_label} Reasoning: auto, "
+                        + ", ".join(sorted(supported))
+                    )
                 reasoning = self._prompt_compact(f"{role_label} Reasoning", seed)
                 reasoning = self.validate_reasoning_effort(
                     reasoning, f"{role_label} Reasoning", set(CODEX_REASONING_EFFORTS)
                 )
-                if supported and reasoning not in supported:
+                if supported and reasoning != "auto" and reasoning not in supported:
                     raise FinalKitError(
                         f"{role_label} Model {model} does not support Reasoning={reasoning}; "
-                        f"choose: {', '.join(sorted(supported))}"
+                        f"choose: auto, {', '.join(sorted(supported))}"
                     )
             else:
+                supported = provider_reasoning_efforts(provider, model)
+                seed = current_reasoning
+                if seed not in supported:
+                    seed = "auto" if "auto" in supported else sorted(supported)[0]
+                print(f"{role_label} Reasoning: " + ", ".join(sorted(supported)))
                 reasoning = self._prompt_compact(
-                    f"{role_label} Reasoning", current_reasoning
+                    f"{role_label} Reasoning", seed
                 )
                 reasoning = self.validate_reasoning_effort(
                     reasoning,
                     f"{role_label} Reasoning",
-                    set(PROVIDER_REASONING_EFFORTS[provider]),
+                    supported,
                 )
             selected_reasoning[role] = reasoning
 
-        return self.update_model_routes(
+        update = (
+            self._update_model_routes_locked
+            if lock_held
+            else self.update_model_routes
+        )
+        return update(
             provider,
             opus=selected_models["opus"],
             sonnet=selected_models["sonnet"],
@@ -1029,6 +1179,16 @@ class RuntimeManager:
         )
 
     def update_model_routes(
+        self,
+        provider: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Serialize route read/merge/write/restart with every runtime mutation."""
+
+        with FileLock(self.p.lock):
+            return self._update_model_routes_locked(provider, **kwargs)
+
+    def _update_model_routes_locked(
         self,
         provider: str,
         *,
@@ -1079,7 +1239,6 @@ class RuntimeManager:
             )
         if provider in API_PROVIDERS:
             target = routes["providers"][provider]
-            allowed_efforts = set(PROVIDER_REASONING_EFFORTS[provider])
             label = API_PROVIDERS[provider]["label"]
         else:
             target = routes["codex"]
@@ -1092,6 +1251,10 @@ class RuntimeManager:
                 )
             role_effort = role_efforts[role]
             if role_effort is not None:
+                if provider in API_PROVIDERS:
+                    allowed_efforts = provider_reasoning_efforts(
+                        provider, target[f"model_{role}"]
+                    )
                 target[f"reasoning_{role}"] = self.validate_reasoning_effort(
                     role_effort,
                     f"{label} {role} reasoning",
@@ -1110,7 +1273,7 @@ class RuntimeManager:
             affected_active = restart_required
             if affected_active and not restart:
                 raise FinalKitError(
-                    "an active FinalKit runtime is using the old route; rerun with --restart or stop it first; no config was written"
+                    "an active Switchboard runtime is using the old route; rerun with --restart or stop it first; no config was written"
                 )
             previous_science_running = False
             if affected_active:
@@ -1124,55 +1287,83 @@ class RuntimeManager:
                 if self.p.bridge_config.is_file()
                 else None
             )
+            previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+            def interrupt_route_transaction(signum: int, _frame: Any) -> None:
+                raise KeyboardInterrupt(f"route transaction interrupted by signal {signum}")
+
+            signal.signal(signal.SIGTERM, interrupt_route_transaction)
             try:
-                if affected_active:
-                    self.science_stop()
-                    self.stop_gateway()
-                atomic_write(
-                    self.p.model_routes,
-                    json.dumps(routes, indent=2, ensure_ascii=False) + "\n",
-                )
-                self.ensure_bridge_config()
-                if affected_active:
-                    endpoint = self.spawn_gateway(previous_backend)
-                    if previous_science_running:
-                        self.science_start(endpoint)
-                    if not self.gateway_health():
-                        raise FinalKitError("updated gateway failed its health check")
-                    if previous_science_running and not self.science_endpoint_matches(endpoint):
-                        raise FinalKitError("updated Claude Science endpoint identity check failed")
-                    self.write_mode(previous_backend)
-                    restarted = True
-            except Exception as primary_error:
-                rollback_errors: list[str] = []
-                if affected_active:
-                    try:
-                        self.science_stop()
-                    except Exception as exc:
-                        rollback_errors.append(f"stop updated Science: {exc}")
-                    try:
-                        self.stop_gateway()
-                    except Exception as exc:
-                        rollback_errors.append(f"stop updated gateway: {exc}")
                 try:
-                    atomic_write(self.p.model_routes, previous_routes)
-                    if previous_bridge is None:
-                        self.p.bridge_config.unlink(missing_ok=True)
-                    else:
-                        atomic_write(self.p.bridge_config, previous_bridge)
-                except Exception as exc:
-                    rollback_errors.append(f"restore route files: {exc}")
-                if affected_active:
-                    try:
+                    if affected_active:
+                        self.science_stop()
+                        self.stop_gateway()
+                    atomic_write(
+                        self.p.model_routes,
+                        json.dumps(routes, indent=2, ensure_ascii=False) + "\n",
+                    )
+                    self.ensure_bridge_config()
+                    if affected_active:
                         endpoint = self.spawn_gateway(previous_backend)
                         if previous_science_running:
                             self.science_start(endpoint)
-                    except Exception as exc:
-                        rollback_errors.append(f"restore {previous_backend}: {exc}")
-                message = f"model route update failed: {primary_error}; previous route files were restored"
-                if rollback_errors:
-                    message += "; rollback incomplete: " + "; ".join(rollback_errors)
-                raise FinalKitError(message) from primary_error
+                        if not self.gateway_health():
+                            raise FinalKitError("updated gateway failed its health check")
+                        if previous_science_running and not self.science_endpoint_matches(endpoint):
+                            raise FinalKitError("updated Claude Science endpoint identity check failed")
+                        self.write_mode(previous_backend)
+                        restarted = True
+                except (Exception, KeyboardInterrupt) as primary_error:
+                    rollback_errors: list[str] = []
+                    previous_sigint = signal.getsignal(signal.SIGINT)
+                    # Once rollback starts, repeated Ctrl-C/TERM cannot leave a
+                    # half-restored route or runtime. Restore signal handling
+                    # only after the old owner is back in place.
+                    signal.signal(signal.SIGINT, signal.SIG_IGN)
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    try:
+                        if affected_active:
+                            try:
+                                self.science_stop()
+                            except Exception as exc:
+                                rollback_errors.append(f"stop updated Science: {exc}")
+                            try:
+                                self.stop_gateway()
+                            except Exception as exc:
+                                rollback_errors.append(f"stop updated gateway: {exc}")
+                        try:
+                            atomic_write(self.p.model_routes, previous_routes)
+                            if previous_bridge is None:
+                                self.p.bridge_config.unlink(missing_ok=True)
+                            else:
+                                atomic_write(self.p.bridge_config, previous_bridge)
+                        except Exception as exc:
+                            rollback_errors.append(f"restore route files: {exc}")
+                        if affected_active:
+                            try:
+                                endpoint = self.spawn_gateway(previous_backend)
+                                if previous_science_running:
+                                    self.science_start(endpoint)
+                                if not self.gateway_health():
+                                    raise FinalKitError("restored gateway failed its health check")
+                                if previous_science_running and not self.science_endpoint_matches(endpoint):
+                                    raise FinalKitError("restored Claude Science endpoint identity check failed")
+                                self.write_mode(previous_backend)
+                            except Exception as exc:
+                                rollback_errors.append(f"restore {previous_backend}: {exc}")
+                    finally:
+                        signal.signal(signal.SIGINT, previous_sigint)
+                        signal.signal(signal.SIGTERM, interrupt_route_transaction)
+                    primary_detail = str(primary_error) or type(primary_error).__name__
+                    message = (
+                        f"model route update failed: {primary_detail}; "
+                        "previous route files and runtime state were restored"
+                    )
+                    if rollback_errors:
+                        message += "; rollback incomplete: " + "; ".join(rollback_errors)
+                    raise FinalKitError(message) from primary_error
+            finally:
+                signal.signal(signal.SIGTERM, previous_sigterm)
         return {
             "provider": provider,
             "changed": changed,
@@ -1297,10 +1488,10 @@ class RuntimeManager:
         ):
             return str(existing["endpoint"])
         if existing and self.gateway_identity(existing):
-            raise FinalKitError("a different verified FinalKit gateway is still running")
+            raise FinalKitError("a different verified Switchboard gateway is still running")
         if self.port_in_use():
             raise FinalKitError(
-                f"127.0.0.1:{self.gateway_port} is owned by another process; FinalKit will not take it over"
+                f"127.0.0.1:{self.gateway_port} is owned by another process; Switchboard will not take it over"
             )
         self.p.gateway_record.unlink(missing_ok=True)
 
@@ -1432,7 +1623,7 @@ class RuntimeManager:
             return
         alive = process_is_live(pid)
         if alive and not self.gateway_identity(record):
-            raise FinalKitError(f"refusing to stop PID {pid}: process identity no longer matches FinalKit")
+            raise FinalKitError(f"refusing to stop PID {pid}: process identity no longer matches Switchboard")
         if alive:
             os.kill(pid, signal.SIGTERM)
             deadline = time.monotonic() + 6.0
@@ -1462,7 +1653,7 @@ class RuntimeManager:
         return environment
 
     def ensure_science_identity(self, *, check_only: bool = False) -> dict[str, Any]:
-        """Create/reuse only FinalKit's identity; never overwrite real credentials."""
+        """Create/reuse only Switchboard's identity; never overwrite real credentials."""
 
         result = subprocess.run(
             [
@@ -1483,7 +1674,7 @@ class RuntimeManager:
         if result.returncode != 0:
             raise FinalKitError(
                 (result.stderr or result.stdout).strip()
-                or "FinalKit could not establish the isolated Claude Science local identity"
+                or "Switchboard could not establish the isolated Claude Science local identity"
             )
         try:
             payload = json.loads(result.stdout)
@@ -1494,7 +1685,7 @@ class RuntimeManager:
         if not check_only and payload.get("schema") != "science-local-v2":
             raise FinalKitError(
                 "the isolated Science profile contains unknown or real credentials; "
-                "FinalKit preserved them and refused to replace them with its local identity"
+                "Switchboard preserved them and refused to replace them with its local identity"
             )
         return payload
 
@@ -1615,7 +1806,7 @@ class RuntimeManager:
                 pid = 0
             if not self.science_process_identity(pid):
                 return self.science_control_error(
-                    "Claude Science status PID failed FinalKit owner identity verification",
+                    "Claude Science status PID failed Switchboard owner identity verification",
                     owner or ({"pid": pid, "owned": False, "process_state": process_state(pid) or "unknown"} if pid else None),
                 )
             if owner and (not owner.get("owned") or int(owner.get("pid", 0) or 0) != pid):
@@ -1684,10 +1875,10 @@ class RuntimeManager:
         detail = status.get("detail", "control socket unavailable")
         return (
             "FINALKIT_SCIENCE_CONTROL_UNAVAILABLE: "
-            f"{detail} (PID {pid}, state {state}). FinalKit did not force-kill a daemon "
+            f"{detail} (PID {pid}, state {state}). Switchboard did not force-kill a daemon "
             "after its official control path failed. "
             "From Windows run: wsl.exe --terminate <your Ubuntu distro>; then run menu 16 "
-            "Update FinalKit runtime and start the provider again. Use menu 2 only when the "
+            "Update Switchboard runtime and start the provider again. Use menu 2 only when the "
             "runtime is missing or the full stack is damaged. Do not use Clear."
         )
 
@@ -1719,7 +1910,7 @@ class RuntimeManager:
         if status.get("running"):
             raise FinalKitError(
                 "Claude Science remained running after its official stop command; "
-                "FinalKit did not kill it without a complete owner proof."
+                "Switchboard did not kill it without a complete owner proof."
             )
         if stop_detail:
             print(
@@ -1743,7 +1934,7 @@ class RuntimeManager:
             identity = self.ensure_science_identity()
             if identity.get("action") == "created":
                 print(
-                    "Created FinalKit's local-only Science identity inside the isolated profile."
+                    "Created Switchboard's local-only Science identity inside the isolated profile."
                 )
             elif str(identity.get("action", "")).startswith("migrated-"):
                 print("Migrated an exact legacy FinalKit identity to the current local-only shape.")
@@ -1934,6 +2125,21 @@ class RuntimeManager:
             "claude-sonnet": route["reasoning_sonnet"],
             "claude-haiku": route["reasoning_haiku"],
         }
+        codex_catalog = self.codex_local_model_catalog()
+
+        def supported_reasoning(model: str) -> list[str]:
+            entry = self._catalog_entry(codex_catalog, model)
+            return [
+                str(level["reasoning"])
+                for level in (entry.get("reasoning", []) if entry else [])
+                if str(level.get("reasoning") or "") in CODEX_REASONING_EFFORTS - {"auto"}
+            ]
+
+        codex_supported_reasoning_map = {
+            "claude-opus": supported_reasoning(codex_opus_model),
+            "claude-sonnet": supported_reasoning(codex_sonnet_model),
+            "claude-haiku": supported_reasoning(codex_haiku_model),
+        }
         config = {
             "deepseek_api_key": "",
             "openai_api_key": "",
@@ -1949,10 +2155,12 @@ class RuntimeManager:
             "codex_model": codex_opus_model,
             "codex_reasoning": route["reasoning_opus"],
             "codex_reasoning_map": codex_reasoning_map,
+            "codex_supported_reasoning": codex_supported_reasoning_map["claude-opus"],
+            "codex_supported_reasoning_map": codex_supported_reasoning_map,
             "codex_model_map": {
                 # Claude Science owns these UI compatibility IDs.  The
                 # connector maps every current/future version suffix within a
-                # family to FinalKit's real three-tier ChatGPT Codex route.
+                # family to Switchboard's real three-tier ChatGPT Codex route.
                 "claude-opus": codex_opus_model,
                 "claude-sonnet": codex_sonnet_model,
                 "claude-haiku": codex_haiku_model,
@@ -2003,7 +2211,7 @@ class RuntimeManager:
     @staticmethod
     def print_science_model_note() -> None:
         print(
-            "Science model IDs: Claude-compatible aliases; FinalKit's model catalog "
+            "Science model IDs: Claude-compatible aliases; Switchboard's model catalog "
             "and EFFECTIVE_ROUTE expose the configured upstream route."
         )
 
@@ -2011,7 +2219,12 @@ class RuntimeManager:
         """Create deterministic non-secret runtime configuration."""
 
         self.require_runtime()
-        self.ensure_bridge_config()
+        # model-routes.json and the derived bridge config share the same
+        # mutation owner as configure/update-models.  In particular, a repair
+        # install may call prepare while another terminal is active; keep the
+        # read/migrate/write sequence inside the common Switchboard lock.
+        with FileLock(self.p.lock):
+            self.ensure_bridge_config()
 
     def _switch_locked(self, mode: str, *, start_science: bool = True) -> str:
         if mode not in VALID_MODES:
@@ -2159,12 +2372,12 @@ class RuntimeManager:
                 if science_status.get("control_error"):
                     raise FinalKitError(self.science_recovery_message(science_status))
                 if science_status.get("running") or self.read_gateway_record():
-                    raise FinalKitError("stop the active FinalKit runtime before initializing its profile")
+                    raise FinalKitError("stop the active Switchboard runtime before initializing its profile")
                 endpoint = self.spawn_gateway("deepseek", key_override="finalkit-local-smoke-key")
                 try:
                     # A first Science boot creates encryption.key.  Once that
                     # bootstrap completes, the helper can remove only exact
-                    # obsolete FinalKit identities and otherwise leaves Claude
+                    # obsolete managed identities and otherwise leaves Claude
                     # Science account state untouched.
                     self.science_start(endpoint, ensure_identity=False)
                     for _ in range(160):
@@ -2194,7 +2407,9 @@ class RuntimeManager:
             atomic_write(key_path, first)
             first = ""
             print(f"{provider['label']} key saved inside this Linux user's WSL home: {key_path}")
-            result = self.configure_model_routes_interactive(provider_name)
+            result = self.configure_model_routes_interactive(
+                provider_name, lock_held=True
+            )
         print("Route: " + self.route_description(provider_name, result["routes"]))
 
     def configure_codex(self) -> None:
@@ -2213,7 +2428,9 @@ class RuntimeManager:
                 "the official Codex browser login did not complete. "
                 "If localhost OAuth is unavailable, run: fkctl configure-codex-device",
             )
-            result = self.configure_model_routes_interactive("codex")
+            result = self.configure_model_routes_interactive(
+                "codex", lock_held=True
+            )
         print("Route: " + self.route_description("codex", result["routes"]))
 
     def configure_codex_device(self) -> None:
@@ -2234,7 +2451,9 @@ class RuntimeManager:
                 "the official Codex device login did not complete. Use fkctl configure-codex "
                 "for the default browser flow, or enable device login in ChatGPT settings",
             )
-            result = self.configure_model_routes_interactive("codex")
+            result = self.configure_model_routes_interactive(
+                "codex", lock_held=True
+            )
         print("Route: " + self.route_description("codex", result["routes"]))
 
     @staticmethod
@@ -2256,67 +2475,148 @@ class RuntimeManager:
         ):
             raise FinalKitError("the imported ChatGPT auth token chain is incomplete")
 
-    def import_codex_auth(self, payload: bytearray) -> None:
-        """One-time stdin import into the WSL-owned official Codex cache.
+    def _import_codex_auth_locked(self, payload: bytearray) -> None:
+        """Validate and replace auth while the caller owns the runtime lock."""
 
-        The caller must stop Science and its gateway first. The candidate is
-        validated in a temporary HOME, then atomically replaces the WSL cache.
-        A failed final validation restores the prior file byte-for-byte. Once
-        committed, the Linux Codex CLI and connector independently own future
-        refreshes and re-login; there is no recurring Windows synchronization.
-        """
+        science_status = self.science_status()
+        if science_status.get("control_error"):
+            raise FinalKitError(self.science_recovery_message(science_status))
+        if science_status.get("running") or self.read_gateway_record():
+            raise FinalKitError(
+                "stop the active Switchboard Science/gateway before importing Codex auth"
+            )
+
+        self.ensure_bridge_config()
+        auth = self.p.codex_auth
+        auth.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        auth.parent.chmod(0o700)
+        previous = bytearray(auth.read_bytes()) if auth.is_file() else None
+        previous_mode = stat.S_IMODE(auth.stat().st_mode) if auth.is_file() else 0o600
+        replaced = False
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=".codex-import.", dir=self.p.client_home
+            ) as scratch:
+                staging_home = Path(scratch)
+                staged_auth = staging_home / ".codex" / "auth.json"
+                atomic_write_bytes(staged_auth, payload)
+                staging_environment = private_child_environment(staging_home)
+                if not self._codex_login_status(staging_environment):
+                    raise FinalKitError(
+                        "official Codex login status did not validate the imported auth"
+                    )
+                os.replace(staged_auth, auth)
+                replaced = True
+                auth.chmod(0o600)
+
+            self._finalize_codex_auth(private_child_environment(self.p.client_home))
+        except (Exception, KeyboardInterrupt):
+            if replaced:
+                if previous is None:
+                    auth.unlink(missing_ok=True)
+                else:
+                    atomic_write_bytes(auth, previous, previous_mode)
+            raise
+        finally:
+            if previous is not None:
+                for index in range(len(previous)):
+                    previous[index] = 0
+
+    def import_codex_auth(self, payload: bytearray) -> None:
+        """Import stdin auth only when the WSL runtime is already stopped."""
 
         self.require_runtime()
         self._validate_imported_codex_auth(payload)
         with FileLock(self.p.lock):
-            science_status = self.science_status()
-            if science_status.get("control_error"):
-                raise FinalKitError(self.science_recovery_message(science_status))
-            if science_status.get("running") or self.read_gateway_record():
-                raise FinalKitError(
-                    "stop the active FinalKit Science/gateway before importing Codex auth"
-                )
-
-            self.ensure_bridge_config()
-            auth = self.p.codex_auth
-            auth.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            auth.parent.chmod(0o700)
-            previous = bytearray(auth.read_bytes()) if auth.is_file() else None
-            previous_mode = stat.S_IMODE(auth.stat().st_mode) if auth.is_file() else 0o600
-            replaced = False
-            try:
-                with tempfile.TemporaryDirectory(
-                    prefix=".codex-import.", dir=self.p.client_home
-                ) as scratch:
-                    staging_home = Path(scratch)
-                    staged_auth = staging_home / ".codex" / "auth.json"
-                    atomic_write_bytes(staged_auth, payload)
-                    staging_environment = private_child_environment(staging_home)
-                    if not self._codex_login_status(staging_environment):
-                        raise FinalKitError(
-                            "official Codex login status did not validate the imported auth"
-                        )
-                    os.replace(staged_auth, auth)
-                    replaced = True
-                    auth.chmod(0o600)
-
-                self._finalize_codex_auth(private_child_environment(self.p.client_home))
-            except Exception:
-                if replaced:
-                    if previous is None:
-                        auth.unlink(missing_ok=True)
-                    else:
-                        atomic_write_bytes(auth, previous, previous_mode)
-                raise
-            finally:
-                if previous is not None:
-                    for index in range(len(previous)):
-                        previous[index] = 0
-
+            self._import_codex_auth_locked(payload)
         print(
             "One-time Codex auth import committed. WSL now owns its independent "
             "refresh and re-login lifecycle."
         )
+
+    def migrate_codex_auth(self, payload: bytearray) -> dict[str, Any]:
+        """Atomically stop, import, and restore the exact prior runtime shape."""
+
+        self.require_runtime()
+        self._validate_imported_codex_auth(payload)
+        auth = self.p.codex_auth
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        termination_seen = False
+
+        def interrupt_transaction(_signum, _frame) -> None:
+            nonlocal termination_seen
+            if termination_seen:
+                return
+            termination_seen = True
+            raise FinalKitError("Codex auth migration was interrupted by SIGTERM")
+
+        signal.signal(signal.SIGTERM, interrupt_transaction)
+        try:
+            with FileLock(self.p.lock):
+                prior_state = self._runtime_state_locked()
+                previous_auth = bytearray(auth.read_bytes()) if auth.is_file() else None
+                previous_auth_mode = stat.S_IMODE(auth.stat().st_mode) if auth.is_file() else 0o600
+                try:
+                    self.science_stop()
+                    self.stop_gateway()
+                    self._import_codex_auth_locked(payload)
+                    self._restore_runtime_state_locked(prior_state)
+                    restored = self._runtime_state_locked()
+                    if restored != prior_state:
+                        raise FinalKitError(
+                            f"post-import runtime state mismatch: expected {prior_state}, got {restored}"
+                        )
+                except (Exception, KeyboardInterrupt) as primary_error:
+                    # Repeated terminal interrupts must not leave auth or the
+                    # previously running provider only partly restored.
+                    previous_sigint = signal.getsignal(signal.SIGINT)
+                    signal.signal(signal.SIGINT, signal.SIG_IGN)
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    rollback_errors: list[str] = []
+                    try:
+                        for cleanup in (self.science_stop, self.stop_gateway):
+                            try:
+                                cleanup()
+                            except Exception as exc:
+                                rollback_errors.append(f"stop partial runtime: {exc}")
+                        try:
+                            if previous_auth is None:
+                                auth.unlink(missing_ok=True)
+                            else:
+                                atomic_write_bytes(auth, previous_auth, previous_auth_mode)
+                        except Exception as exc:
+                            rollback_errors.append(f"restore auth: {exc}")
+                        try:
+                            self._restore_runtime_state_locked(prior_state)
+                        except Exception as exc:
+                            rollback_errors.append(f"restore runtime: {exc}")
+                        try:
+                            if self._runtime_state_locked() != prior_state:
+                                rollback_errors.append("restored runtime state does not match the snapshot")
+                        except Exception as exc:
+                            rollback_errors.append(f"verify runtime: {exc}")
+                    finally:
+                        signal.signal(signal.SIGINT, previous_sigint)
+                        signal.signal(signal.SIGTERM, interrupt_transaction)
+
+                    message = f"one-time Codex auth migration failed: {primary_error}"
+                    if rollback_errors:
+                        message += "\nrollback incomplete: " + "; ".join(rollback_errors)
+                    else:
+                        message += "\nprevious auth bytes and runtime state were restored"
+                    raise FinalKitError(message) from primary_error
+                finally:
+                    if previous_auth is not None:
+                        for index in range(len(previous_auth)):
+                            previous_auth[index] = 0
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+
+        print(
+            "One-time Codex auth migration committed. WSL owns an independent copy, "
+            "and the prior runtime state was restored under one lock."
+        )
+        return prior_state
 
     def _replace_codex_auth(
         self,
@@ -2391,6 +2691,7 @@ class RuntimeManager:
             stderr=subprocess.PIPE,
             text=True,
             check=False,
+            timeout=CODEX_LOGIN_STATUS_TIMEOUT_SECONDS,
         )
         return status.returncode == 0
 
@@ -2406,19 +2707,20 @@ class RuntimeManager:
     def login_linux_codex(self) -> None:
         if not self.p.codex.is_file():
             raise FinalKitError(f"Linux Codex CLI is missing: {self.p.codex}")
-        environment = codex_network_environment(
-            Path.home(), "https://auth.openai.com"
-        )
-        result = subprocess.run(
-            [str(self.p.codex), *CODEX_FILE_AUTH_ARGS, "login"],
-            env=environment,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise FinalKitError("Linux Codex browser login did not complete")
+        with FileLock(self.p.lock):
+            environment = codex_network_environment(
+                self.p.client_home, "https://auth.openai.com"
+            )
+            print("Starting the official Linux Codex browser login in Switchboard's isolated home.")
+            print("The ordinary WSL ~/.codex profile is not read or changed.")
+            self._replace_codex_auth(
+                [str(self.p.codex), *CODEX_FILE_AUTH_ARGS, "login"],
+                environment,
+                "Linux Codex browser login did not complete",
+            )
 
     def run_claude_code(self, mode: str, arguments: list[str]) -> int:
-        """Run native Linux Claude Code against the selected local FinalKit gateway."""
+        """Run native Linux Claude Code against the selected local Switchboard gateway."""
 
         self.select_gateway(mode)
         record = self.read_gateway_record()
@@ -2438,6 +2740,71 @@ class RuntimeManager:
         environment["ANTHROPIC_API_KEY"] = ""
         append_no_proxy(environment)
         result = subprocess.run([str(self.p.claude), *arguments], env=environment, check=False)
+        return result.returncode
+
+    def run_codex_with_provider(self, mode: str, arguments: list[str]) -> int:
+        """Run isolated Linux Codex while its Claude workers use one owned route."""
+
+        self.select_gateway(mode)
+        record = self.read_gateway_record()
+        if not record or not self.gateway_identity(record) or not self.gateway_health(record):
+            raise FinalKitError("the selected gateway is not healthy")
+        if not self.codex_login_status():
+            raise FinalKitError(
+                "WSL Codex login is not configured; use the independent Linux login or the "
+                "optional one-time Windows auth import"
+            )
+        environment = private_child_environment(self.p.client_home)
+        environment["PATH"] = f"{self.p.claude.parent}:{LINUX_SYSTEM_PATH}"
+        environment["ANTHROPIC_BASE_URL"] = str(record["endpoint"])
+        environment["ANTHROPIC_AUTH_TOKEN"] = SCIENCE_LOCAL_SESSION_TOKEN
+        environment["ANTHROPIC_API_KEY"] = ""
+        environment["SWITCHBOARD_PROVIDER"] = mode
+        append_no_proxy(environment)
+        print(f"ACTIVE_MODE={mode}")
+        print(f"EFFECTIVE_ROUTE={self.route_description(mode)}")
+        active_route = (
+            self.model_routes()["codex"]
+            if mode == "codex"
+            else self.model_routes()["providers"][mode]
+        )
+        explicit_roles = [
+            role
+            for role in CLAUDE_ROUTE_ROLES
+            if active_route[f"reasoning_{role}"] != "auto"
+        ]
+        if explicit_roles:
+            print(
+                "MULTI_AGENT_REASONING explicit tier overrides are active for "
+                + ",".join(explicit_roles)
+                + "; use Reasoning=auto to preserve supported incoming role effort."
+            )
+        else:
+            print(
+                "MULTI_AGENT_REASONING auto preserves supported incoming role effort; "
+                "requests without one use the model default."
+            )
+        print(
+            "MULTI_AGENT_AUTH Codex=isolated-official-login "
+            "Claude-workers=selected-loopback-route Windows-auth=not-injected "
+            "Science-identity=not-mutated"
+        )
+        print(
+            "MULTI_AGENT_FILESYSTEM sandbox=false; workers inherit Codex/Claude tool approvals "
+            "and can access the selected project plus other mounts visible to this WSL user."
+        )
+        print("MULTI_AGENT_USE Start a fresh Codex task and explicitly invoke the installed skill:")
+        print(
+            "Use $codex-claude-orchestrator:claude-pty-agents for this bounded outcome; "
+            "keep Codex as authority and independently verify Claude's handoff."
+        )
+        print("Installing the plugin exposes transport; it does not modify project AGENTS.md policy.")
+        sys.stdout.flush()
+        result = subprocess.run(
+            [str(self.p.codex), *CODEX_FILE_AUTH_ARGS, *arguments],
+            env=environment,
+            check=False,
+        )
         return result.returncode
 
     def smoke_local(self) -> str:
@@ -2628,7 +2995,9 @@ class RuntimeManager:
             add("Codex auth permission 600", stat.S_IMODE(self.p.codex_auth.stat().st_mode) == 0o600)
         routes: dict[str, Any] = {}
         try:
-            routes = self.model_routes()
+            # Doctor is observational. Route migration belongs to prepare or
+            # an explicit configuration command under FileLock.
+            routes = self.model_routes_read_only()
             routes_ok = True
         except FinalKitError:
             routes_ok = False
@@ -2714,7 +3083,7 @@ class RuntimeManager:
             )
         print(f"[INFO] ChatGPT Codex auth: {'configured' if self.codex_auth_configured() else 'not configured'}")
         if science_identity.get("schema") == "science-local-v2":
-            print("[INFO] Claude Science identity: FinalKit local-only profile; no Claude account used")
+            print("[INFO] Claude Science identity: Switchboard local-only profile; no Claude account used")
         elif science_identity.get("schema") == "science-credentials-preserved":
             print("[INFO] Claude Science identity: unknown/real credentials preserved; direct start is blocked")
         record = self.read_gateway_record()
@@ -2731,7 +3100,7 @@ class RuntimeManager:
         return 0 if failures == 0 else 1
 
     def status(self) -> None:
-        print(f"FinalKit root:       {self.p.root}")
+        print(f"Switchboard root:    {self.p.root}")
         print(f"Deployed version:    {self.installed_package_version()}")
         print(f"Science data:       {self.p.data_dir}")
         print(f"Committed mode:     {self.current_mode() or 'unconfigured'}")
@@ -2780,13 +3149,79 @@ class RuntimeManager:
         try:
             identity = self.ensure_science_identity(check_only=True)
             if identity.get("schema") == "science-local-v2":
-                print("Science identity:   FinalKit local-only; no Claude account used")
+                print("Science identity:   Switchboard local-only; no Claude account used")
             elif identity.get("schema") == "science-local-missing":
                 print("Science identity:   not initialized; run update-runtime or init-profile")
             else:
                 print("Science identity:   unknown/real credentials preserved; direct start is blocked")
         except FinalKitError as exc:
             print(f"Science identity:   credential audit failed ({exc})")
+
+    def _runtime_state_locked(self) -> dict[str, Any]:
+        """Read the exact restorable shape while the caller owns the lock."""
+
+        science = self.science_status()
+        if science.get("control_error"):
+            raise FinalKitError(self.science_recovery_message(science))
+
+        record = self.read_gateway_record()
+        gateway_running = bool(
+            record and self.gateway_identity(record) and self.gateway_health(record)
+        )
+        if record and not gateway_running:
+            raise FinalKitError(
+                "cannot snapshot a stale or unverified gateway; run fkctl stop or repair it first"
+            )
+
+        science_running = bool(science.get("running"))
+        if science_running:
+            if not gateway_running or not record:
+                raise FinalKitError(
+                    "Claude Science is running without a healthy owned gateway; refusing an auth migration"
+                )
+            if not self.science_status_endpoint_matches(science, str(record["endpoint"])):
+                raise FinalKitError(
+                    "Claude Science and the owned gateway have different endpoints; refusing an auth migration"
+                )
+
+        mode_value = record.get("backend") if gateway_running and record else self.current_mode()
+        mode = str(mode_value) if mode_value in VALID_MODES else None
+        if (science_running or gateway_running) and mode is None:
+            raise FinalKitError("active runtime has no restorable provider mode")
+
+        return {
+            "schema": "switchboard-runtime-state-v1",
+            "science_running": science_running,
+            "gateway_running": gateway_running,
+            "mode": mode,
+        }
+
+    def runtime_state(self) -> dict[str, Any]:
+        """Return the exact restorable runtime shape without exposing secrets."""
+
+        self.require_runtime()
+        with FileLock(self.p.lock):
+            return self._runtime_state_locked()
+
+    def _restore_runtime_state_locked(self, state: dict[str, Any]) -> None:
+        """Restore a state produced by ``_runtime_state_locked``."""
+
+        mode = state.get("mode")
+        if state.get("science_running"):
+            if mode not in VALID_MODES:
+                raise FinalKitError("Science snapshot has no valid provider mode")
+            self._switch_locked(str(mode), start_science=True)
+        elif state.get("gateway_running"):
+            if mode not in VALID_MODES:
+                raise FinalKitError("gateway snapshot has no valid provider mode")
+            self._switch_locked(str(mode), start_science=False)
+        else:
+            self.science_stop()
+            self.stop_gateway()
+            if mode in VALID_MODES:
+                self.write_mode(str(mode))
+            else:
+                self.p.mode.unlink(missing_ok=True)
 
     def capabilities(self) -> None:
         """Machine-readable command support; package versions never gate use."""
@@ -2806,7 +3241,7 @@ class RuntimeManager:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="fkctl", description="ScienceCodexFinalKit controller")
+    parser = argparse.ArgumentParser(prog="fkctl", description="Claude Codex Switchboard controller")
     parser.add_argument("--root", type=Path, default=Path(os.environ.get("FINALKIT_ROOT", DEFAULT_ROOT)))
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("prepare")
@@ -2819,10 +3254,20 @@ def build_parser() -> argparse.ArgumentParser:
         "import-codex-auth",
         help="one-time import of an official ChatGPT Codex auth JSON from stdin",
     )
+    sub.add_parser(
+        "migrate-codex-auth",
+        help="one-lock stop/import/restore of an official ChatGPT Codex auth JSON from stdin",
+    )
     sub.add_parser("login-linux-codex")
-    claude = sub.add_parser("claude", help="run native Claude Code through a selected FinalKit backend")
+    claude = sub.add_parser("claude", help="run native Claude Code through a selected Switchboard backend")
     claude.add_argument("mode", choices=sorted(VALID_MODES))
     claude.add_argument("arguments", nargs=argparse.REMAINDER)
+    codex = sub.add_parser(
+        "codex",
+        help="run isolated Linux Codex while installed Claude workers use a selected backend",
+    )
+    codex.add_argument("mode", choices=sorted(VALID_MODES))
+    codex.add_argument("arguments", nargs=argparse.REMAINDER)
     gateway = sub.add_parser("gateway", help="select a backend without starting Claude Science")
     gateway.add_argument("mode", choices=sorted(VALID_MODES))
     for command in ("start", "switch", "restart", "test"):
@@ -2864,6 +3309,7 @@ def build_parser() -> argparse.ArgumentParser:
     update_models.add_argument("--json", action="store_true", dest="as_json")
     sub.add_parser("url")
     sub.add_parser("status")
+    sub.add_parser("runtime-state")
     sub.add_parser("capabilities")
     sub.add_parser("doctor")
     sub.add_parser("stop")
@@ -2899,10 +3345,22 @@ def main() -> int:
             finally:
                 for index in range(len(payload)):
                     payload[index] = 0
+        elif args.command == "migrate-codex-auth":
+            if sys.stdin.isatty():
+                raise FinalKitError("migrate-codex-auth accepts auth JSON only through stdin")
+            payload = bytearray(sys.stdin.buffer.read(MAX_CODEX_AUTH_BYTES + 1))
+            try:
+                state = manager.migrate_codex_auth(payload)
+                print(json.dumps({"migration": "ok", "restored_runtime": state}, sort_keys=True))
+            finally:
+                for index in range(len(payload)):
+                    payload[index] = 0
         elif args.command == "login-linux-codex":
             manager.login_linux_codex()
         elif args.command == "claude":
             return manager.run_claude_code(args.mode, args.arguments)
+        elif args.command == "codex":
+            return manager.run_codex_with_provider(args.mode, args.arguments)
         elif args.command == "gateway":
             manager.select_gateway(args.mode)
             print(f"ACTIVE_MODE={args.mode}")
@@ -2970,21 +3428,20 @@ def main() -> int:
                     )
                 print(f"SOURCE={result['catalog_source']}")
         elif args.command == "update-models":
-            with FileLock(manager.p.lock):
-                result = manager.update_model_routes(
-                    args.provider,
-                    main=args.main,
-                    fast=args.fast,
-                    opus=args.opus,
-                    sonnet=args.sonnet,
-                    haiku=args.haiku,
-                    effort=args.effort,
-                    effort_opus=args.effort_opus,
-                    effort_sonnet=args.effort_sonnet,
-                    effort_haiku=args.effort_haiku,
-                    dry_run=args.dry_run,
-                    restart=args.restart,
-                )
+            result = manager.update_model_routes(
+                args.provider,
+                main=args.main,
+                fast=args.fast,
+                opus=args.opus,
+                sonnet=args.sonnet,
+                haiku=args.haiku,
+                effort=args.effort,
+                effort_opus=args.effort_opus,
+                effort_sonnet=args.effort_sonnet,
+                effort_haiku=args.effort_haiku,
+                dry_run=args.dry_run,
+                restart=args.restart,
+            )
             if args.as_json:
                 print(json.dumps(result, ensure_ascii=False, sort_keys=True))
             else:
@@ -2997,13 +3454,15 @@ def main() -> int:
             print(manager.science_url())
         elif args.command == "status":
             manager.status()
+        elif args.command == "runtime-state":
+            print(json.dumps(manager.runtime_state(), sort_keys=True))
         elif args.command == "capabilities":
             manager.capabilities()
         elif args.command == "doctor":
             return manager.doctor()
         elif args.command == "stop":
             manager.stop()
-            print("FinalKit runtime stopped.")
+            print("Switchboard runtime stopped.")
         elif args.command == "logs":
             manager.show_log(args.which, max(1, min(args.lines, 2000)))
         return 0

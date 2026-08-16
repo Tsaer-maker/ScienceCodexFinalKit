@@ -1,328 +1,365 @@
-# Science SwitchModel / FinalKit 3.2.3
+# Claude Codex Switchboard 3.3.0
 
-ScienceCodexFinalKit 为普通 Windows 用户建立一套可重复安装、按用户隔离的科研 Agent 环境。主运行面位于 Ubuntu 24.04 WSL2：Claude Science 使用本地隔离身份连接 DeepSeek、Kimi、GLM 或 ChatGPT/Codex；原生 Linux Claude Code 可以复用同一组 provider。另有一套完全独立的 Windows Claude profile，可在 Windows 应用内使用三家 API 或 Windows Codex CLI 的 ChatGPT 登录。
+**在 Windows 上用一个入口管理 Claude Science、Claude Code、官方 Windows Claude 应用，以及可选的 Codex 主控多 Agent 工作区。**
 
-新用户不需要修改源码、用户名或盘符。根脚本通过自身位置找到包，Windows 状态写入当前用户的 `%LOCALAPPDATA%/%USERPROFILE%`，Linux 状态写入目标用户的 `/home/<user>`。执行 owner 中没有固定的 `TSA`、`C:\Users\TSA`、`/home/tsa` 或 `D:\Tools` 路径。
+[English](README.md) · [完整操作手册](operation.md) · [代码剖析](docs/CODE_WALKTHROUGH.zh-CN.md) · [相近项目检索与采纳报告](docs/PROJECT_RESEARCH_REPORT.zh-CN.md)
 
-> 完整的首次安装、日常命令、更新和故障恢复见 [operation.md](operation.md)。维护者实现与安全模型见 [代码剖析](docs/CODE_WALKTHROUGH.zh-CN.md)。
+## 能解决什么
 
-## 1. 能做什么
+Claude Codex Switchboard 面向希望复用现有 API 或官方 Codex ChatGPT 登录、同时又不想把 Windows 和 WSL 认证混在一起的用户。它提供四条上游路线：
 
-| 运行面 | 用途 | 可用 provider | 凭据 owner | 默认端口 |
-|---|---|---|---|---|
-| WSL Claude Science | 本地科研工作台 | DeepSeek、Kimi、GLM、ChatGPT/Codex | 当前 Linux 用户 | Science `8765`；gateway `9876` |
-| WSL 原生 Claude Code | CLI/项目工作 | 同上 | 当前 Linux 用户 | 复用当前或临时启动的 WSL gateway |
-| Windows Claude 应用（可选） | 官方 Windows 应用的独立 3P profile | DeepSeek、Kimi、GLM、ChatGPT/Codex | 当前 Windows 用户 | gateway `18987` |
-| Windows 隔离 Chrome（可选） | Claude Science 页面自动化与 MCP | 不改变推理 provider | 当前 Windows 用户 | DevTools `9223` |
+| 上游 | 认证所有者 | WSL Claude Science | WSL Claude Code | Windows Claude | 多 Agent Claude workers |
+| --- | --- | --- | --- | --- | --- |
+| DeepSeek API | 当前 WSL 用户的私有 key，或 Windows DPAPI profile | 支持 | 支持 | 支持 | 支持 |
+| Kimi API | 当前 WSL 用户的私有 key，或 Windows DPAPI profile | 支持 | 支持 | 支持 | 支持 |
+| GLM API | 当前 WSL 用户的私有 key，或 Windows DPAPI profile | 支持 | 支持 | 支持 | 支持 |
+| ChatGPT / Codex | 对应系统内官方 Codex CLI 的 `auth.json` | 支持 | 支持 | 支持 | 支持 |
 
-WSL Claude Science 的本地身份不是 Claude.ai 账号，不需要 Claude.ai 登录。实际推理仍必须拥有至少一种有效上游认证：三家 API key，或官方 Codex CLI 的 ChatGPT 登录。Windows Claude 使用官方 Windows 应用，其应用可用性、登录和计划要求仍由 Anthropic 决定；FinalKit 只管理独立的第三方推理 profile。
+这里有两套互不调用的应用面：
 
-FinalKit 不依赖 Docker，不复制 HGSX 的专有代码、镜像、凭据或许可证内容，也不尝试绕过验证码、订阅、配额、地区、组织或付费边界。它独立实现单入口切换、loopback gateway、进程身份核验、原子配置、失败回滚和按用户隔离。
+- **WSL 面**：Claude Science 使用隔离的本地工作台身份，不需要 Claude.ai 账号登录；Claude Code、Codex CLI、provider key 与 Science 身份分别持有。
+- **Windows 面**：官方 Windows Claude 应用使用独立 profile、独立 loopback gateway 和 Windows 认证，不读取、不修改、不启动 WSL。
 
-## 2. 适用环境
+两边都可以配置 Opus、Sonnet、Haiku 三档，每一档分别保存：
 
-### 必需
+- `Model`：真实上游模型 ID；
+- `Reasoning`：该模型支持的推理强度。
 
-- Windows 10 版本 2004 / Build 19041 以上，或 Windows 11；这是微软当前 `wsl --install` 的官方前提。[Microsoft WSL 安装说明](https://learn.microsoft.com/windows/wsl/install)
-- 可用的 WSL2 与硬件虚拟化；Build 可在首次启用 Windows 组件时申请一次 UAC，并在需要重启时明确停止。
-- x64 或 ARM64 Windows/WSL；安装器会按 `uname -m` 选择 Node.js `x64` 或 `arm64` 包。
-- 稳定网络，可访问 Ubuntu、Claude、OpenAI/ChatGPT、GitHub、Node.js、PyPI 和 npm；使用哪家 API 还需访问对应供应商。
-- 建议至少预留 `20 GB` 可用磁盘空间。完整参考安装约占 `14 GB`，不同 Claude Science/conda/npm 缓存会继续波动。
-- 至少一种你有权使用的推理凭据。
+Sonnet 不再和 Opus 共用一个输入框或被默认锁成同一档。Codex profile 会读取官方 Codex CLI 的本地 model cache，在可用时列出最近声明的模型与 reasoning levels，并拒绝 cache 明确不支持的固定组合。该 cache 不是实时 entitlement 或请求一定被接受的保证。
 
-### 仅独立 Windows Claude 需要
+## 运行结构
 
-- 官方 Claude Windows 应用。Anthropic 当前列出的 Windows 系统前提是 Windows 10 以上。[Claude Desktop 安装说明](https://support.claude.com/en/articles/10065433-install-claude-desktop)
-- Windows Python `3.10+`，`py -3 --version` 或 `python --version` 能找到它。
-- 使用 Codex profile 时，还要安装并登录官方 Windows Codex CLI；三家 API profile 不要求 Codex 登录。
+```mermaid
+flowchart TD
+    E["Windows Switchboard 入口"] --> WSL["Ubuntu 24.04 WSL2"]
+    E --> WCLAUDE["独立 Windows Claude controller"]
 
-### 不要求
+    WSL --> RT["Switchboard runtime"]
+    RT --> SCI["Claude Science 本地工作台"]
+    RT --> CLI["原生 Linux Claude Code"]
+    RT --> AG["可选 Codex 主控多 Agent"]
 
-- 不要求 Docker Desktop。
-- 不要求预先打开管理员 PowerShell；普通用户运行 Build，只有启用 WSL 系统组件时出现 UAC。
-- 不要求固定的 `C:`、`D:` 或 `E:` 安装盘。
-- 不要求把 API key 写入环境变量或脚本。
-- 只使用 WSL Claude Science 时，不要求安装 Windows Claude 应用或 Windows Python。
+    WCLAUDE --> APP["官方 Windows Claude 应用"]
 
-## 3. 当前发布状态
+    DS["DeepSeek API"] --> GW["私有 loopback gateway"]
+    KM["Kimi API"] --> GW
+    GL["GLM API"] --> GW
+    CX["官方 Codex ChatGPT 登录"] --> GW
 
-3.2.3 当前提交在 GitHub 分支 `fix/science-entry-v3.2.1`，默认 `main` 仍是 3.2.0。需要本说明中 Windows/WSL 独立 profile、逐角色 Model/Reasoning 和一次性 auth 迁移时，请在正式 merge/tag 前明确获取该分支：
-
-```powershell
-git clone --branch fix/science-entry-v3.2.1 --single-branch `
-  https://github.com/Tsaer-maker/ScienceCodexFinalKit.git
-cd ScienceCodexFinalKit
+    GW --> SCI
+    GW --> CLI
+    GW --> AG
+    DS --> WCLAUDE
+    KM --> WCLAUDE
+    GL --> WCLAUDE
+    CX --> WCLAUDE
 ```
 
-若从 GitHub 下载 ZIP，应确认下载的是同一分支，而不是默认 `main`。完整解压到稳定的本地目录；不要直接在 ZIP、聊天软件临时目录、自动清理目录或即将撤除的磁盘中运行。
+切换 provider 时，WSL runtime 会停止自己拥有的 Science/gateway，写入经过验证的新 route，启动同一身份下的新 gateway，再核对 PID、endpoint、health 与 Claude Science 会话。失败时恢复之前的受管文件和 route；不会关闭其他 WSL 发行版，也不会执行全局 `wsl --shutdown`。
 
-仓库当前只有第三方许可证说明，没有项目级 `LICENSE`。这不影响维护者和获授权测试者在自己的机器上验证，但在正式公开发行、复制、修改或再分发前，维护者仍需明确选择项目许可证。第三方组件边界见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+## 快速安装
 
-## 4. 新用户五步安装
+### 要求
 
-### 第一步：以自己的普通 Windows 用户运行 Build
+- Windows 10 2004+ 或 Windows 11；
+- WSL2；
+- Ubuntu 24.04；首次 Build 可在得到系统权限后安装；
+- 普通 Windows 用户，不要求长期使用管理员账户；
+- 只有使用独立 Windows Claude gateway 时需要 **Windows Python 3.10+**；`Build.cmd` 安装的是 WSL Python，不会静默安装 Windows Python；
+- 至少一项有效上游认证：DeepSeek/Kimi/GLM API key，或官方 Codex CLI 的 ChatGPT 登录。
 
-双击：
+### 下载与启动
+
+```powershell
+git clone https://github.com/Tsaer-maker/claude-codex-switchboard.git
+Set-Location .\claude-codex-switchboard
+.\Build.cmd
+.\Switchboard.cmd
+```
+
+也可以在解压目录直接双击：
+
+1. `Build.cmd`：首次安装或完整修复；
+2. `Switchboard.cmd`：打开统一菜单。
+
+Build 安装或核验：
+
+- Ubuntu 24.04 WSL2 系统依赖；
+- 官方 Claude Science；
+- 原生 Linux Claude Code；
+- 官方 Linux Codex CLI；
+- 固定版本 Node.js 与可选 Chrome DevTools MCP；
+- 固定 commit 的 `claude-science-codex-connector`；
+- Switchboard runtime、离线契约测试与升级回滚逻辑。
+
+Build 不会要求把 API key 写进命令行、`.cmd`、README 或 Git。API key 只从隐藏输入读取。
+
+## 第一次配置
+
+### WSL Claude Science / Claude Code
+
+从菜单选择任一 provider，或使用：
+
+```powershell
+.\windows\Switchboard.ps1 -Action configure-deepseek
+.\windows\Switchboard.ps1 -Action configure-kimi
+.\windows\Switchboard.ps1 -Action configure-glm
+.\windows\Switchboard.ps1 -Action configure-codex
+```
+
+Codex 登录默认调用 WSL 内官方 Codex CLI 的 browser/device 登录。它写入：
 
 ```text
-Build.cmd
+~/.finalkit-client/.codex/auth.json
 ```
 
-或在包根目录执行：
+该文件不属于 Claude Science，也不等于 OpenAI API key。
+
+### 可选：一次性把 Windows Codex 登录复制到 WSL
+
+如果 Windows 官方 Codex CLI 已显示 `Logged in using ChatGPT`，可以执行：
 
 ```powershell
-.\windows\FinalKit.ps1 -Action build
+.\windows\08-One-Time-Migrate-Windows-Codex-Auth-to-WSL.cmd
 ```
 
-默认建立或复用 `Ubuntu-24.04`，Linux 用户名由当前 Windows 用户名安全转换。首次启用 WSL 时允许 UAC；若系统要求重启，重启后登录回同一个普通 Windows 用户，再运行一次 Build。不要从另一个 Administrator 账号安装 Ubuntu，否则发行版会注册给错误的 Windows 用户。
+或：
 
-Build 会安装或核验 Ubuntu 24.04、系统依赖、Claude Science、原生 Linux Claude Code、Linux Codex CLI、固定 Node/MCP、FinalKit runtime 和固定提交的 Codex connector。末尾应出现：
+```powershell
+.\windows\Switchboard.ps1 -Action migrate-windows-codex-auth-to-wsl
+```
+
+该操作只通过 stdin 把当前官方 Windows `auth.json` 作为一次性输入交给 WSL，并在 WSL 内由官方 Codex CLI 验证。完成后：
+
+- Windows auth 仍由 Windows Codex CLI 持有；
+- WSL 得到独立副本；
+- 原先的 WSL 状态会精确恢复为 stopped、gateway-only，或原 provider 的 Science + gateway；
+- 不建立自动同步；
+- 以后 Windows 或 WSL 任一侧仍可自主重新登录；
+- 不读取或改变 Claude Science 账号状态。
+
+## 三档模型与 Reasoning
+
+查看当前 route：
+
+```powershell
+.\windows\Switchboard.ps1 -Action models
+```
+
+交互修改：
+
+```powershell
+.\windows\Switchboard.ps1 -Action update-models
+```
+
+每个 provider 都会依次询问：
+
+1. Opus Model；
+2. Opus Reasoning；
+3. Sonnet Model；
+4. Sonnet Reasoning；
+5. Haiku Model；
+6. Haiku Reasoning。
+
+当前允许的 reasoning 值：
+
+| Provider | 可选 Reasoning |
+| --- | --- |
+| DeepSeek | `auto`、`none`、`high`、`max` |
+| Kimi | K2.6：`auto`、`none`；K2.7-code：仅 `auto`；K3：`auto`、`low`、`high`、`max` |
+| GLM | 4.7：`auto`、`none`；5.2：`auto`、`none`、`low`、`medium`、`high`、`xhigh`、`max`；5.3：`auto`、`low`、`high`、`max` |
+| Codex | `auto`、`none`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`；固定值受本地 cache 声明约束 |
+
+模型级规则分别依据 [Kimi Thinking Models](https://platform.kimi.ai/docs/guide/use-thinking-models) 与 [GLM Thinking Mode](https://docs.bigmodel.cn/cn/guide/capabilities/thinking)：K3 只发送 top-level `reasoning_effort`，K2.6 只使用 thinking 开关，K2.7-code 保持始终 thinking；GLM 5.2/5.3 与 4.7 使用各自真实能力。
+
+3.3.0 使用稳定的跨 provider 语义子集：GLM 5.2 官方 `minimal` 不另设 UI 档，关闭 thinking 统一选择 `none`。
+
+API provider 的 `auto` 只透传当前 provider + model 明确支持的角色级 effort，不支持组合明确失败。Codex 的 `auto` 在本地 cache 声明存在时按具体模型校验；声明缺失时标记为 capability unknown 并由上游最终判定，不冒充已验证。固定值会覆盖该 Claude 档位中的上游角色 effort。`models_cache.json` 不是实时 entitlement；实时接受情况只能由显式 tier test 的实际请求确认。
+
+命令行原子更新示例：
+
+```powershell
+.\windows\Switchboard.ps1 `
+  -Action update-models `
+  -RemainingArgs codex,--opus,gpt-5.6-sol,--reasoning-opus,max,--sonnet,gpt-5.6-terra,--reasoning-sonnet,max,--haiku,gpt-5.6-luna,--reasoning-haiku,max,--restart
+```
+
+## 启动入口
+
+### WSL Claude Science
+
+```powershell
+.\windows\10-Start-DeepSeek.cmd
+.\windows\11-Start-ChatGPT-Codex.cmd
+.\windows\12-Start-Kimi.cmd
+.\windows\13-Start-GLM.cmd
+```
+
+或：
+
+```powershell
+.\windows\Switchboard.ps1 -Action deepseek
+.\windows\Switchboard.ps1 -Action codex
+```
+
+浏览器打开的 Science 使用 Switchboard 隔离 data-dir。它显示 Claude 兼容模型别名，但实际 model/reasoning route 可由 `models`、`status` 和 `EFFECTIVE_ROUTE` 查看。
+
+### 原生 WSL Claude Code
+
+```powershell
+.\windows\Switchboard.ps1 -Action claude -RemainingArgs deepseek
+.\windows\Switchboard.ps1 -Action claude -RemainingArgs codex
+```
+
+Claude Code 复用选定 provider gateway，不复制 Science 身份。
+
+### 独立 Windows Claude
+
+Switchboard 配置的是用户已经安装的官方 Windows Claude 应用及其独立 profile；应用本体的提供、可用地区、版本和账号方案仍由 Anthropic 决定，本项目不分发或破解该应用。
+
+先建立四条 Windows-only profile：
+
+```powershell
+.\windows\40-Initialize-Windows-Claude.cmd
+```
+
+再分别配置：
+
+```powershell
+.\windows\41-Configure-Windows-Claude-DeepSeek.cmd
+.\windows\42-Configure-Windows-Claude-Kimi.cmd
+.\windows\43-Configure-Windows-Claude-GLM.cmd
+.\windows\44-Configure-Windows-Claude-Codex-Login.cmd
+```
+
+Windows profile 显示名保持简短：
+
+- `DeepSeek API`
+- `Kimi API`
+- `GLM API`
+- `Codex Login`
+
+API key 由当前 Windows 用户的 DPAPI 加密。Codex profile 只绑定官方 Windows Codex CLI ChatGPT 登录，不询问 OpenAI API key。Windows controller 的代码路径不含 `wsl.exe` 调用，端口和运行状态也与 WSL 分开。
+
+## 可选多 Agent 模块
+
+3.3.0 新增 WSL-only 多 Agent 模块。它把 Codex 保持为用户意图、路由与最终核验者，再通过 provider-routed Claude Code PTY workers 承担适合分离的检索、实现、调试或审阅工作。
+
+安装和检查：
+
+```powershell
+.\windows\60-Multi-Agent.cmd
+.\windows\61-Multi-Agent-Status.cmd
+```
+
+命令形式：
+
+```powershell
+.\windows\Switchboard.ps1 -Action agents-install
+.\windows\Switchboard.ps1 -Action agents-status
+.\windows\Switchboard.ps1 -Action agents -Project D:\work\repo -RemainingArgs deepseek
+.\windows\Switchboard.ps1 -Action agents -Project D:\work\repo -RemainingArgs codex
+.\windows\Switchboard.ps1 -Action agents-on
+.\windows\Switchboard.ps1 -Action agents-off
+.\windows\Switchboard.ps1 -Action agents-stop
+```
+
+当前集成固定为 [coredo-eu/codex-claude-orchestrator](https://github.com/coredo-eu/codex-claude-orchestrator) `0.3.1`、commit `c996b497c6682f4695b5aa342610527731712c51`。Switchboard 不 fork 或删除其角色与生命周期实现，而是在外层增加：
+
+- 精确 commit、origin、clean-tree 与许可证检查；
+- 隔离的 WSL Codex HOME；
+- DeepSeek、Kimi、GLM、Codex 四条 Claude worker route；
+- provider/auth 环境白名单；
+- 安装前依赖与 Claude CLI flag 检查；
+- read-only status；
+- enable、disable、只停止已验证 owned workers 的 kill switch；
+- Windows 菜单和指定项目目录启动。
+
+上游保留的主要能力包括 persistent PTY parent、Haiku/Sonnet/Opus/Fable 角色路由、租约与 edit custody、私有 runtime snapshot、compaction checkpoint、并发上限、失败后显式 custody transfer、Codex native fallback roles 与最终独立核验。
+
+Reasoning 有一个可见的控制边界：同一 Claude 档位内，上游不同 role 可以请求不同 effort。该档配置为 `auto` 时，API provider 按具体模型校验；Codex 在 cache 能力已知时同样前置校验，未知时明确显示 unknown。若用户显式选择固定值，该值会有意覆盖该档所有上游 role effort。
+
+安装该模块不会：
+
+- 修改 Windows Claude；
+- 修改 Claude Science 身份；
+- 复制 provider key 到插件目录；
+- 把 Windows auth 变成自动同步；
+- 批量安装检索到的其他 orchestrator。
+
+这里提供的是 **environment/auth 隔离，不是 filesystem sandbox**。Worker 继承 Codex/Claude 的 tool approval，并以同一个 WSL 用户运行；它可以访问用户选定的项目，也可以访问该 WSL 用户本来就能看到的 `/mnt/<drive>` 等挂载。不要把无关 secret 放在工作区；需要限制文件或命令访问时，应使用 Codex/Claude 自身的 approval/sandbox。文档中的“未注入 Windows auth”只表示 controller 不复制 Windows credential，不表示 Windows 文件在技术上不可达。
+
+启动入口先强制要求 `MULTI_AGENT_READY=true`；checkout、plugin、enable 状态、依赖或 WSL Codex 登录任一缺失时都会阻断，不会把普通 Codex 会话冒充成多 Agent。若 Claude Science 正在运行，worker provider 必须与其健康 active gateway 一致；不同 provider 需要用户先显式切换或停止 Science，Agent 入口本身不会偷偷改 Science route。
+
+安装完成后必须新建一个 **Codex task**，让新 skill 被发现；随后在任务中显式调用：
 
 ```text
-BUILD_OK distro=Ubuntu-24.04 linux_user=<user>
-SMOKE_OK
+Use $codex-claude-orchestrator:claude-pty-agents for this bounded outcome.
+Keep Codex as the authority owner and independently verify Claude's handoff.
 ```
 
-### 第二步：配置至少一种 WSL provider
+安装 plugin 只开放 transport，普通提示词不保证自动委派。Switchboard 不会自动改项目 `AGENTS.md`，也不会偷偷写入 executor-selection policy；若用户以后希望项目长期优先委派，应人工审阅上游 policy snippet 后与项目规则合并。
 
-打开 `SwitchModel.cmd`，选择菜单 `3–6`，或运行：
+其他相近项目的机制、许可证、采纳项和未采纳原因见[检索与采纳报告](docs/PROJECT_RESEARCH_REPORT.zh-CN.md)。
+
+## 更新与诊断
 
 ```powershell
-.\windows\FinalKit.ps1 -Action configure-deepseek
-.\windows\FinalKit.ps1 -Action configure-kimi
-.\windows\FinalKit.ps1 -Action configure-glm
-.\windows\FinalKit.ps1 -Action configure-codex
+# 只更新包内 runtime，保留 WSL、认证和 model routes
+.\windows\05-Update-Switchboard-Runtime.cmd
+
+# 重新配置模型和 reasoning
+.\windows\06-Update-Provider-Models.cmd
+
+# 明确联网更新官方工具
+.\windows\07-Update-Official-Tools.cmd
+
+# 状态和 doctor
+.\windows\20-Status.cmd
+.\windows\21-Doctor.cmd
 ```
 
-三家 API key 通过隐藏提示输入并保存在目标 Linux 用户的 WSL ext4 home，权限 `0600`。Codex 默认运行官方 Linux Codex 浏览器登录；若当前账号/工作区允许 device login，`configure-codex-device` 可作为显式备用。
+Runtime 更新只对 package-managed code、connector owner、wrapper 和版本 metadata 做精确失败回滚；auth、model routes 及其最新派生 config 明确不属于 installer rollback，因而不会用旧快照覆盖官方 Codex CLI 或另一个终端刚提交的状态。它不会因品牌改名迁移 credential 目录。官方工具更新与 runtime 更新分开，避免一次更新同时改变代码、认证与模型路由。
 
-### 第三步：检查 Model/Reasoning
+## 认证与安全边界
 
-四个 provider 都分别配置三组短字段：
+| 对象 | 持有位置 | 是否跨 Windows/WSL 自动同步 |
+| --- | --- | --- |
+| WSL DeepSeek/Kimi/GLM key | 当前 WSL 用户私有文件，权限 600 | 否 |
+| Windows DeepSeek/Kimi/GLM key | 当前 Windows 用户 DPAPI blob | 否 |
+| WSL Codex 登录 | `~/.finalkit-client/.codex/auth.json` | 否；可一次性导入 |
+| Windows Codex 登录 | 官方 Windows Codex CLI `%CODEX_HOME%\auth.json` | 否 |
+| WSL Claude Science 身份 | `~/.science-finalkit` 本地隔离身份 | 不属于 provider auth |
+| Windows Claude profile | `%LOCALAPPDATA%\ScienceCodexFinalKit\WindowsClaude` | 不读取 WSL |
+| 多 Agent 状态 | 隔离 WSL Codex HOME 与 pinned integration | 不注入 Windows auth；不是文件系统沙箱 |
 
-```text
-Opus   Model / Reasoning
-Sonnet Model / Reasoning
-Haiku  Model / Reasoning
-```
+网络边界：
 
-Codex 从该操作系统自己的 `models_cache.json` 列出模型和逐模型 Reasoning 能力。包内 Sol/Terra/Luna 只是建议初值；其他用户必须以自己账号的本地模型缓存和配置界面为准。DeepSeek/Kimi/GLM 会在拥有 key 后读取固定官方 endpoint 的账号模型目录；目录可见不等于每种强度都可用，最终仍由真实测试证明。
+- gateway 只绑定 `127.0.0.1`；
+- 私有 path/control token 由安装时随机生成；
+- PID、可执行文件、命令行、root、endpoint 与 health 共同验证 owner；
+- 未识别的 Science credential、connector 修改或端口 owner 会阻断接管；
+- 不改 `.wslconfig`、Docker、系统代理或其他发行版；
+- 不绕过账号登录、验证码、订阅、配额、地区、组织或付费限制。
 
-### 第四步：发送一个最小真实请求
+## 为什么保留旧内部目录名
 
-```powershell
-.\windows\FinalKit.ps1 -Action test-deepseek
-.\windows\FinalKit.ps1 -Action test-kimi
-.\windows\FinalKit.ps1 -Action test-glm
-.\windows\FinalKit.ps1 -Action test-codex
-```
+产品显示名和入口已改为 Claude Codex Switchboard，但以下内部名字暂时保留：
 
-只运行已经配置的那一种。预期为：
+- `%LOCALAPPDATA%\ScienceCodexFinalKit`
+- `~/.local/share/science-codex-finalkit`
+- `~/.science-finalkit`
+- `~/.finalkit-client`
+- `FINALKIT_*`
+- `fkctl`
 
-```text
-BACKEND_OK mode=<provider>
-```
+它们已经参与 credential 路径、DPAPI entropy、connector control header、进程 owner 与升级识别。仅为改名迁移它们会增加认证丢失和旧安装失效风险。文档把它们定义为 **legacy-compatible internal namespace**；它们不是第二套产品，也不会继续扩散到新的用户可见名称。
 
-真实测试可能产生少量费用或额度消耗；Build/doctor/smoke 的离线契约不会访问模型上游。
+## 文档与验证
 
-### 第五步：启动 Claude Science
+- [operation.md](operation.md)：安装、模型、auth、Windows/WSL、多 Agent、更新、诊断与恢复；
+- [docs/CODE_WALKTHROUGH.zh-CN.md](docs/CODE_WALKTHROUGH.zh-CN.md)：代码 owner、调用链、安全边界和契约；
+- [docs/PROJECT_RESEARCH_REPORT.zh-CN.md](docs/PROJECT_RESEARCH_REPORT.zh-CN.md)：相近项目检索快照、许可证、借鉴机制、实际采纳与拒绝原因；
+- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)：运行时第三方组件与许可证通知。
 
-双击 `SwitchModel.cmd`，选择菜单 `7–10`，或运行：
-
-```powershell
-.\windows\FinalKit.ps1 -Action deepseek
-.\windows\FinalKit.ps1 -Action kimi
-.\windows\FinalKit.ps1 -Action glm
-.\windows\FinalKit.ps1 -Action codex
-```
-
-浏览器打开的 `127.0.0.1` 页面可能要求接受一次本地 nonce/cookie 会话。这不是 Claude.ai 登录。启动后验证：
-
-```powershell
-.\windows\FinalKit.ps1 -Action status
-.\windows\FinalKit.ps1 -Action doctor
-```
-
-健康状态应包含：
-
-```text
-Gateway: healthy
-Claude Science: running
-Runtime identity: matched
-Science identity: FinalKit local-only; no Claude account used
-```
-
-## 5. Provider 与凭据边界
-
-| Provider | WSL 认证 | Windows Claude 认证 | Model/Reasoning 来源 |
-|---|---|---|---|
-| DeepSeek | Linux 用户私有 API key | Windows DPAPI `CurrentUser` | 官方账号模型目录 + provider 级 Reasoning |
-| Kimi | Linux 用户私有 API key | Windows DPAPI `CurrentUser` | 官方账号模型目录 + provider 级 Reasoning |
-| GLM | Linux 用户私有 API key | Windows DPAPI `CurrentUser` | 官方账号模型目录 + provider 级 Reasoning |
-| ChatGPT/Codex | WSL 官方 Codex CLI 登录 | Windows 官方 Codex CLI 登录 | 每个 OS 自己的 Codex 模型缓存 |
-
-Windows 和 WSL 默认拥有两个独立 Codex auth owner。只有用户主动运行下面入口时，才把当时的 Windows 官方 auth 一次性原子导入 WSL：
-
-```powershell
-.\windows\FinalKit.ps1 -Action migrate-windows-codex-auth-to-wsl
-```
-
-等价快捷入口：
-
-```text
-windows\08-One-Time-Migrate-Windows-Codex-Auth-to-WSL.cmd
-```
-
-迁移后不建立同步。Windows 和 WSL 会各自刷新；任一侧失效时，只在那一侧重新登录。不要用 `Get-Content`、剪贴板、命令行参数或聊天手工搬运 `auth.json`。
-
-Reasoning wire 语义：
-
-- DeepSeek：`auto/none/high/max`；非自动档使用 thinking 与 `output_config.effort`。[官方 Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode)
-- Kimi：`auto/none/low/high/max`；always-thinking 模型可能拒绝 `none`。[Kimi API 文档](https://platform.kimi.ai/docs/api/overview)
-- GLM：`auto/none/high/max`；最终能力受具体模型和账号限制。[智谱思考模式](https://docs.bigmodel.cn/cn/guide/capabilities/thinking)
-- Codex：只接受本机缓存为所选模型声明的强度；`ultra` 只有模型明确支持时才出现。
-
-## 6. 独立 Windows Claude（可选）
-
-Windows Claude 控制器从不读取、调用或切换 WSL。首次运行：
-
-```powershell
-.\windows\FinalKit.ps1 -Action windows-claude-init
-.\windows\FinalKit.ps1 -Action windows-claude-status
-```
-
-初始化只登记四个 profile，保持官方 `1p`，不索取 key、不登录、不启动 gateway。随后配置一个 profile：
-
-```powershell
-.\windows\FinalKit.ps1 -Action windows-claude-configure -RemainingArgs deepseek
-.\windows\FinalKit.ps1 -Action windows-claude-configure -RemainingArgs kimi
-.\windows\FinalKit.ps1 -Action windows-claude-configure -RemainingArgs glm
-.\windows\FinalKit.ps1 -Action windows-claude-configure -RemainingArgs codex
-```
-
-Codex profile 使用 Windows 官方 Codex CLI 的 ChatGPT 登录，不要求另一份 OpenAI API key。OpenAI 当前说明 Codex 可通过现有 ChatGPT 账号登录，具体可用性和用量取决于计划与工作区。[Using Codex with your ChatGPT plan](https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan)
-
-启动、状态、停止和恢复官方模式：
-
-```powershell
-.\windows\FinalKit.ps1 -Action windows-claude -RemainingArgs codex
-.\windows\FinalKit.ps1 -Action windows-claude-status
-.\windows\FinalKit.ps1 -Action windows-claude-stop
-.\windows\FinalKit.ps1 -Action windows-claude-official
-```
-
-未配置 profile 会在启动 Python 或改 Claude 配置前失败。`windows-claude-official` 只恢复 Windows Claude 的官方 `1p`，不查看 WSL。
-
-## 7. 日常使用与独立更新
-
-```powershell
-# 状态、诊断、停止 WSL Science/gateway
-.\windows\FinalKit.ps1 -Action status
-.\windows\FinalKit.ps1 -Action doctor
-.\windows\FinalKit.ps1 -Action stop
-
-# 只更新 FinalKit runtime；保留 WSL、认证和模型选择
-.\windows\FinalKit.ps1 -Action update-runtime
-
-# 交互更新三档 Model/Reasoning
-.\windows\FinalKit.ps1 -Action update-models
-
-# 明确联网更新官方客户端与固定工具
-.\windows\FinalKit.ps1 -Action update-tools
-```
-
-模型换代不需要重新 Build。只有首次安装或 `doctor` 证明组件缺失时才运行完整 Build。网络中断时直接重跑 Build，不要 Clear。
-
-## 8. 多用户与自定义路径
-
-隔离单位是“Windows 用户 + WSL 发行版 + Linux 用户”：
-
-| 层 | 独立内容 |
-|---|---|
-| Windows 用户 | WSL 注册、Windows Claude profile/DPAPI、Windows Codex、Chrome profile、备份 |
-| WSL 发行版 | Ubuntu 系统包与 Linux 文件系统 |
-| Linux 用户 | API key、Codex 登录、Science 数据、模型路由、日志和进程 owner |
-
-同一发行版增加另一个 Linux 用户：
-
-```powershell
-.\windows\FinalKit.ps1 -Action build -LinuxUser alice
-.\windows\FinalKit.ps1 -Action configure-codex -LinuxUser alice
-.\windows\FinalKit.ps1 -Action codex -LinuxUser alice
-```
-
-自定义发行版名时必须同时给出明确位置：
-
-```powershell
-.\windows\FinalKit.ps1 -Action build `
-  -Distro Research-Ubuntu-24.04 `
-  -DistroLocation D:\WSL\Research-Ubuntu-24.04 `
-  -LinuxUser alice
-```
-
-不要复制另一个 Windows 用户的 WSL 注册目录、DPAPI blob、Chrome profile 或 Codex auth。
-
-## 9. 安全与故障边界
-
-- WSL API key 和 auth 文件只在目标 Linux home，权限 `0600`。
-- Windows 三家 API key 只保存为 DPAPI `CurrentUser` blob；不会进入 Claude JSON、argv、环境变量或 WSL。
-- Windows/WSL gateway 都只绑定 loopback，并验证私密 path、token、instance、PID 和 owner。
-- provider URL 是源码固定 HTTPS 白名单，不跟随 redirect。
-- 停止进程前验证 PID、start ticks、命令行和脚本 owner；未知监听者不会被接管或强杀。
-- Claude Science 只在 `~/.science-finalkit` 使用 FinalKit 本地身份；未知或真实 Science 凭据不会被自动覆盖。
-- `Clear` 不执行全局 `wsl --shutdown`，只处理精确识别的当前 Windows 用户 Ubuntu；默认先导出 tar。
-- `wsl --unregister` 会永久删除发行版数据。新用户、普通 Build 失败、模型未配置或单个 gateway 故障都不应先 Clear。
-- Windows Claude 与 WSL Science 的配置、进程、端口和 auth owner 独立；Windows controller 不会静默退回 WSL。
-
-常见故障和精确恢复见 [operation.md 的故障处理](operation.md#10-故障处理)。
-
-## 10. 验证范围
-
-Build 执行七组 WSL 离线契约，覆盖 connector、direct gateway、Science control/identity、模型路由、Windows 入口和 runtime 更新回滚。Windows Claude 另有两组隔离契约，覆盖四 profile、DPAPI、Codex auth owner、工具/SSE、PID/health 和 schema 迁移。
-
-```powershell
-.\windows\FinalKit.ps1 -Action doctor
-.\windows\FinalKit.ps1 -Action smoke
-```
-
-它们证明本地链路和安全 owner，不证明某个用户的账号、套餐、地区、余额或全部模型都可用。只有对应 `test-*` 返回 `BACKEND_OK` 才证明当前账号当前路由的最小真实请求成功。
-
-参考环境已经验证：
-
-- 包路径可以位于不同本地盘符；
-- Linux 用户名和 home 自动解析；
-- WSL Claude Science 使用 ChatGPT/Codex 真实请求返回 `BACKEND_OK`；
-- Windows Claude Codex profile 使用独立 `127.0.0.1:18987`，Sonnet 不再与 Opus 共用 Model；
-- 仓库不包含真实 API key、auth JSON、模型缓存、运行态 profile 或日志。
-
-## 11. 主要入口
-
-| 文件 | 用途 |
-|---|---|
-| `Build.cmd` / `Install.cmd` | 首次安装或完整修复 |
-| `SwitchModel.cmd` | 普通用户菜单 |
-| `Clear.cmd` | 可选、破坏性 Ubuntu 清理；默认备份 |
-| `operation.md` | 完整操作手册 |
-| `windows/FinalKit.ps1` | Windows/WSL 总控制 owner |
-| `windows/WindowsClaude.ps1` | 独立 Windows Claude owner |
-| `windows/08-One-Time-Migrate-Windows-Codex-Auth-to-WSL.cmd` | 可选一次性 auth 初始化 |
-| `windows/40–51` | Windows Claude 初始化、配置、启停、恢复快捷入口 |
-| `wsl/install-final-stack.sh` | WSL 安装 owner |
-| `wsl/runtime/switch_manager.py` | 路由、身份、切换、回滚、测试 |
-| `wsl/runtime/direct_gateway.py` | DeepSeek/Kimi/GLM 固定入口 gateway |
-| `docs/CODE_WALKTHROUGH.zh-CN.md` | 维护者代码剖析 |
-| `THIRD_PARTY_NOTICES.md` | 第三方版本与许可证 |
-
-## 12. 官方与上游依据
-
-- [Microsoft：安装 WSL](https://learn.microsoft.com/windows/wsl/install)
-- [Anthropic：安装 Claude Desktop](https://support.claude.com/en/articles/10065433-install-claude-desktop)
-- [Anthropic：设置 Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started)
-- [OpenAI：使用 ChatGPT 计划登录 Codex](https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan)
-- [DeepSeek Anthropic API](https://api-docs.deepseek.com/guides/anthropic_api)
-- [Kimi API overview](https://platform.kimi.ai/docs/api/overview)
-- [智谱 Claude 接入](https://docs.bigmodel.cn/cn/guide/develop/claude/introduction)
-- [`claude-science-codex-connector`](https://github.com/haoyuan-sjtu/claude-science-codex-connector)，固定提交 `30b26d7c6f097b186bbd228e93a427a731399960`
-- [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp)
-
-第三方组件、固定版本、许可证与 HGSX 排除边界见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+Switchboard 原创代码与文档采用 [MIT License](LICENSE)；第三方组件继续服从各自许可证。面向其他用户的安装不依赖作者本机路径、用户名或现有 auth，所有 credential 都在安装用户自己的 Windows/WSL owner 中建立。

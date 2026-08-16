@@ -22,12 +22,10 @@ import signal
 import ssl
 import sys
 import threading
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -43,12 +41,10 @@ ROLES = ("opus", "sonnet", "haiku")
 PROFILE_REASONING = {
     "deepseek": {"auto", "none", "high", "max"},
     "kimi": {"auto", "none", "low", "high", "max"},
-    "glm": {"auto", "none", "high", "max"},
-    "codex": {"none", "low", "medium", "high", "xhigh", "max", "ultra"},
+    "glm": {"auto", "none", "low", "medium", "high", "xhigh", "max"},
+    "codex": {"auto", "none", "low", "medium", "high", "xhigh", "max", "ultra"},
 }
-CODEX_AUTH_BASE_URL = "https://auth.openai.com"
 CODEX_BACKEND_URL = "https://chatgpt.com/backend-api/codex"
-CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLAUDE_ALIASES = (
     "claude-opus-4-8",
     "claude-sonnet-4-5",
@@ -56,6 +52,72 @@ CLAUDE_ALIASES = (
 )
 SAFE_SECRET = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 SAFE_TOOL_NAME = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def is_kimi_k3_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"kimi-k3(?:\[[a-z0-9._+-]+\])?", value))
+
+
+def is_kimi_toggle_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"kimi-k2\.(?:5|6)(?:\[[a-z0-9._+-]+\])?", value))
+
+
+def is_kimi_always_thinking_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"kimi-k2\.7-code(?:-highspeed)?(?:\[[a-z0-9._+-]+\])?", value))
+
+
+def is_glm_52_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"glm-5\.2(?:[-._][a-z0-9]+)*", value))
+
+
+def is_glm_53_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"glm-5\.3(?:[-._][a-z0-9]+)*", value))
+
+
+def is_glm_thinking_toggle_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"glm-4\.(?:[5-9])(?:[-._][a-z0-9]+)*", value))
+
+
+def profile_reasoning_values(profile: str, model: Any) -> set[str]:
+    if profile in {"deepseek", "codex"}:
+        return set(PROFILE_REASONING[profile])
+    if profile == "kimi":
+        if is_kimi_k3_model(model):
+            return {"auto", "low", "high", "max"}
+        if is_kimi_toggle_model(model):
+            return {"auto", "none"}
+        if is_kimi_always_thinking_model(model):
+            return {"auto"}
+        return {"auto"}
+    if profile == "glm":
+        if is_glm_53_model(model):
+            return {"auto", "low", "high", "max"}
+        if is_glm_52_model(model):
+            return {"auto", "none", "low", "medium", "high", "xhigh", "max"}
+        if is_glm_thinking_toggle_model(model):
+            return {"auto", "none"}
+        return {"auto"}
+    return {"auto"}
+
+
+def without_effort_fields(body: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(body)
+    normalized.pop("reasoning_effort", None)
+    output_config = normalized.get("output_config")
+    if isinstance(output_config, dict) and "effort" in output_config:
+        output_config = dict(output_config)
+        output_config.pop("effort", None)
+        if output_config:
+            normalized["output_config"] = output_config
+        else:
+            normalized.pop("output_config", None)
+    return normalized
 
 
 class GatewayError(RuntimeError):
@@ -102,7 +164,7 @@ def _validate_url(raw: Any, protocol: str) -> str:
     if any(marker in lowered for marker in ("/mnt/", "/home/", "\\\\wsl", "wsl.exe")):
         raise GatewayError("Windows Claude upstream cannot reference WSL")
     if parsed.hostname in {"127.0.0.1", "localhost", "::1"} and parsed.port in {9876, 18987}:
-        raise GatewayError("Windows Claude cannot use a reserved FinalKit gateway port")
+        raise GatewayError("Windows Claude cannot use a reserved Switchboard gateway port")
     if protocol == "openai-responses" and parsed.path.rstrip("/").endswith("/messages"):
         raise GatewayError("OpenAI Responses upstream cannot end in /messages")
     return value
@@ -211,10 +273,27 @@ def load_config(path: Path) -> dict[str, Any]:
     for role in ROLES:
         config[f"model_{role}"] = _require_text(config.get(f"model_{role}"), f"{role} model")
         reasoning = _validate_effort(config.get(f"reasoning_{role}"), f"{role} reasoning").lower()
-        if reasoning not in PROFILE_REASONING[profile]:
-            choices = ", ".join(sorted(PROFILE_REASONING[profile]))
+        allowed = profile_reasoning_values(profile, config[f"model_{role}"])
+        if reasoning not in allowed:
+            choices = ", ".join(sorted(allowed))
             raise GatewayError(f"{role} reasoning must be one of: {choices}")
         config[f"reasoning_{role}"] = reasoning
+        if profile == "codex":
+            raw_supported = config.get(f"supported_reasoning_{role}", [])
+            if not isinstance(raw_supported, list) or len(raw_supported) > 16:
+                raise GatewayError(f"{role} supported reasoning must be a bounded list")
+            supported: list[str] = []
+            for raw_effort in raw_supported:
+                effort = _validate_effort(raw_effort, f"{role} supported reasoning").lower()
+                if effort == "auto" or effort not in (PROFILE_REASONING["codex"] - {"auto"}):
+                    raise GatewayError(f"{role} supported reasoning contains an unknown effort")
+                if effort not in supported:
+                    supported.append(effort)
+            if supported and reasoning != "auto" and reasoning not in supported:
+                raise GatewayError(
+                    f"{role} model {config[f'model_{role}']} does not support reasoning={reasoning}"
+                )
+            config[f"supported_reasoning_{role}"] = supported
 
     for field in ("instance_id", "profile_id"):
         try:
@@ -274,14 +353,9 @@ def _account_id_from_id_token(id_token: str) -> str:
 class CodexAuthStore:
     """Adapter over the official Windows Codex CLI ChatGPT auth.json."""
 
-    def __init__(self, path: Path, opener=None):
+    def __init__(self, path: Path):
         self.path = path
         self._lock = threading.RLock()
-        self._opener = opener or urllib.request.build_opener(
-            urllib.request.ProxyHandler(),
-            NoRedirect(),
-            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
-        )
 
     def _read_root(self) -> dict[str, Any]:
         try:
@@ -319,121 +393,18 @@ class CodexAuthStore:
         if not data["access_token"] or not data["refresh_token"]:
             raise CodexAuthError("Windows Codex ChatGPT login is incomplete; run: codex login")
 
-    @staticmethod
-    def _is_expiring(access_token: str) -> bool:
-        exp = _decode_jwt_claims(access_token).get("exp")
-        return isinstance(exp, (int, float)) and float(exp) <= time.time() + 300
-
-    def _adopt_newer_cache(self, previous: dict[str, str]) -> dict[str, str] | None:
-        current = self.load()
-        if (
-            current["access_token"] != previous["access_token"]
-            or current["refresh_token"] != previous["refresh_token"]
-        ):
-            return current
-        return None
-
-    def _write_refreshed(self, previous: dict[str, str], refreshed: dict[str, Any]) -> dict[str, str]:
-        root = self._read_root()
-        current = self._normalize(root)
-        if (
-            current["access_token"] != previous["access_token"]
-            or current["refresh_token"] != previous["refresh_token"]
-        ):
-            return current
-
-        tokens = root.get("tokens")
-        assert isinstance(tokens, dict)
-        merged = dict(tokens)
-        for name in ("access_token", "refresh_token", "id_token"):
-            if refreshed.get(name):
-                merged[name] = str(refreshed[name])
-        account_id = refreshed.get("account_id") or refreshed.get("chatgpt_account_id")
-        if account_id:
-            merged["account_id"] = str(account_id)
-        root["auth_mode"] = "chatgpt"
-        root["OPENAI_API_KEY"] = None
-        root["tokens"] = merged
-        root["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-        temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            with temporary.open("x", encoding="utf-8", newline="\n") as handle:
-                json.dump(root, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            newest = self.load()
-            if (
-                newest["access_token"] != previous["access_token"]
-                or newest["refresh_token"] != previous["refresh_token"]
-            ):
-                return newest
-            os.replace(temporary, self.path)
-        except OSError as exc:
-            raise CodexAuthError("Windows Codex auth refresh could not be saved; run: codex login") from exc
-        finally:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-        return self._normalize(root)
-
-    def _refresh(self, previous: dict[str, str]) -> dict[str, str]:
-        if not previous["refresh_token"]:
-            raise CodexAuthError("Windows Codex refresh token is missing; run: codex login")
-        form = urllib.parse.urlencode(
-            {
-                "grant_type": "refresh_token",
-                "refresh_token": previous["refresh_token"],
-                "client_id": CODEX_CLIENT_ID,
-            }
-        ).encode("utf-8")
-        request = urllib.request.Request(
-            f"{CODEX_AUTH_BASE_URL}/oauth/token",
-            data=form,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            method="POST",
-        )
-        response = None
-        try:
-            try:
-                response = self._opener.open(request, timeout=20)
-            except urllib.error.HTTPError as exc:
-                response = exc
-            status = int(getattr(response, "status", response.code))
-            if status != 200:
-                adopted = self._adopt_newer_cache(previous)
-                if adopted is not None:
-                    return adopted
-                raise CodexAuthError("Windows Codex ChatGPT auth refresh failed; run: codex login")
-            raw = response.read(MAX_ERROR_BYTES + 1)
-            if len(raw) > MAX_ERROR_BYTES:
-                raise CodexAuthError("Windows Codex auth refresh response was too large")
-            refreshed = json.loads(raw)
-            if not isinstance(refreshed, dict) or not refreshed.get("access_token"):
-                raise CodexAuthError("Windows Codex auth refresh returned no access token")
-            return self._write_refreshed(previous, refreshed)
-        except CodexAuthError:
-            raise
-        except (OSError, TimeoutError, UnicodeError, json.JSONDecodeError) as exc:
-            adopted = self._adopt_newer_cache(previous)
-            if adopted is not None:
-                return adopted
-            raise CodexAuthError("Windows Codex ChatGPT auth refresh failed; run: codex login") from exc
-        finally:
-            if response is not None:
-                response.close()
-
     def headers(self, rejected_access_token: str = "") -> dict[str, str]:
+        """Read the official cache without ever refreshing or rewriting it."""
+
         with self._lock:
             data = self.load()
-            if rejected_access_token and data["access_token"] != rejected_access_token:
-                pass
-            elif rejected_access_token or not data["access_token"] or self._is_expiring(data["access_token"]):
-                data = self._refresh(data)
             if not data["access_token"]:
                 raise CodexAuthError("Windows Codex access token is missing; run: codex login")
+            if rejected_access_token and data["access_token"] == rejected_access_token:
+                raise CodexAuthError(
+                    "The official Windows Codex token was rejected or expired. "
+                    "Run the official Codex CLI so it refreshes its login, or run: codex login"
+                )
             headers = {
                 "Authorization": f"Bearer {data['access_token']}",
                 "Content-Type": "application/json",
@@ -473,31 +444,66 @@ def _join_responses_url(base: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, target, "", ""))
 
 
-def _route_for(config: dict[str, Any], requested: Any) -> tuple[str, str]:
+def _role_for(requested: Any) -> str:
     alias = str(requested or "").lower()
-    role = "haiku" if "haiku" in alias else "opus" if "opus" in alias else "sonnet"
+    return "haiku" if "haiku" in alias else "opus" if "opus" in alias else "sonnet"
+
+
+def _route_for(config: dict[str, Any], requested: Any) -> tuple[str, str]:
+    role = _role_for(requested)
     return config[f"model_{role}"], config[f"reasoning_{role}"]
 
 
 def apply_provider_reasoning(
-    body: dict[str, Any], profile: str, reasoning: str
+    body: dict[str, Any], profile: str, model: str, reasoning: str
 ) -> dict[str, Any]:
     """Map a compact profile Reasoning value to the provider's real wire fields."""
 
-    if profile == "codex" or reasoning == "auto":
+    if profile == "codex":
         return body
-    normalized = dict(body)
+    if reasoning == "auto":
+        thinking = body.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+            reasoning = "none"
+        else:
+            output_config = body.get("output_config")
+            candidate = (
+                output_config.get("effort")
+                if isinstance(output_config, dict)
+                else None
+            )
+            if candidate is None:
+                candidate = body.get("reasoning_effort")
+            if candidate is None or str(candidate).strip() == "":
+                if profile == "kimi" and (
+                    is_kimi_k3_model(model) or is_kimi_always_thinking_model(model)
+                ):
+                    normalized = without_effort_fields(body)
+                    normalized.pop("thinking", None)
+                    return normalized
+                if profile == "glm" and is_glm_53_model(model):
+                    normalized = without_effort_fields(body)
+                    normalized["thinking"] = {"type": "enabled"}
+                    return normalized
+                return body
+            reasoning = str(candidate).strip().lower()
+
+    allowed = profile_reasoning_values(profile, model)
+    if reasoning not in allowed:
+        raise GatewayError(
+            f"{profile} model {model} does not support reasoning={reasoning}; "
+            f"choose: {', '.join(sorted(allowed))}"
+        )
+    normalized = without_effort_fields(body)
+    if profile == "kimi" and is_kimi_k3_model(model):
+        normalized.pop("thinking", None)
+        normalized["reasoning_effort"] = reasoning
+        return normalized
+    if profile == "kimi" and is_kimi_always_thinking_model(model):
+        normalized.pop("thinking", None)
+        return normalized
     if reasoning == "none":
         normalized["thinking"] = {"type": "disabled"}
-        normalized.pop("reasoning_effort", None)
-        output_config = normalized.get("output_config")
-        if isinstance(output_config, dict) and "effort" in output_config:
-            output_config = dict(output_config)
-            output_config.pop("effort", None)
-            if output_config:
-                normalized["output_config"] = output_config
-            else:
-                normalized.pop("output_config", None)
         return normalized
 
     normalized["thinking"] = {"type": "enabled"}
@@ -506,18 +512,54 @@ def apply_provider_reasoning(
         output_config = dict(output_config) if isinstance(output_config, dict) else {}
         output_config["effort"] = reasoning
         normalized["output_config"] = output_config
-        normalized.pop("reasoning_effort", None)
-    else:
+    elif profile == "glm" and (is_glm_52_model(model) or is_glm_53_model(model)):
         normalized["reasoning_effort"] = reasoning
-        output_config = normalized.get("output_config")
-        if isinstance(output_config, dict) and "effort" in output_config:
-            output_config = dict(output_config)
-            output_config.pop("effort", None)
-            if output_config:
-                normalized["output_config"] = output_config
-            else:
-                normalized.pop("output_config", None)
     return normalized
+
+
+def resolve_codex_reasoning(
+    body: dict[str, Any],
+    configured: str,
+    model: str = "",
+    supported_reasoning: Iterable[str] | None = None,
+) -> str:
+    """Apply an explicit route override or preserve a supported incoming effort."""
+
+    configured = str(configured or "").strip().lower()
+    if configured != "auto":
+        return configured
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+        candidates = ("none",)
+    else:
+        output_config = body.get("output_config")
+        candidates = (
+            output_config.get("effort") if isinstance(output_config, dict) else None,
+            body.get("reasoning_effort"),
+        )
+    globally_supported = PROFILE_REASONING["codex"] - {"auto"}
+    model_supported = {
+        str(value or "").strip().lower()
+        for value in (supported_reasoning or [])
+        if str(value or "").strip()
+    }
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        effort = str(candidate or "").strip().lower()
+        if not effort:
+            continue
+        if effort not in globally_supported:
+            raise GatewayError(
+                f"unsupported incoming Codex reasoning effort for Reasoning=auto: {effort}"
+            )
+        if model_supported and effort not in model_supported:
+            raise GatewayError(
+                f"Codex model {model or 'selected route'} does not support incoming "
+                f"Reasoning=auto effort {effort}; choose: {', '.join(sorted(model_supported))}"
+            )
+        return effort
+    return ""
 
 
 def _block_text(content: Any) -> str:
@@ -591,7 +633,10 @@ def _sanitize_schema(value: Any, *, root: bool = False) -> dict[str, Any]:
 
 
 def anthropic_to_responses(
-    body: dict[str, Any], model: str, reasoning_effort: str = ""
+    body: dict[str, Any],
+    model: str,
+    reasoning_effort: str = "",
+    supported_reasoning: Iterable[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Translate one Anthropic Messages request to OpenAI Responses."""
 
@@ -705,8 +750,11 @@ def anthropic_to_responses(
     # The ChatGPT-account Codex backend rejects sampling and output-limit
     # parameters accepted by the public Responses API.  Keep the Claude limit
     # local to the compatibility surface rather than sending an invalid field.
-    if reasoning_effort:
-        payload["reasoning"] = {"effort": reasoning_effort}
+    resolved_reasoning = resolve_codex_reasoning(
+        body, reasoning_effort, model, supported_reasoning
+    )
+    if resolved_reasoning:
+        payload["reasoning"] = {"effort": resolved_reasoning}
     return payload, reverse_names
 
 
@@ -1109,6 +1157,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 role: {
                     "model": self.cfg[f"model_{role}"],
                     "reasoning": self.cfg[f"reasoning_{role}"],
+                    "supported_reasoning": self.cfg.get(f"supported_reasoning_{role}", []),
+                    "capability_source": (
+                        "local-codex-cache"
+                        if self.cfg.get(f"supported_reasoning_{role}")
+                        else "unknown"
+                    ),
                 }
                 for role in ROLES
             }
@@ -1172,12 +1226,27 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.reject(503, "offline smoke mode does not contact an upstream API")
             return
         original_model = str(body.get("model", CLAUDE_ALIASES[1]))
+        role = _role_for(original_model)
         body["model"], reasoning = _route_for(self.cfg, original_model)
         if self.cfg["protocol"] == "anthropic-messages":
-            body = apply_provider_reasoning(body, str(self.cfg["profile"]), reasoning)
+            try:
+                body = apply_provider_reasoning(
+                    body, str(self.cfg["profile"]), str(body["model"]), reasoning
+                )
+            except GatewayError as exc:
+                self.reject(400, str(exc))
+                return
             self.forward_anthropic(body)
         else:
-            self.forward_responses(body, original_model, reasoning)
+            try:
+                self.forward_responses(
+                    body,
+                    original_model,
+                    reasoning,
+                    self.cfg.get(f"supported_reasoning_{role}", []),
+                )
+            except GatewayError as exc:
+                self.reject(400, str(exc))
 
     def _open(self, request: urllib.request.Request):
         try:
@@ -1262,10 +1331,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.reject(status, message[:4096], "api_error")
 
     def forward_responses(
-        self, body: dict[str, Any], original_model: str, reasoning_effort: str
+        self,
+        body: dict[str, Any],
+        original_model: str,
+        reasoning_effort: str,
+        supported_reasoning: Iterable[str] | None = None,
     ) -> None:
         payload, reverse_names = anthropic_to_responses(
-            body, body["model"], reasoning_effort
+            body, body["model"], reasoning_effort, supported_reasoning
         )
         client_stream = bool(payload["stream"])
         # The ChatGPT-account backend reliably exposes the Responses protocol
@@ -1343,7 +1416,7 @@ def configure_log(path: Path | None) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="FinalKit Windows Claude API gateway")
+    parser = argparse.ArgumentParser(description="Switchboard Windows Claude API gateway")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--log-file", type=Path)
     args = parser.parse_args()

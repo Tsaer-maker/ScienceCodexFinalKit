@@ -1,26 +1,24 @@
 diff --git a/proxy.py b/proxy.py
-index 5db7334..70611bd 100755
+index 5db7334..d970f1a 100755
 --- a/proxy.py
 +++ b/proxy.py
-@@ -22,6 +22,8 @@ import os
+@@ -22,6 +22,7 @@ import os
  import re
  import base64
  import hashlib
 +import hmac
-+import tempfile
  import secrets
  import subprocess
  import sys
-@@ -44,13 +46,65 @@ from starlette.middleware.base import BaseHTTPMiddleware
+@@ -44,13 +45,45 @@ from starlette.middleware.base import BaseHTTPMiddleware
  APP_DIR = Path(__file__).resolve().parent
  PROXY_DIR = Path(os.environ.get("CLAUDE_SCIENCE_PROXY_DIR", str(APP_DIR))).expanduser()
  CONFIG_FILE = PROXY_DIR / "config.json"
 -CODEX_AUTH_FILE = PROXY_DIR / "codex-auth.json"
 -CODEX_CLI_AUTH_FILE = Path.home() / ".codex" / "auth.json"
-+# FinalKit keeps one credential owner: the official Codex CLI cache under the
-+# isolated HOME. The connector refreshes it instead of a copied token chain.
++# Switchboard keeps one credential writer: the official Codex CLI under the
++# isolated HOME. The connector is a read-only consumer of that cache.
 +CODEX_AUTH_FILE = Path.home() / ".codex" / "auth.json"
-+CODEX_CLI_AUTH_FILE = CODEX_AUTH_FILE
  STATIC_DIR = PROXY_DIR / "static"
  TOKEN_DIR = Path.home() / ".claude-science" / ".oauth-tokens"
  ENC_KEY_FILE = Path.home() / ".claude-science" / "encryption.key"
@@ -57,47 +55,32 @@ index 5db7334..70611bd 100755
 +FAKE_ORG_UUID = "00000000-0000-4000-8000-000000000002"
 +FAKE_ACCESS_TOKEN = "sk-ant-finalkit-local-session"
 +
-+
-+def _atomic_private_json(path: Path, payload: dict) -> None:
-+    """Persist a credential cache without exposing a partial refresh chain."""
-+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-+    try:
-+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-+            json.dump(payload, handle, indent=2)
-+            handle.flush()
-+            os.fsync(handle.fileno())
-+        os.chmod(temporary, 0o600)
-+        os.replace(temporary, path)
-+    finally:
-+        try:
-+            os.unlink(temporary)
-+        except FileNotFoundError:
-+            pass
-+
-+
  # ---------------------------------------------------------------------------
  # Config persistence
  # ---------------------------------------------------------------------------
-@@ -70,6 +124,8 @@ class Config:
+@@ -70,6 +103,10 @@ class Config:
          "codex_client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
          "codex_backend_url": "https://chatgpt.com/backend-api/codex",
          "codex_model": "gpt-5.6-sol",
 +        "codex_reasoning": "max",
 +        "codex_reasoning_map": {},
++        "codex_supported_reasoning": [],
++        "codex_supported_reasoning_map": {},
          "codex_model_map": {},
          "default_backend": "deepseek",
          "force_model": "",
-@@ -98,6 +154,8 @@ class Config:
+@@ -98,6 +135,10 @@ class Config:
          "codex_client_id": "CODEX_CLIENT_ID",
          "codex_backend_url": "CODEX_BACKEND_URL",
          "codex_model": "CODEX_MODEL",
 +        "codex_reasoning": "CODEX_REASONING",
 +        "codex_reasoning_map": "CODEX_REASONING_MAP",
++        "codex_supported_reasoning": "CODEX_SUPPORTED_REASONING",
++        "codex_supported_reasoning_map": "CODEX_SUPPORTED_REASONING_MAP",
          "codex_model_map": "CODEX_MODEL_MAP",
          "default_backend": "DEFAULT_BACKEND",
          "force_model": "FORCE_MODEL",
-@@ -112,7 +170,10 @@ class Config:
+@@ -112,7 +153,11 @@ class Config:
          "proxy_host": "PROXY_HOST",
          "proxy_port": "PROXY_PORT",
      }
@@ -105,11 +88,12 @@ index 5db7334..70611bd 100755
 +    JSON_KEYS = {
 +        "deepseek_model_map", "openai_model_map", "custom_model_map",
 +        "codex_model_map", "codex_reasoning_map",
++        "codex_supported_reasoning", "codex_supported_reasoning_map",
 +    }
  
      def __init__(self):
          self._data = dict(self.DEFAULTS)
-@@ -192,6 +253,10 @@ class Config:
+@@ -192,6 +237,14 @@ class Config:
      @property
      def codex_model(self) -> str: return self._data["codex_model"]
      @property
@@ -117,10 +101,14 @@ index 5db7334..70611bd 100755
 +    @property
 +    def codex_reasoning_map(self) -> dict: return self._data["codex_reasoning_map"]
 +    @property
++    def codex_supported_reasoning(self) -> list: return self._data["codex_supported_reasoning"]
++    @property
++    def codex_supported_reasoning_map(self) -> dict: return self._data["codex_supported_reasoning_map"]
++    @property
      def codex_model_map(self) -> dict: return self._data["codex_model_map"]
      @property
      def default_backend(self) -> str: return self._data["default_backend"]
-@@ -244,12 +309,37 @@ class Config:
+@@ -244,12 +297,55 @@ class Config:
          elif backend == "openai":
              if self.openai_auth_mode == "codex_device":
                  base_url = self.codex_backend_url.rstrip("/")
@@ -154,20 +142,39 @@ index 5db7334..70611bd 100755
 +                    self.codex_reasoning_map.get(matched_alias or model)
 +                    or self.codex_reasoning
 +                ).strip().lower()
-+                if reasoning not in {"none", "low", "medium", "high", "xhigh", "max", "ultra"}:
++                if reasoning not in {"auto", "none", "low", "medium", "high", "xhigh", "max", "ultra"}:
 +                    raise ValueError(f"Unsupported Codex reasoning: {reasoning}")
++                raw_supported = (
++                    self.codex_supported_reasoning_map.get(matched_alias or model)
++                    or self.codex_supported_reasoning
++                    or []
++                )
++                if not isinstance(raw_supported, list) or len(raw_supported) > 16:
++                    raise ValueError("Unsupported Codex reasoning capability map")
++                supported_reasoning = []
++                for value in raw_supported:
++                    effort = str(value or "").strip().lower()
++                    if effort not in {"none", "low", "medium", "high", "xhigh", "max", "ultra"}:
++                        raise ValueError(f"Unsupported Codex reasoning capability: {effort}")
++                    if effort not in supported_reasoning:
++                        supported_reasoning.append(effort)
++                if supported_reasoning and reasoning != "auto" and reasoning not in supported_reasoning:
++                    raise ValueError(
++                        f"Codex model {mapped_model} does not support configured reasoning={reasoning}"
++                    )
                  auth_header = codex_auth_store.authorization_header()
                  return {
                      "backend": "codex",
-@@ -257,6 +347,7 @@ class Config:
+@@ -257,6 +353,8 @@ class Config:
                      "auth_header": auth_header,
                      "base_url": base_url,
                      "account_id": codex_auth_store.account_id(),
 +                    "reasoning": reasoning,
++                    "supported_reasoning": supported_reasoning,
                  }
              base_url = normalize_openai_base_url(self.openai_base_url)
              mapped_model = self.force_model or self.openai_model_map.get(model, model)
-@@ -294,7 +385,7 @@ def bearer_auth_header(token: str, backend: str) -> str:
+@@ -294,7 +392,7 @@ def bearer_auth_header(token: str, backend: str) -> str:
  
  
  class CodexAuthStore:
@@ -176,7 +183,7 @@ index 5db7334..70611bd 100755
  
      def __init__(self, path: Path):
          self.path = path
-@@ -305,15 +396,41 @@ class CodexAuthStore:
+@@ -305,21 +403,35 @@ class CodexAuthStore:
          try:
              with open(self.path) as f:
                  data = json.load(f)
@@ -204,88 +211,141 @@ index 5db7334..70611bd 100755
 -        with open(self.path, "w") as f:
 -            json.dump(data, f, indent=2)
 -        os.chmod(self.path, 0o600)
-+        try:
-+            current = json.loads(self.path.read_text(encoding="utf-8"))
-+        except (FileNotFoundError, json.JSONDecodeError, OSError):
-+            current = {}
-+        payload = dict(current) if isinstance(current, dict) else {}
-+        payload["auth_mode"] = "chatgpt"
-+        payload["OPENAI_API_KEY"] = None
-+        tokens = dict(current.get("tokens") or {}) if isinstance(current, dict) else {}
-+        for key in ("access_token", "refresh_token", "id_token"):
-+            if data.get(key):
-+                tokens[key] = data[key]
-+        if data.get("chatgpt_account_id"):
-+            tokens["account_id"] = data["chatgpt_account_id"]
-+        payload["tokens"] = tokens
-+        payload["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-+        _atomic_private_json(self.path, payload)
++        raise ValueError(
++            "The official Codex CLI is the only auth.json writer. "
++            "Run fkctl configure-codex instead."
++        )
  
      def clear(self):
-         try:
-@@ -347,9 +464,8 @@ class CodexAuthStore:
-         token = refreshed.get("access_token")
-         if not token:
-             raise ValueError(
+-        try:
+-            self.path.unlink()
+-        except FileNotFoundError:
+-            pass
++        raise ValueError(
++            "The connector cannot delete the official Codex login. "
++            "Use the official Codex CLI logout command."
++        )
+ 
+     def is_configured(self) -> bool:
+         data = self.load()
+@@ -341,101 +453,25 @@ class CodexAuthStore:
+     def authorization_header(self) -> str:
+         data = self.load()
+         token = data.get("access_token")
+-        if token and not self._is_expiring(data):
++        if token:
+             return f"Bearer {token}"
+-        refreshed = self.refresh(data)
+-        token = refreshed.get("access_token")
+-        if not token:
+-            raise ValueError(
 -                "OpenAI Codex device auth is not configured. "
 -                f"Open {config.codex_device_url}, enter a code from the dashboard or "
 -                "run ./setup-codex-device.py, then retry."
-+                "ChatGPT Codex auth is missing or could not be refreshed. "
-+                "Run fkctl configure-codex, then retry."
-             )
-         return f"Bearer {token}"
+-            )
+-        return f"Bearer {token}"
+-
+-    def _is_expiring(self, data: dict) -> bool:
+-        expires_at = data.get("expires_at")
+-        if not expires_at:
+-            exp = _exp_from_access_token(data.get("access_token", ""))
+-            if exp is None:
+-                return False
+-            return exp <= time.time() + 300
+-        try:
+-            if isinstance(expires_at, (int, float)):
+-                expires_ts = float(expires_at)
+-            else:
+-                expires_ts = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00")).timestamp()
+-            return expires_ts <= time.time() + 300
+-        except Exception:
+-            return False
++        raise ValueError(
++            "ChatGPT Codex auth is missing. Run fkctl configure-codex, then retry."
++        )
  
-@@ -385,7 +501,7 @@ class CodexAuthStore:
-                 data=payload,
-                 headers={"Content-Type": "application/x-www-form-urlencoded"},
-                 timeout=20,
+     def refresh(self, data: dict) -> dict:
+-        refresh_token = data.get("refresh_token")
+-        if not refresh_token:
+-            return self._maybe_import_from_cli(data)
+-        payload = {
+-            "grant_type": "refresh_token",
+-            "refresh_token": refresh_token,
+-            "client_id": data.get("client_id") or config.codex_client_id,
+-        }
+-        url = f"{config.codex_auth_base_url.rstrip('/')}/oauth/token"
+-        try:
+-            resp = httpx.post(
+-                url,
+-                data=payload,
+-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+-                timeout=20,
 -                trust_env=False,
-+                trust_env=True,
-             )
-             if resp.status_code != 200:
-                 return self._maybe_import_from_cli(data)
-@@ -398,13 +514,11 @@ class CodexAuthStore:
-             return self._maybe_import_from_cli(data)
- 
-     def _maybe_import_from_cli(self, data: dict) -> dict:
+-            )
+-            if resp.status_code != 200:
+-                return self._maybe_import_from_cli(data)
+-            token_data = resp.json()
+-            merged = dict(data)
+-            merged.update(_normalize_codex_token_response(token_data, payload["client_id"]))
+-            self.save(merged)
+-            return merged
+-        except Exception:
+-            return self._maybe_import_from_cli(data)
+-
+-    def _maybe_import_from_cli(self, data: dict) -> dict:
 -        """Fallback: re-import a fresh token from the Codex CLI auth file.
-+        """Re-read the shared cache after another process may have refreshed it.
- 
+-
 -        The Codex CLI and this bridge share one OAuth credential. OpenAI refresh
 -        tokens are one-time-use, so if the CLI refreshes first it consumes the
 -        refresh_token and the bridge's own refresh returns 401
 -        refresh_token_reused. Re-importing from the CLI keeps the bridge working
 -        without forcing the user to re-run setup-codex-device.py manually.
-+        The official CLI and connector share one file. If another request or the
-+        CLI rotates a one-time refresh token first, this caller can adopt the
-+        newer access/refresh chain instead of forcing another browser login.
-         """
-         if not CODEX_CLI_AUTH_FILE.exists():
-             return data
-@@ -416,9 +530,10 @@ class CodexAuthStore:
-         tokens = cli_data.get("tokens") if isinstance(cli_data, dict) else None
-         if not isinstance(tokens, dict) or not tokens.get("access_token"):
-             return data
+-        """
+-        if not CODEX_CLI_AUTH_FILE.exists():
+-            return data
+-        try:
+-            with open(CODEX_CLI_AUTH_FILE) as f:
+-                cli_data = json.load(f)
+-        except Exception:
+-            return data
+-        tokens = cli_data.get("tokens") if isinstance(cli_data, dict) else None
+-        if not isinstance(tokens, dict) or not tokens.get("access_token"):
+-            return data
 -        new_exp = _exp_from_access_token(tokens.get("access_token", ""))
 -        old_exp = _exp_from_access_token(data.get("access_token", ""))
 -        if new_exp and old_exp and new_exp <= old_exp:
-+        if (
-+            tokens.get("access_token") == data.get("access_token")
-+            and tokens.get("refresh_token") == data.get("refresh_token")
-+        ):
-             return data
-         imported = _normalize_codex_token_response(
-             {
-@@ -434,7 +549,7 @@ class CodexAuthStore:
-         merged = dict(data)
-         merged.update(imported)
-         self.save(merged)
+-            return data
+-        imported = _normalize_codex_token_response(
+-            {
+-                "access_token": tokens.get("access_token"),
+-                "refresh_token": tokens.get("refresh_token"),
+-                "id_token": tokens.get("id_token"),
+-                "chatgpt_account_id": tokens.get("account_id"),
+-            },
+-            data.get("client_id") or config.codex_client_id,
++        """Adopt only a newer access token written by the official CLI."""
++
++        current = self.load()
++        token = current.get("access_token")
++        if token and token != data.get("access_token"):
++            print("[proxy] adopted a newer official Codex CLI access token", flush=True)
++            return current
++        raise ValueError(
++            "The official Codex token was rejected or expired. "
++            "Run the official Codex CLI so it refreshes its login, "
++            "or run fkctl configure-codex, then retry."
+         )
+-        if not imported.get("access_token"):
+-            return data
+-        merged = dict(data)
+-        merged.update(imported)
+-        self.save(merged)
 -        print("[proxy] re-imported fresh Codex token from ~/.codex/auth.json (refresh_token was reused)", flush=True)
-+        print("[proxy] adopted a newer Codex token from shared ~/.codex/auth.json", flush=True)
-         return merged
+-        return merged
  
  
-@@ -526,7 +641,7 @@ def _new_pkce_pair() -> tuple[str, str]:
+ def _expires_at_from_response(token_data: dict) -> str:
+@@ -526,7 +562,7 @@ def _new_pkce_pair() -> tuple[str, str]:
  
  async def _post_codex_auth(path: str, payload: dict) -> httpx.Response:
      url = f"{config.codex_auth_base_url.rstrip('/')}{path}"
@@ -294,7 +354,7 @@ index 5db7334..70611bd 100755
          resp = await c.post(url, json=payload)
          if resp.status_code in {400, 415, 422}:
              return await c.post(
-@@ -545,7 +660,7 @@ async def _exchange_codex_authorization_code(code: str, code_verifier: str, clie
+@@ -545,7 +581,7 @@ async def _exchange_codex_authorization_code(code: str, code_verifier: str, clie
          "client_id": client_id,
          "code_verifier": code_verifier,
      }
@@ -303,7 +363,7 @@ index 5db7334..70611bd 100755
          resp = await c.post(
              url,
              data=payload,
-@@ -617,7 +732,7 @@ app = FastAPI(title="Claude Science BYOK Proxy", version="2.0.0")
+@@ -617,7 +653,7 @@ app = FastAPI(title="Claude Science BYOK Proxy", version="2.0.0")
  # CORS
  app.add_middleware(
      CORSMiddleware,
@@ -312,7 +372,7 @@ index 5db7334..70611bd 100755
      allow_credentials=True,
      allow_methods=["*"],
      allow_headers=["*"],
-@@ -653,6 +768,37 @@ async def access_log_middleware(request: Request, call_next):
+@@ -653,6 +689,37 @@ async def access_log_middleware(request: Request, call_next):
      log_local_event(request, response.status_code)
      return response
  
@@ -350,19 +410,17 @@ index 5db7334..70611bd 100755
  # Static files for dashboard
  app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
  
-@@ -1607,34 +1753,66 @@ def _codex_headers(backend: dict) -> dict:
+@@ -1607,34 +1674,123 @@ def _codex_headers(backend: dict) -> dict:
      return headers
  
  
 +def _refresh_codex_backend(backend: dict) -> bool:
-+    """Force one shared-cache refresh after an unexpected backend 401."""
-+    current = codex_auth_store.load()
-+    refreshed = codex_auth_store.refresh(current)
++    """Retry only after the official CLI has published a different token."""
++
++    rejected = str(backend.get("auth_header") or "").removeprefix("Bearer ").strip()
++    refreshed = codex_auth_store.refresh({"access_token": rejected})
 +    token = refreshed.get("access_token")
-+    if not token or (
-+        token == current.get("access_token")
-+        and refreshed.get("refresh_token") == current.get("refresh_token")
-+    ):
++    if not token or token == rejected:
 +        return False
 +    backend["auth_header"] = f"Bearer {token}"
 +    backend["account_id"] = (
@@ -372,10 +430,68 @@ index 5db7334..70611bd 100755
 +    return True
 +
 +
++def _codex_reasoning_for_request(
++    body: dict, configured: str, model: str = "", supported_reasoning=None
++) -> str:
++    """Resolve an explicit route override or preserve an incoming role effort."""
++    configured = str(configured or "").strip().lower()
++    if configured != "auto":
++        return configured
++    thinking = body.get("thinking")
++    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
++        candidates = ["none"]
++    else:
++        output_config = body.get("output_config")
++        candidates = [
++            output_config.get("effort") if isinstance(output_config, dict) else None,
++            body.get("reasoning_effort"),
++        ]
++    globally_supported = {"none", "low", "medium", "high", "xhigh", "max", "ultra"}
++    model_supported = {
++        str(value or "").strip().lower()
++        for value in (supported_reasoning or [])
++        if str(value or "").strip()
++    }
++    for candidate in candidates:
++        if candidate is None:
++            continue
++        effort = str(candidate or "").strip().lower()
++        if not effort:
++            continue
++        if effort not in globally_supported:
++            raise ValueError(
++                f"unsupported incoming Codex reasoning effort for Reasoning=auto: {effort}"
++            )
++        if model_supported and effort not in model_supported:
++            raise ValueError(
++                f"Codex model {model or 'selected route'} does not support incoming "
++                f"Reasoning=auto effort {effort}; choose: {', '.join(sorted(model_supported))}"
++            )
++        return effort
++    return ""
++
++
  async def _handle_codex_messages(body: dict, backend: dict, original_model: str, request_id: str, stream: bool):
      """Route a request to the ChatGPT Codex backend (Responses API)."""
      responses_body = anthropic_to_codex_responses(body, backend["model"])
-+    responses_body["reasoning"] = {"effort": backend["reasoning"]}
++    try:
++        request_reasoning = _codex_reasoning_for_request(
++            body,
++            backend["reasoning"],
++            backend["model"],
++            backend.get("supported_reasoning", []),
++        )
++    except ValueError as exc:
++        log_request("codex", backend["model"], stream, "error invalid reasoning")
++        return JSONResponse(
++            status_code=400,
++            content={
++                "type": "error",
++                "error": {"type": "invalid_request_error", "message": str(exc)},
++            },
++        )
++    if request_reasoning:
++        responses_body["reasoning"] = {"effort": request_reasoning}
      responses_body["stream"] = True  # Codex backend only reliably supports streaming
      headers = _codex_headers(backend)
      client = get_client()
@@ -384,7 +500,8 @@ index 5db7334..70611bd 100755
 -    print(f"[proxy] → codex | model={backend['model']} | stream={stream} | original_model={original_model}")
 +    print(
 +        f"[proxy] → codex | model={backend['model']} | "
-+        f"reasoning={backend['reasoning']} | stream={stream} | original_model={original_model}"
++        f"reasoning={request_reasoning or 'model-default'} | "
++        f"stream={stream} | original_model={original_model}"
 +    )
  
      if stream:
@@ -432,7 +549,7 @@ index 5db7334..70611bd 100755
              except Exception as e:
                  log_request("codex", backend["model"], True, "error")
                  safe_msg = str(e).encode("ascii", errors="replace").decode("ascii")
-@@ -1648,41 +1826,51 @@ async def _handle_codex_messages(body: dict, backend: dict, original_model: str,
+@@ -1648,41 +1804,51 @@ async def _handle_codex_messages(body: dict, backend: dict, original_model: str,
          aggregated = {"output": [], "usage": {}, "status": "completed"}
          text_acc = ""
          tool_items: dict[str, dict] = {}
@@ -518,7 +635,7 @@ index 5db7334..70611bd 100755
  
          if text_acc:
              aggregated["output"].append({"type": "message", "content": [{"type": "output_text", "text": text_acc}]})
-@@ -1786,18 +1974,13 @@ async def count_tokens(request: Request):
+@@ -1786,18 +1952,13 @@ async def count_tokens(request: Request):
  # OAuth mocks
  # ---------------------------------------------------------------------------
  
@@ -539,7 +656,7 @@ index 5db7334..70611bd 100755
          "scope": "openid profile email",
      }
  
-@@ -1807,15 +1990,15 @@ def fake_user_response() -> dict:
+@@ -1807,15 +1968,15 @@ def fake_user_response() -> dict:
          "id": FAKE_ACCOUNT_UUID,
          "uuid": FAKE_ACCOUNT_UUID,
          "sub": FAKE_ACCOUNT_UUID,
@@ -559,7 +676,7 @@ index 5db7334..70611bd 100755
          "billing_type": "api",
          "has_extra_usage_enabled": True,
      }
-@@ -1825,12 +2008,12 @@ def fake_org_response() -> dict:
+@@ -1825,12 +1986,12 @@ def fake_org_response() -> dict:
      return {
          "id": FAKE_ORG_UUID,
          "uuid": FAKE_ORG_UUID,
@@ -574,7 +691,7 @@ index 5db7334..70611bd 100755
          "billing_type": "api",
      }
  
-@@ -1864,16 +2047,32 @@ async def userinfo_mock(request: Request):
+@@ -1864,16 +2025,32 @@ async def userinfo_mock(request: Request):
  
  @app.get("/v1/models")
  async def list_models(request: Request):
@@ -615,7 +732,7 @@ index 5db7334..70611bd 100755
  
  
  # Add proper organization endpoint (not just catch-all)
-@@ -2051,19 +2250,22 @@ async def api_test_backend(request: Request):
+@@ -2051,19 +2228,23 @@ async def api_test_backend(request: Request):
              "auth_header": auth_header,
              "account_id": codex_auth_store.account_id(),
          }
@@ -627,8 +744,9 @@ index 5db7334..70611bd 100755
              "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ping"}]}],
              "stream": True,
              "store": False,
-+            "reasoning": {"effort": probe_reasoning},
          }
++        if probe_reasoning != "auto":
++            probe_body["reasoning"] = {"effort": probe_reasoning}
          url = f"{config.codex_backend_url.rstrip('/')}/responses"
          try:
 -            async with httpx.AsyncClient(timeout=20, trust_env=False) as c:
@@ -641,7 +759,7 @@ index 5db7334..70611bd 100755
                      err_text = (await resp.aread()).decode("utf-8", errors="replace")[:300]
                      return {"ok": False, "error": f"HTTP {resp.status_code}: {err_text}"}
          except Exception as e:
-@@ -2083,7 +2285,7 @@ async def api_test_backend(request: Request):
+@@ -2083,7 +2264,7 @@ async def api_test_backend(request: Request):
          return {"ok": False, "error": "Custom provider requires an API Base URL"}
  
      try:
@@ -650,7 +768,7 @@ index 5db7334..70611bd 100755
              resp = await c.get(url, headers={"Authorization": auth_header})
              if resp.status_code == 200:
                  data = resp.json()
-@@ -2263,6 +2465,9 @@ async def api_anthropic_catch_all(request: Request, path: str):
+@@ -2263,6 +2444,9 @@ async def api_anthropic_catch_all(request: Request, path: str):
  async def health():
      return {
          "status": "ok",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Minimal loopback Anthropic gateway for approved Anthropic-compatible APIs.
 
-FinalKit owns this implementation.  It deliberately does not expose a
+Switchboard owns this implementation. It deliberately does not expose a
 dashboard or accept configuration over HTTP.  Runtime configuration and the
 provider key arrive through inherited file descriptors, never argv or the
 environment.
@@ -13,6 +13,7 @@ import argparse
 import hmac
 import json
 import os
+import re
 import signal
 import ssl
 import sys
@@ -50,8 +51,74 @@ ROLES = ("opus", "sonnet", "haiku")
 PROVIDER_REASONING = {
     "deepseek": {"auto", "none", "high", "max"},
     "kimi": {"auto", "none", "low", "high", "max"},
-    "glm": {"auto", "none", "high", "max"},
+    "glm": {"auto", "none", "low", "medium", "high", "xhigh", "max"},
 }
+
+
+def is_kimi_k3_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"kimi-k3(?:\[[a-z0-9._+-]+\])?", value))
+
+
+def is_kimi_toggle_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"kimi-k2\.(?:5|6)(?:\[[a-z0-9._+-]+\])?", value))
+
+
+def is_kimi_always_thinking_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"kimi-k2\.7-code(?:-highspeed)?(?:\[[a-z0-9._+-]+\])?", value))
+
+
+def is_glm_52_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"glm-5\.2(?:[-._][a-z0-9]+)*", value))
+
+
+def is_glm_53_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"glm-5\.3(?:[-._][a-z0-9]+)*", value))
+
+
+def is_glm_thinking_toggle_model(model: Any) -> bool:
+    value = str(model or "").strip().lower()
+    return bool(re.fullmatch(r"glm-4\.(?:[5-9])(?:[-._][a-z0-9]+)*", value))
+
+
+def provider_reasoning_values(provider: str, model: Any) -> set[str]:
+    if provider == "deepseek":
+        return set(PROVIDER_REASONING[provider])
+    if provider == "kimi":
+        if is_kimi_k3_model(model):
+            return {"auto", "low", "high", "max"}
+        if is_kimi_toggle_model(model):
+            return {"auto", "none"}
+        if is_kimi_always_thinking_model(model):
+            return {"auto"}
+        return {"auto"}
+    if provider == "glm":
+        if is_glm_53_model(model):
+            return {"auto", "low", "high", "max"}
+        if is_glm_52_model(model):
+            return {"auto", "none", "low", "medium", "high", "xhigh", "max"}
+        if is_glm_thinking_toggle_model(model):
+            return {"auto", "none"}
+        return {"auto"}
+    return {"auto"}
+
+
+def without_effort_fields(body: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(body)
+    normalized.pop("reasoning_effort", None)
+    output_config = normalized.get("output_config")
+    if isinstance(output_config, dict) and "effort" in output_config:
+        output_config = dict(output_config)
+        output_config.pop("effort", None)
+        if output_config:
+            normalized["output_config"] = output_config
+        else:
+            normalized.pop("output_config", None)
+    return normalized
 
 
 def read_private_fd(fd: int, *, limit: int) -> bytes:
@@ -100,7 +167,7 @@ def load_runtime(config_fd: int, key_fd: int) -> tuple[dict[str, Any], str]:
 
     provider = str(config["provider"])
     if provider not in PROVIDERS:
-        raise ValueError("provider is not in FinalKit's fixed allowlist")
+        raise ValueError("provider is not in Switchboard's fixed allowlist")
     expected = PROVIDERS[provider]
     upstream = urllib.parse.urlsplit(str(config["upstream"]))
     expected_upstream = urllib.parse.urlsplit(expected["upstream"])
@@ -120,8 +187,9 @@ def load_runtime(config_fd: int, key_fd: int) -> tuple[dict[str, Any], str]:
         if not model or "\n" in model or "\r" in model or len(model) > 200:
             raise ValueError(f"{role} model is empty or malformed")
         reasoning = str(config[f"reasoning_{role}"]).strip().lower()
-        if reasoning not in PROVIDER_REASONING[provider]:
-            choices = ", ".join(sorted(PROVIDER_REASONING[provider]))
+        allowed = provider_reasoning_values(provider, model)
+        if reasoning not in allowed:
+            choices = ", ".join(sorted(allowed))
             raise ValueError(f"{role} reasoning must be one of: {choices}")
         config[f"model_{role}"] = model
         config[f"reasoning_{role}"] = reasoning
@@ -176,7 +244,7 @@ def role_from_alias(requested: Any) -> str:
     alias = str(requested or "").lower()
     if "haiku" in alias:
         return "haiku"
-    if "opus" in alias:
+    if "opus" in alias or "fable" in alias:
         return "opus"
     return "sonnet"
 
@@ -187,25 +255,54 @@ def route_for(config: dict[str, Any], requested: Any) -> tuple[str, str, str]:
 
 
 def apply_provider_reasoning(
-    body: dict[str, Any], provider: str, reasoning: str
+    body: dict[str, Any], provider: str, model: str, reasoning: str
 ) -> dict[str, Any]:
-    """Apply one profile-owned reasoning choice without discarding unrelated fields."""
+    """Normalize one supported provider/model reasoning choice onto the wire."""
 
     if reasoning == "auto":
-        return body
+        thinking = body.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+            reasoning = "none"
+        else:
+            output_config = body.get("output_config")
+            candidate = (
+                output_config.get("effort")
+                if isinstance(output_config, dict)
+                else None
+            )
+            if candidate is None:
+                candidate = body.get("reasoning_effort")
+            if candidate is None or str(candidate).strip() == "":
+                if provider == "kimi" and (
+                    is_kimi_k3_model(model) or is_kimi_always_thinking_model(model)
+                ):
+                    normalized = without_effort_fields(body)
+                    normalized.pop("thinking", None)
+                    return normalized
+                if provider == "glm" and is_glm_53_model(model):
+                    normalized = without_effort_fields(body)
+                    normalized["thinking"] = {"type": "enabled"}
+                    return normalized
+                return body
+            reasoning = str(candidate).strip().lower()
 
-    normalized = dict(body)
+    allowed = provider_reasoning_values(provider, model)
+    if reasoning not in allowed:
+        raise ValueError(
+            f"{provider} model {model} does not support reasoning={reasoning}; "
+            f"choose: {', '.join(sorted(allowed))}"
+        )
+
+    normalized = without_effort_fields(body)
+    if provider == "kimi" and is_kimi_k3_model(model):
+        normalized.pop("thinking", None)
+        normalized["reasoning_effort"] = reasoning
+        return normalized
+    if provider == "kimi" and is_kimi_always_thinking_model(model):
+        normalized.pop("thinking", None)
+        return normalized
     if reasoning == "none":
         normalized["thinking"] = {"type": "disabled"}
-        normalized.pop("reasoning_effort", None)
-        output_config = normalized.get("output_config")
-        if isinstance(output_config, dict) and "effort" in output_config:
-            output_config = dict(output_config)
-            output_config.pop("effort", None)
-            if output_config:
-                normalized["output_config"] = output_config
-            else:
-                normalized.pop("output_config", None)
         return normalized
 
     normalized["thinking"] = {"type": "enabled"}
@@ -214,17 +311,8 @@ def apply_provider_reasoning(
         output_config = dict(output_config) if isinstance(output_config, dict) else {}
         output_config["effort"] = reasoning
         normalized["output_config"] = output_config
-        normalized.pop("reasoning_effort", None)
-    else:
+    elif provider == "glm" and (is_glm_52_model(model) or is_glm_53_model(model)):
         normalized["reasoning_effort"] = reasoning
-        output_config = normalized.get("output_config")
-        if isinstance(output_config, dict) and "effort" in output_config:
-            output_config = dict(output_config)
-            output_config.pop("effort", None)
-            if output_config:
-                normalized["output_config"] = output_config
-            else:
-                normalized.pop("output_config", None)
     return normalized
 
 
@@ -478,7 +566,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
         requested = str(body.get("model", "claude-sonnet-4-5"))
         _role, model, reasoning = route_for(self.cfg, requested)
         body["model"] = model
-        body = apply_provider_reasoning(body, str(self.cfg["provider"]), reasoning)
+        try:
+            body = apply_provider_reasoning(
+                body, str(self.cfg["provider"]), model, reasoning
+            )
+        except ValueError as exc:
+            self.reject(400, str(exc))
+            return
         encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(encoded) > MAX_REQUEST_BYTES:
             self.reject(413, "normalized request exceeds the 64 MiB limit")
@@ -552,7 +646,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="FinalKit direct provider gateway")
+    parser = argparse.ArgumentParser(description="Switchboard direct provider gateway")
     parser.add_argument("--config-fd", type=int, required=True)
     parser.add_argument("--key-fd", type=int, required=True)
     args = parser.parse_args()
@@ -567,7 +661,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop_server)
     signal.signal(signal.SIGINT, stop_server)
     print(
-        f"FinalKit {config['provider_label']} gateway ready on 127.0.0.1:{config['port']} "
+        f"Switchboard {config['provider_label']} gateway ready on 127.0.0.1:{config['port']} "
         f"profile={config['profile_id']}",
         flush=True,
     )

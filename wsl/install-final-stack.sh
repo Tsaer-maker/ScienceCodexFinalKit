@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-# Science SwitchModel / FinalKit v3 installer.
+# Claude Codex Switchboard v3 installer.
 # Windows invokes --system once as root and --user as the ordinary WSL user.
 # It never creates a passwordless-sudo rule and never changes Windows/WSL proxy
 # settings, .wslconfig, Docker, or another distribution.
@@ -16,21 +16,24 @@ PACKAGE_VERSION="$(tr -d '\r\n' <"$SCRIPT_DIR/../VERSION")"
   exit 1
 }
 BRIDGE_REPO="https://github.com/haoyuan-sjtu/claude-science-codex-connector.git"
-BRIDGE_REF="${BRIDGE_REF:-30b26d7c6f097b186bbd228e93a427a731399960}"
-# Exact proxy.py files produced by prior managed FinalKit patches at BRIDGE_REF.
-# These hashes distinguish an upgradeable FinalKit owner from unknown local
+readonly BRIDGE_REF="30b26d7c6f097b186bbd228e93a427a731399960"
+# Exact proxy.py files produced by prior managed Switchboard patches at BRIDGE_REF.
+# These hashes distinguish an upgradeable managed owner from unknown local
 # edits; no unrecognized connector file is overwritten.
 LEGACY_BRIDGE_PROXY_SHA256="b2808deb29d5fa8d7a0f78e8134f0c7b3f59ba6a29cc78cf42bd79bc2bc957e7"
 LEGACY_BRIDGE_PROXY_SHA256_304="b986db81f5f30ae1e8083da9f78681c8beafdba1fd439b29ce8fb3f640b7bd7f"
 LEGACY_BRIDGE_PROXY_SHA256_306="d405d6a675f4844880aeec182cef6ed7bf424d5b13621f1aa3e12cae3c9d908d"
 LEGACY_BRIDGE_PROXY_SHA256_307="4bd365339455b4a44338fe723b646259455a8f260e8aa98b14cc209a52d0a378"
 MANAGED_BRIDGE_PROXY_SHA256_320="9e31942216c5980486b6b6aa97781b42951e9b51c33496339c12d5e163a64b42"
-# 3.3.0 briefly added a Windows Desktop route to this same pinned connector.
-# Admit that exact managed file only as a one-way recovery source so 3.2.2 can
-# restore the isolated WSL owner; unknown connector edits still fail closed.
+# Admit this exact earlier managed proxy as an upgrade source; unknown
+# connector edits still fail closed.
 RECOVERY_BRIDGE_PROXY_SHA256_330="0b0f071a7c33fe9a00faeb11d73d9f1c986f6d0c57b353addb1f98e37d86e620"
-NODE_VERSION="${NODE_VERSION:-v24.19.0}"
-CHROME_MCP_VERSION="${CHROME_MCP_VERSION:-1.2.0}"
+RECOVERY_BRIDGE_PROXY_SHA256_330_AUTO="9bc9555b3cdfe5a0f9d9825256ccde98ab53157056c664194215513a96f961a6"
+RECOVERY_BRIDGE_PROXY_SHA256_330_READONLY="c1ac0a4bb92d1ee7266185feed03e9b9af0ba2d6112491044b8c7a73c2f98cb2"
+RECOVERY_BRIDGE_PROXY_SHA256_330_MODEL_WIRE="8c578d80c26d444f01d8f0b4386c4be44e89d39f11021174b5959cf5d0f3c503"
+MANAGED_BRIDGE_PROXY_SHA256_330="4f2dce686a2af533c179210ea7f90a14f71c49cb4e1e1319ca3e192037cbcf32"
+readonly NODE_VERSION="v24.19.0"
+readonly CHROME_MCP_VERSION="1.2.0"
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -45,9 +48,21 @@ is_managed_bridge_proxy() {
   case "${1:-}" in
     "$LEGACY_BRIDGE_PROXY_SHA256"|"$LEGACY_BRIDGE_PROXY_SHA256_304"|\
     "$LEGACY_BRIDGE_PROXY_SHA256_306"|"$LEGACY_BRIDGE_PROXY_SHA256_307"|\
-    "$MANAGED_BRIDGE_PROXY_SHA256_320"|"$RECOVERY_BRIDGE_PROXY_SHA256_330") return 0 ;;
+    "$MANAGED_BRIDGE_PROXY_SHA256_320"|"$RECOVERY_BRIDGE_PROXY_SHA256_330"|\
+    "$RECOVERY_BRIDGE_PROXY_SHA256_330_AUTO"|"$RECOVERY_BRIDGE_PROXY_SHA256_330_READONLY"|\
+    "$RECOVERY_BRIDGE_PROXY_SHA256_330_MODEL_WIRE"|\
+    "$MANAGED_BRIDGE_PROXY_SHA256_330") return 0 ;;
     *) return 1 ;;
   esac
+}
+
+verify_bridge_proxy_hash() {
+  local proxy_path="$1"
+  local actual
+  [[ -f "$proxy_path" ]] || die "Managed connector owner is missing: $proxy_path"
+  actual="$(sha256sum "$proxy_path" | awk '{print $1}')"
+  [[ "$actual" == "$MANAGED_BRIDGE_PROXY_SHA256_330" ]] || \
+    die "Connector proxy hash is not the exact Switchboard $PACKAGE_VERSION owner: $actual"
 }
 
 without_proxy() {
@@ -65,6 +80,19 @@ network_retry_direct() {
   without_proxy "$@"
 }
 
+normalized_requirements() {
+  tr -d '\r' <"$1" | \
+    sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' | LC_ALL=C sort -f
+}
+
+connector_requirements_match() {
+  local requirements_file="$1"
+  local pip_bin="$2"
+  [[ "$(normalized_requirements "$requirements_file")" == \
+     "$("$pip_bin" freeze | LC_ALL=C sort -f)" ]] && \
+    "$pip_bin" check >/dev/null
+}
+
 verify_ubuntu() {
   [[ -r /etc/os-release ]] || die "/etc/os-release is missing"
   # shellcheck disable=SC1091
@@ -78,7 +106,7 @@ install_system() {
   [[ "$EUID" -eq 0 ]] || die "--system must run as WSL root"
   verify_ubuntu
   local packages missing package status
-  packages=(ca-certificates curl bubblewrap socat git jq python3 python3-venv python3-pip rsync xdg-utils xz-utils)
+  packages=(ca-certificates curl bubblewrap socat git jq zsh lsof python3 python3-venv python3-pip rsync xdg-utils xz-utils)
   missing=()
   for package in "${packages[@]}"; do
     status="$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)"
@@ -185,13 +213,13 @@ ensure_bridge_checkout() {
   fi
 
   if git -C "$bridge_dir" apply --reverse --check "$SCRIPT_DIR/connector-security.patch" >/dev/null 2>&1; then
-    note "FinalKit connector security patch is already applied."
+    note "Switchboard connector security patch is already applied."
   else
     if ! git -C "$bridge_dir" apply --check "$SCRIPT_DIR/connector-security.patch" >/dev/null 2>&1; then
       changed="$(git -C "$bridge_dir" diff --name-only)"
       proxy_sha="$(sha256sum "$bridge_dir/proxy.py" | awk '{print $1}')"
       if [[ "$changed" == "proxy.py" ]] && is_managed_bridge_proxy "$proxy_sha"; then
-        note "Upgrading the verified previous FinalKit connector owner to $PACKAGE_VERSION..."
+        note "Upgrading the verified previous Switchboard connector owner to $PACKAGE_VERSION..."
         git -C "$bridge_dir" restore --source=HEAD --worktree -- proxy.py
       else
         die "Connector has unknown local changes; refusing to replace $bridge_dir/proxy.py"
@@ -204,6 +232,10 @@ ensure_bridge_checkout() {
   git -C "$bridge_dir" diff --check
   changed="$(git -C "$bridge_dir" diff --name-only)"
   [[ "$changed" == "proxy.py" ]] || die "Unexpected patched connector files: ${changed:-none}"
+  # Reverse-apply only proves that the expected patch is present somewhere in
+  # the worktree.  It does not exclude extra edits in the same credential-
+  # handling file, so every install and repair ends on one exact managed owner.
+  verify_bridge_proxy_hash "$bridge_dir/proxy.py"
 }
 
 generate_identity_files() {
@@ -248,7 +280,7 @@ write_versions_metadata() {
   bridge_commit="$(tr -d '\r\n' <"$root/bridge.commit")"
   trap 'rm -f -- "${versions_pending:-}"' RETURN
   {
-    printf 'package=Science SwitchModel / FinalKit\n'
+    printf 'package=Claude Codex Switchboard\n'
     printf 'package_version=%s\n' "$runtime_version"
     printf 'installed_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'bridge_commit=%s\n' "$bridge_commit"
@@ -272,6 +304,7 @@ install_user() {
   verify_ubuntu
 
   local real_home root bridge_dir science_bin claude_bin codex_bin client_home science_home legacy_science_home
+  local maintenance_fd=""
   real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
   [[ -n "$real_home" && "$real_home" != "/root" ]] || die "Could not resolve an ordinary-user home"
   export HOME="$real_home"
@@ -288,6 +321,15 @@ install_user() {
   install -d -m 700 \
     "$real_home/.local/bin" "$root" "$root/runtime" "$root/run" \
     "$root/logs" "$root/secrets" "$root/profiles" "$root/config"
+
+  # Runtime-only repair already owns this package-maintenance lock in
+  # update_runtime(). Full installs acquire it here. This lock serializes only
+  # installer-owned code/dependency files; user auth and routes remain under
+  # their own official CLI / Switchboard owners.
+  if [[ "$install_mode" == "full" ]]; then
+    exec {maintenance_fd}>"$root/run/maintenance.lock"
+    flock -w 15 "$maintenance_fd" || die "another Switchboard package maintenance operation is active"
+  fi
 
   if [[ -d "$legacy_science_home" && ! -e "$science_home" ]]; then
     note "Migrating the draft Science profile to the short AF_UNIX-safe path..."
@@ -313,8 +355,8 @@ install_user() {
   fi
   [[ -x "$codex_bin" ]] || die "Codex CLI was not installed at $codex_bin"
 
-  if [[ -f "$science_home/.codex/auth.json" && ! -e "$client_home/.codex/auth.json" ]]; then
-    note "Migrating the FinalKit-owned Codex auth cache out of the Science data HOME..."
+  if [[ "$install_mode" == "full" && -f "$science_home/.codex/auth.json" && ! -e "$client_home/.codex/auth.json" ]]; then
+    note "Migrating the legacy managed Codex auth cache out of the Science data HOME..."
     install -d -m 700 "$client_home/.codex"
     mv -- "$science_home/.codex/auth.json" "$client_home/.codex/auth.json"
     chmod 600 "$client_home/.codex/auth.json"
@@ -326,7 +368,7 @@ install_user() {
   else
     [[ -x "$real_home/.local/bin/node" ]] || die "Node.js is missing; use --tools or the full Build"
     [[ -x "$real_home/.local/bin/chrome-devtools-mcp-finalkit" ]] || \
-      die "FinalKit browser wrapper is missing; use the full Build once"
+      die "Switchboard browser wrapper is missing; use the full Build once"
     [[ -d "$bridge_dir/.git" ]] || die "Connector checkout is missing; use the full Build once"
     git -C "$bridge_dir" cat-file -e "$BRIDGE_REF^{commit}" 2>/dev/null || \
       die "Pinned connector commit is not available locally; use the full Build with network access"
@@ -339,14 +381,10 @@ install_user() {
   if [[ ! -x "$bridge_dir/.venv/bin/python" ]]; then
     python3 -m venv "$bridge_dir/.venv"
   fi
-  local expected_requirements installed_requirements
   # Source archives extracted on Windows may expose CRLF through /mnt/<drive>.
   # Compare package semantics, not the transport newline representation.
-  expected_requirements="$(tr -d '\r' <"$SCRIPT_DIR/requirements.lock" | \
-    sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' | LC_ALL=C sort -f)"
-  installed_requirements="$("$bridge_dir/.venv/bin/pip" freeze | LC_ALL=C sort -f)"
-  if [[ "$expected_requirements" == "$installed_requirements" ]] && \
-     "$bridge_dir/.venv/bin/pip" check >/dev/null; then
+  if connector_requirements_match \
+      "$SCRIPT_DIR/requirements.lock" "$bridge_dir/.venv/bin/pip"; then
     note "Pinned connector Python environment already matches; skipping pip network work."
   elif [[ "$install_mode" == "runtime" ]]; then
     die "Connector Python dependencies changed; run --tools or the full Build before the offline runtime update"
@@ -364,6 +402,9 @@ install_user() {
   note "Verifying direct provider Model/Reasoning request mapping..."
   python3 "$SCRIPT_DIR/tests/direct_gateway_contract.py" \
     "$SCRIPT_DIR/runtime/direct_gateway.py"
+  note "Verifying the optional pinned multi-agent integration boundary..."
+  python3 "$SCRIPT_DIR/tests/agents_manager_contract.py" \
+    "$SCRIPT_DIR/runtime/agents_manager.py"
   note "Verifying the offline Claude Science ownership/control contract..."
   python3 "$SCRIPT_DIR/tests/runtime_control_contract.py" \
     "$SCRIPT_DIR/runtime/switch_manager.py"
@@ -376,13 +417,15 @@ install_user() {
     "$SCRIPT_DIR/runtime/switch_manager.py"
   note "Verifying the offline Windows Start Science / native Claude entry contract..."
   python3 "$SCRIPT_DIR/tests/windows_entry_contract.py" \
-    "$SCRIPT_DIR/../windows/FinalKit.ps1"
+    "$SCRIPT_DIR/../windows/Switchboard.ps1"
   if [[ "$install_mode" == "full" ]]; then
     note "Verifying runtime-update rollback semantics..."
-    bash "$SCRIPT_DIR/tests/installer_update_contract.sh" "$SCRIPT_DIR/install-final-stack.sh"
+    bash "$SCRIPT_DIR/tests/installer_update_contract.sh" \
+      "$SCRIPT_DIR/install-final-stack.sh" "$bridge_dir/proxy.py"
   fi
 
   install -m 700 "$SCRIPT_DIR/runtime/direct_gateway.py" "$root/runtime/direct_gateway.py"
+  install -m 700 "$SCRIPT_DIR/runtime/agents_manager.py" "$root/runtime/agents_manager.py"
   install -m 700 "$SCRIPT_DIR/runtime/science_identity.py" "$root/runtime/science_identity.py"
   install -m 700 "$SCRIPT_DIR/runtime/switch_manager.py" "$root/runtime/switch_manager.py"
   install -m 700 "$SCRIPT_DIR/fkctl" "$real_home/.local/bin/fkctl"
@@ -392,7 +435,7 @@ install_user() {
     "$root/instance.id" "$root/secrets/gateway-path.token" \
     "$root/secrets/connector-control.token"
 
-  # A repair install replaces runtime owners.  Close only this FinalKit
+  # A repair install replaces runtime owners. Close only this Switchboard
   # instance first; the manager refuses to kill a PID whose identity differs.
   "$real_home/.local/bin/fkctl" stop
   "$real_home/.local/bin/fkctl" prepare
@@ -404,23 +447,30 @@ install_user() {
   write_versions_metadata "$root" "$real_home" "$science_bin" "$claude_bin" "$codex_bin" "$PACKAGE_VERSION"
 
   if [[ "$install_mode" == "runtime" ]]; then
-    note "FinalKit runtime update completed; provider auth and model routes were preserved."
+    note "Switchboard runtime update completed; provider auth and model routes were preserved."
     note "The runtime is stopped. Start the provider you want from the Windows menu."
   else
-    note "Science SwitchModel installation completed."
+    note "Claude Codex Switchboard installation completed."
     note "Next: configure DeepSeek, Kimi, GLM and/or ChatGPT Codex per Linux user."
+  fi
+  if [[ -n "$maintenance_fd" ]]; then
+    flock -u "$maintenance_fd"
+    exec {maintenance_fd}>&-
   fi
 }
 
 update_runtime() {
   [[ "$EUID" -ne 0 ]] || die "--runtime must run as the ordinary WSL user"
   verify_ubuntu
-  local real_home root target label
+  local real_home root target label maintenance_fd
   local runtime_update_success=0
   real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
   root="${FINALKIT_ROOT:-$real_home/.local/share/science-codex-finalkit}"
   [[ -x "$real_home/.local/bin/fkctl" && -d "$root/bridge/.git" ]] || \
-    die "FinalKit is not installed for this Linux user; use the full Build"
+    die "Switchboard is not installed for this Linux user; use the full Build"
+  install -d -m 700 "$root/run"
+  exec {maintenance_fd}>"$root/run/maintenance.lock"
+  flock -w 15 "$maintenance_fd" || die "another Switchboard package maintenance operation is active"
   # These two rollback values deliberately outlive this function's local
   # scope. Bash runs an EXIT trap after unwinding function locals when an
   # entrypoint command fails under `set -e`; keeping them local made that
@@ -428,18 +478,15 @@ update_runtime() {
   FINALKIT_RUNTIME_UPDATE_BACKUP="$(mktemp -d /tmp/finalkit-runtime-update.XXXXXX)"
   FINALKIT_RUNTIME_UPDATE_TARGETS=(
     "$root/runtime/direct_gateway.py"
+    "$root/runtime/agents_manager.py"
     "$root/runtime/science_identity.py"
     "$root/runtime/switch_manager.py"
     "$root/bridge/proxy.py"
-    "$root/bridge/config.json"
-    "$root/config/model-routes.json"
     "$root/bridge.commit"
     "$root/bridge.requirements.resolved.txt"
     "$root/versions.txt"
     "$real_home/.local/bin/fkctl"
     "$real_home/.local/bin/chrome-devtools-mcp-finalkit"
-    "$real_home/.science-finalkit/.codex/auth.json"
-    "$real_home/.finalkit-client/.codex/auth.json"
   )
   mkdir -p "$FINALKIT_RUNTIME_UPDATE_BACKUP/files"
   for target in "${FINALKIT_RUNTIME_UPDATE_TARGETS[@]}"; do
@@ -452,6 +499,10 @@ update_runtime() {
   done
   rollback_runtime_update() {
     local rollback_target rollback_label
+    # Once restoration starts, a second terminal interrupt must not leave the
+    # package owner set half old and half new. Preserve the original exit code
+    # and finish this bounded local rollback before returning control.
+    trap '' INT TERM
     for rollback_target in "${FINALKIT_RUNTIME_UPDATE_TARGETS[@]}"; do
       rollback_label="$(printf '%s' "$rollback_target" | sha256sum | awk '{print $1}')"
       rm -f -- "$rollback_target"
@@ -463,31 +514,35 @@ update_runtime() {
     rm -rf -- "$FINALKIT_RUNTIME_UPDATE_BACKUP"
   }
   runtime_update_success=0
-  trap 'rc=$?; if [[ "${runtime_update_success:-0}" != "1" ]]; then note "Runtime update failed; restoring the previous managed files. The prior runtime may need to be started again."; rollback_runtime_update; fi; exit "$rc"' EXIT
+  trap 'rc=$?; trap "" INT TERM; if [[ "${runtime_update_success:-0}" != "1" ]]; then note "Runtime update failed; restoring the previous package-managed code. Auth, model routes, and their latest derived config are never rolled back by this installer. The prior runtime may need to be started again."; rollback_runtime_update; fi; exit "$rc"' EXIT
   trap 'exit 130' INT TERM
   install_user runtime
   runtime_update_success=1
   trap - EXIT INT TERM
   rm -rf -- "$FINALKIT_RUNTIME_UPDATE_BACKUP"
   unset FINALKIT_RUNTIME_UPDATE_BACKUP FINALKIT_RUNTIME_UPDATE_TARGETS
+  flock -u "$maintenance_fd"
+  exec {maintenance_fd}>&-
 }
 
 update_tools() {
   [[ "$EUID" -ne 0 ]] || die "--tools must run as the ordinary WSL user"
   verify_ubuntu
-  local real_home root bridge_dir science_bin claude_bin codex_bin auth_file auth_before runtime_version
-  local expected_requirements installed_requirements
+  local real_home root bridge_dir science_bin claude_bin codex_bin auth_file auth_before runtime_version maintenance_fd
   real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
   export HOME="$real_home"
   export PATH="$real_home/.local/bin:$PATH"
   root="${FINALKIT_ROOT:-$real_home/.local/share/science-codex-finalkit}"
+  install -d -m 700 "$root/run"
+  exec {maintenance_fd}>"$root/run/maintenance.lock"
+  flock -w 15 "$maintenance_fd" || die "another Switchboard package maintenance operation is active"
   bridge_dir="$root/bridge"
   science_bin="$real_home/.local/bin/claude-science"
   claude_bin="$real_home/.local/bin/claude"
   codex_bin="$real_home/.local/bin/codex"
   auth_file="$real_home/.finalkit-client/.codex/auth.json"
   [[ -x "$real_home/.local/bin/fkctl" && -f "$root/bridge.commit" ]] || \
-    die "FinalKit is not installed for this Linux user; use the full Build"
+    die "Switchboard is not installed for this Linux user; use the full Build"
   auth_before=""
   [[ ! -f "$auth_file" ]] || auth_before="$(sha256sum "$auth_file" | awk '{print $1}')"
   "$real_home/.local/bin/fkctl" stop
@@ -498,11 +553,8 @@ update_tools() {
   note "Updating the package-pinned Node.js and Chrome DevTools MCP dependencies..."
   install_node_and_browser_mcp "$root" "$real_home"
   [[ -x "$bridge_dir/.venv/bin/pip" ]] || die "Connector Python environment is missing; use the full Build"
-  expected_requirements="$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' \
-    "$SCRIPT_DIR/requirements.lock" | LC_ALL=C sort -f)"
-  installed_requirements="$("$bridge_dir/.venv/bin/pip" freeze | LC_ALL=C sort -f)"
-  if [[ "$expected_requirements" != "$installed_requirements" ]] || \
-     ! "$bridge_dir/.venv/bin/pip" check >/dev/null; then
+  if ! connector_requirements_match \
+      "$SCRIPT_DIR/requirements.lock" "$bridge_dir/.venv/bin/pip"; then
     note "Updating the package-pinned connector Python dependencies..."
     network_retry_direct "$bridge_dir/.venv/bin/pip" install \
       --disable-pip-version-check \
@@ -522,6 +574,8 @@ update_tools() {
   [[ -n "$runtime_version" ]] || runtime_version="unknown"
   write_versions_metadata "$root" "$real_home" "$science_bin" "$claude_bin" "$codex_bin" "$runtime_version"
   note "Official tool update completed; auth and model routes were preserved. The runtime remains stopped."
+  flock -u "$maintenance_fd"
+  exec {maintenance_fd}>&-
 }
 
 show_help() {
@@ -529,7 +583,7 @@ show_help() {
 Usage:
   install-final-stack.sh --system   # WSL root phase
   install-final-stack.sh --user     # ordinary-user phase
-  install-final-stack.sh --runtime  # offline FinalKit runtime-only update
+  install-final-stack.sh --runtime  # offline Switchboard runtime-only update
   install-final-stack.sh --tools    # network update of official clients/dependencies
 
 Normal Windows users should double-click 00-Install.cmd instead.

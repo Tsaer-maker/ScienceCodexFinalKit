@@ -5,12 +5,30 @@ umask 077
 REAL_HOME="${REAL_HOME:-$(getent passwd "$(id -un)" | cut -d: -f6)}"
 ROOT="${FINALKIT_ROOT:-$REAL_HOME/.local/share/science-codex-finalkit}"
 MANAGER="$ROOT/runtime/switch_manager.py"
+AGENTS_MANAGER="$ROOT/runtime/agents_manager.py"
 
 if [[ ! -f "$MANAGER" ]]; then
-  printf 'ERROR: FinalKit manager is missing: %s\n' "$MANAGER" >&2
+  printf 'ERROR: Switchboard manager is missing: %s\n' "$MANAGER" >&2
   printf 'Run the Windows bootstrap command again.\n' >&2
   exit 1
 fi
 
 export HOME="$REAL_HOME"
+if [[ "${1:-}" == "agents" ]]; then
+  shift
+  if [[ ! -f "$AGENTS_MANAGER" ]]; then
+    printf 'ERROR: Switchboard multi-agent manager is missing: %s\n' "$AGENTS_MANAGER" >&2
+    printf 'Run the Windows runtime update command again.\n' >&2
+    exit 1
+  fi
+  exec /usr/bin/python3 "$AGENTS_MANAGER" --root "$ROOT" "$@"
+fi
+if [[ "${1:-}" == "codex" ]]; then
+  if [[ ! -f "$AGENTS_MANAGER" ]]; then
+    printf 'ERROR: Switchboard multi-agent manager is missing: %s\n' "$AGENTS_MANAGER" >&2
+    printf 'Run the Windows runtime update command again.\n' >&2
+    exit 1
+  fi
+  /usr/bin/python3 "$AGENTS_MANAGER" --root "$ROOT" status --require-ready
+fi
 exec /usr/bin/python3 "$MANAGER" --root "$ROOT" "$@"

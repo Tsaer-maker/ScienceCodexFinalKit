@@ -1,6 +1,6 @@
 @echo off
 setlocal
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0FinalKit.ps1" -Action windows-claude-configure -RemainingArgs deepseek
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Switchboard.ps1" -Action windows-claude-configure -RemainingArgs deepseek
 set "result=%errorlevel%"
 pause
 exit /b %result%

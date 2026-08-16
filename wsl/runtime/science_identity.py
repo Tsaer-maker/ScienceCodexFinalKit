@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Own FinalKit's isolated, restart-stable Claude Science local identity.
+"""Own Switchboard's isolated, restart-stable Claude Science local identity.
 
 Claude Science has two independent gates: a local UI identity and an inference
-endpoint.  FinalKit supplies both only inside ``~/.science-finalkit``: this
+endpoint. Switchboard supplies both only inside ``~/.science-finalkit``: this
 helper installs one cryptographically authenticated local identity, while the
 runtime injects a loopback ``ANTHROPIC_BASE_URL`` and session-only auth token.
 DeepSeek/Kimi/GLM keys and ChatGPT/Codex credentials remain owned by their
@@ -11,7 +11,7 @@ gateways and are never copied into the Science profile.
 The local identity is deliberately not a Claude.ai account, subscription, or
 service-side authorization.  It has an empty refresh token and a far-future
 local expiry, so no usable Anthropic refresh chain is created.  Claude Science
-may still make its own best-effort account-metadata probe, but FinalKit admits
+may still make its own best-effort account-metadata probe, but Switchboard admits
 the local workbench through the daemon's loopback nonce gate and routes only
 inference through the selected gateway.  The identity is created only in an
 empty isolated profile, reused byte-for-byte on later starts, and migrated only
@@ -326,7 +326,7 @@ def _remove_recognized_identity(data_dir: Path) -> None:
 
 
 def _install_local_identity(data_dir: Path, keys: dict[str, str]) -> dict[str, str]:
-    """Install the one FinalKit-owned identity into a proven-empty profile."""
+    """Install the one Switchboard-owned identity into a proven-empty profile."""
 
     if _token_files(data_dir / ".oauth-tokens") or _read_private(
         data_dir / "active-org.json", required=False
